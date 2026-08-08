@@ -12,7 +12,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Json};
 use axum::routing::{get, post};
 use axum::Router;
-use gateway_core::{A2aAgent, AcpAsA2a, StdioAcpAgent};
+use gateway_core::{A2aAgent, AcpAsA2a, Owner, StdioAcpAgent};
 use protocol::a2a::{Task, TaskId};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -138,7 +138,11 @@ async fn rpc_handler(
         Err(e) => return rpc_error(request.id, StatusCode::NOT_FOUND, -32601, &e.to_string()),
     };
 
-    let result = dispatch_a2a_method(&adapter, &request).await;
+    // ИСПРАВЛЕНО (аудит P1-1): владелец разговора выводится из токена
+    // клиента, иначе адаптер не может отличить одного клиента от другого.
+    let owner = Owner::from_token(&token);
+
+    let result = dispatch_a2a_method(&adapter, owner, &request).await;
     match result {
         Ok(value) => Json(json!({ "jsonrpc": "2.0", "id": request.id, "result": value })).into_response(),
         Err(e) => rpc_error(request.id, StatusCode::OK, -32000, &e.to_string()),
@@ -151,12 +155,13 @@ fn rpc_error(id: Value, status: StatusCode, code: i64, message: &str) -> axum::r
 
 async fn dispatch_a2a_method(
     adapter: &Arc<AcpAsA2a<StdioAcpAgent>>,
+    owner: Owner,
     request: &JsonRpcRequest,
 ) -> anyhow::Result<Value> {
     match request.method.as_str() {
         "message/send" => {
             let task: Task = build_task_from_send_params(&request.params)?;
-            match adapter.send_task(task).await? {
+            match adapter.send_task_as(owner, task).await? {
                 gateway_core::Reply::Complete(t) => Ok(serde_json::to_value(t)?),
                 gateway_core::Reply::Streaming(_) => {
                     anyhow::bail!("Фаза 1: streaming не реализован для A2A->ACP направления")
@@ -166,13 +171,13 @@ async fn dispatch_a2a_method(
         "tasks/get" => {
             let id = request.params.get("id").and_then(Value::as_str)
                 .ok_or_else(|| anyhow::anyhow!("tasks/get: id обязателен"))?;
-            let task = adapter.get_task(TaskId(id.to_string())).await?;
+            let task = adapter.get_task_as(owner, TaskId(id.to_string())).await?;
             Ok(serde_json::to_value(task)?)
         }
         "tasks/cancel" => {
             let id = request.params.get("id").and_then(Value::as_str)
                 .ok_or_else(|| anyhow::anyhow!("tasks/cancel: id обязателен"))?;
-            let task = adapter.cancel_task(TaskId(id.to_string())).await?;
+            let task = adapter.cancel_task_as(owner, TaskId(id.to_string())).await?;
             Ok(serde_json::to_value(task)?)
         }
         other => anyhow::bail!("method_not_found: {other}"),
@@ -185,9 +190,23 @@ fn build_task_from_send_params(params: &Value) -> anyhow::Result<Task> {
     let message: protocol::a2a::Message = serde_json::from_value(message_value.clone())?;
 
     let task_id = format!("task-{}", uuid_stub());
+
+    // ИСПРАВЛЕНО (аудит P1-1): contextId раньше приравнивался к task_id,
+    // то есть каждое сообщение начинало новый разговор, а на стороне
+    // адаптера все они всё равно попадали в одну общую сессию. Теперь
+    // contextId клиента уважается (штатное поле A2A), а если его нет —
+    // выдаётся новый и возвращается клиенту в Task.contextId.
+    let context_id = params
+        .get("message")
+        .and_then(|m| m.get("contextId"))
+        .or_else(|| params.get("contextId"))
+        .and_then(Value::as_str)
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("ctx-{}", uuid_stub()));
+
     Ok(Task {
-        id: TaskId(task_id.clone()),
-        context_id: protocol::a2a::ContextId(task_id),
+        id: TaskId(task_id),
+        context_id: protocol::a2a::ContextId(context_id),
         status: protocol::a2a::TaskStatus {
             state: protocol::a2a::TaskState::Submitted,
             message: Some(message),

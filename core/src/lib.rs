@@ -9,7 +9,7 @@ pub mod stdio_agent;
 pub mod task_store;
 
 pub use agent::{A2aAgent, AcpAgent};
-pub use convert::{A2aAsAcp, AcpAsA2a};
+pub use convert::{A2aAsAcp, AcpAsA2a, Owner, DEFAULT_SESSION_TTL};
 pub use http_agent::HttpA2aAgent;
 pub use lease::{TurnGuard, TurnLease, TurnLeaseTimeoutError};
 pub use reply::Reply;
