@@ -45,6 +45,12 @@ impl TurnLease {
         }
     }
 
+    /// Число сессий, за которыми сейчас числится лиз. Нужно, чтобы
+    /// утечку можно было измерить в тесте, а не только рассуждать о ней.
+    pub async fn tracked_sessions(&self) -> usize {
+        self.locks.lock().await.len()
+    }
+
     /// Вызывается при закрытии сессии, чтобы не накапливать записи в HashMap.
     pub async fn forget(&self, session: &SessionId) {
         self.locks.lock().await.remove(session);

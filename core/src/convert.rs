@@ -429,15 +429,115 @@ impl<T: AcpAgent + Send + Sync> A2aAgent for AcpAsA2a<T> {
 // 4. A2aAsAcp — ACP-клиент видит A2A-агента.
 // =========================================================================
 
+/// Потолок сессий на одно ACP-соединение. Второй рубеж после проверки
+/// «сессия заведена через session/new»: даже добросовестный клиент не
+/// должен уметь открыть их неограниченно.
+const MAX_SESSIONS_PER_CONNECTION: usize = 256;
+
 pub struct A2aAsAcp<T: A2aAgent> {
     inner: T,
     lease: TurnLease,
     lease_timeout: Duration,
+    /// ИСПРАВЛЕНО (аудит P2-8): раньше сессий как понятия здесь не было
+    /// вовсе. `prompt` брал sessionId прямо из запроса клиента и
+    /// ключевал им TurnLease, а `forget` не вызывался нигде — то есть
+    /// любой sessionId, присланный клиентом, навсегда добавлял запись
+    /// в HashMap лиза. Это не только утечка: клиент с валидным токеном
+    /// мог забивать память шлюза, генерируя идентификаторы на лету.
+    ///
+    /// Теперь сессия существует, только если заведена через session/new,
+    /// и удаляется при session/cancel вместе с записью в лизе.
+    sessions: tokio::sync::Mutex<HashMap<SessionId, std::time::Instant>>,
+    session_ttl: Duration,
 }
 
 impl<T: A2aAgent> A2aAsAcp<T> {
     pub fn new(inner: T, lease_timeout: Duration) -> Self {
-        Self { inner, lease: TurnLease::default(), lease_timeout }
+        Self::with_session_ttl(inner, lease_timeout, DEFAULT_SESSION_TTL)
+    }
+
+    pub fn with_session_ttl(inner: T, lease_timeout: Duration, session_ttl: Duration) -> Self {
+        Self {
+            inner,
+            lease: TurnLease::default(),
+            lease_timeout,
+            sessions: tokio::sync::Mutex::new(HashMap::new()),
+            session_ttl,
+        }
+    }
+
+    /// Регистрирует сессию, заведённую через session/new.
+    async fn register_session(&self, session: SessionId) -> anyhow::Result<()> {
+        let mut sessions = self.sessions.lock().await;
+        self.evict_expired(&mut sessions).await;
+
+        if sessions.len() >= MAX_SESSIONS_PER_CONNECTION {
+            anyhow::bail!(
+                "достигнут потолок сессий на соединение ({MAX_SESSIONS_PER_CONNECTION}); \
+                 закройте ненужные через session/cancel"
+            );
+        }
+
+        sessions.insert(session, std::time::Instant::now());
+        Ok(())
+    }
+
+    /// Проверяет, что сессия заведена, и продлевает её.
+    ///
+    /// По ACP клиент обязан вызвать session/new до session/prompt.
+    /// Раньше это не проверялось, и произвольный sessionId считался
+    /// валидным — что и было корнем утечки.
+    async fn touch_session(&self, session: &SessionId) -> anyhow::Result<()> {
+        let mut sessions = self.sessions.lock().await;
+        self.evict_expired(&mut sessions).await;
+
+        match sessions.get_mut(session) {
+            Some(last_used) => {
+                *last_used = std::time::Instant::now();
+                Ok(())
+            }
+            None => anyhow::bail!(
+                "неизвестный sessionId {}: сессию нужно создать через session/new",
+                session.0
+            ),
+        }
+    }
+
+    /// Забывает сессию и освобождает её запись в лизе.
+    async fn drop_session(&self, session: &SessionId) {
+        self.sessions.lock().await.remove(session);
+        self.lease.forget(session).await;
+    }
+
+    async fn evict_expired(
+        &self,
+        sessions: &mut HashMap<SessionId, std::time::Instant>,
+    ) {
+        let now = std::time::Instant::now();
+        let ttl = self.session_ttl;
+        let expired: Vec<SessionId> = sessions
+            .iter()
+            .filter(|(_, last_used)| now.duration_since(**last_used) > ttl)
+            .map(|(session, _)| session.clone())
+            .collect();
+
+        for session in expired {
+            sessions.remove(&session);
+            // Без этого запись оставалась бы в TurnLease навсегда —
+            // ровно та утечка, ради которой всё и делается.
+            self.lease.forget(&session).await;
+        }
+    }
+
+    /// Число живых сессий — для тестов и диагностики.
+    pub async fn active_sessions(&self) -> usize {
+        self.sessions.lock().await.len()
+    }
+
+    /// Сколько сессий числится за TurnLease. Должно совпадать с числом
+    /// живых сессий: расхождение и есть утечка.
+    pub async fn leased_sessions(&self) -> usize {
+        self.lease.tracked_sessions().await
     }
 }
 
@@ -467,10 +567,16 @@ impl<T: A2aAgent + Send + Sync> AcpAgent for A2aAsAcp<T> {
     }
 
     async fn new_session(&self, _req: NewSessionRequest) -> anyhow::Result<acp::NewSessionResponse> {
-        Ok(acp::NewSessionResponse { session_id: SessionId(new_session_id()) })
+        let session_id = SessionId(new_session_id());
+        self.register_session(session_id.clone()).await?;
+        Ok(acp::NewSessionResponse { session_id })
     }
 
     async fn prompt(&self, req: PromptRequest) -> anyhow::Result<Reply<PromptResponse, SessionUpdate>> {
+        // Проверка ДО acquire: иначе неизвестный sessionId успевал
+        // создать запись в лизе прежде, чем был отвергнут.
+        self.touch_session(&req.session_id).await?;
+
         let _guard = self.lease.acquire(&req.session_id, self.lease_timeout).await?;
 
         let message = prompt_to_message(req.clone());
@@ -506,8 +612,14 @@ impl<T: A2aAgent + Send + Sync> AcpAgent for A2aAsAcp<T> {
     }
 
     async fn cancel(&self, session: SessionId) -> anyhow::Result<()> {
-        self.inner.cancel_task(TaskId(session.0)).await?;
-        Ok(())
+        let result = self.inner.cancel_task(TaskId(session.0.clone())).await;
+
+        // Сессия забывается независимо от исхода отмены на стороне
+        // агента: клиент считает её закрытой в любом случае, и держать
+        // за неё запись в лизе не за чем.
+        self.drop_session(&session).await;
+
+        result.map(|_| ())
     }
 }
 
@@ -1147,5 +1259,159 @@ mod tests {
         assert!(after > before, "свежий процесс должен получить initialize");
 
         adapter.send_task_as(owner, task_in_context("t-3", "ctx-1", "три")).await.unwrap();
+    }
+
+    // ---------------------------------------------------------------
+    // Регрессии на аудит P2-8: утечка TurnLease по клиентским sessionId
+    // ---------------------------------------------------------------
+
+    /// Фейковый A2A-агент для проверки ACP-стороны конвертера.
+    struct StubA2aAgent;
+
+    #[async_trait]
+    impl A2aAgent for StubA2aAgent {
+        async fn card(&self) -> anyhow::Result<a2a::AgentCard> {
+            Ok(a2a::AgentCard {
+                name: "stub".into(),
+                description: None,
+                version: "1".into(),
+                url: String::new(),
+                capabilities: Default::default(),
+                skills: Vec::new(),
+            })
+        }
+
+        async fn send_task(&self, task: Task) -> anyhow::Result<Reply<Task, a2a::A2aEvent>> {
+            let mut done = task;
+            done.status.state = TaskState::Completed;
+            Ok(Reply::Complete(done))
+        }
+
+        async fn get_task(&self, _id: TaskId) -> anyhow::Result<Task> {
+            anyhow::bail!("не используется в тестах")
+        }
+
+        async fn cancel_task(&self, id: TaskId) -> anyhow::Result<Task> {
+            Ok(Task {
+                id: id.clone(),
+                context_id: ContextId(id.0),
+                status: TaskStatus {
+                    state: TaskState::Canceled,
+                    message: None,
+                    timestamp: None,
+                },
+                history: None,
+                artifacts: None,
+                metadata: None,
+            })
+        }
+    }
+
+    fn new_session_req() -> NewSessionRequest {
+        NewSessionRequest {
+            cwd: ".".into(),
+            mcp_servers: Vec::new(),
+            additional_directories: Vec::new(),
+        }
+    }
+
+    fn prompt_for(session: &SessionId) -> PromptRequest {
+        PromptRequest {
+            session_id: session.clone(),
+            prompt: vec![ContentBlock::Text { text: "привет".into() }],
+        }
+    }
+
+    /// Главная регрессия: раньше prompt принимал ЛЮБОЙ sessionId и
+    /// заводил под него запись в лизе. Клиент с валидным токеном мог
+    /// забивать память шлюза, генерируя идентификаторы на лету.
+    #[tokio::test]
+    async fn prompt_with_unknown_session_is_rejected() {
+        let adapter = A2aAsAcp::new(StubA2aAgent, Duration::from_secs(5));
+
+        for i in 0..100 {
+            let bogus = SessionId(format!("выдуманная-{i}"));
+            assert!(
+                adapter.prompt(prompt_for(&bogus)).await.is_err(),
+                "sessionId без session/new должен отклоняться"
+            );
+        }
+
+        assert_eq!(
+            adapter.leased_sessions().await,
+            0,
+            "отклонённые идентификаторы не должны оставлять следа в лизе"
+        );
+    }
+
+    /// session/cancel освобождает и сессию, и запись в лизе.
+    #[tokio::test]
+    async fn cancel_releases_lease_entry() {
+        let adapter = A2aAsAcp::new(StubA2aAgent, Duration::from_secs(5));
+
+        let session = adapter.new_session(new_session_req()).await.unwrap().session_id;
+        adapter.prompt(prompt_for(&session)).await.unwrap();
+
+        assert_eq!(adapter.active_sessions().await, 1);
+        assert_eq!(adapter.leased_sessions().await, 1);
+
+        adapter.cancel(session).await.unwrap();
+
+        assert_eq!(adapter.active_sessions().await, 0);
+        assert_eq!(adapter.leased_sessions().await, 0, "лиз должен быть освобождён");
+    }
+
+    /// Долгое соединение с множеством закрытых сессий не копит записи.
+    #[tokio::test]
+    async fn long_connection_does_not_accumulate_lease_entries() {
+        let adapter = A2aAsAcp::new(StubA2aAgent, Duration::from_secs(5));
+
+        for _ in 0..300 {
+            let session =
+                adapter.new_session(new_session_req()).await.unwrap().session_id;
+            adapter.prompt(prompt_for(&session)).await.unwrap();
+            adapter.cancel(session).await.unwrap();
+        }
+
+        assert_eq!(adapter.active_sessions().await, 0);
+        assert_eq!(adapter.leased_sessions().await, 0);
+    }
+
+    /// Клиент, который не закрывает сессии, упирается в потолок, а не
+    /// в память шлюза.
+    #[tokio::test]
+    async fn open_sessions_hit_the_cap() {
+        let adapter = A2aAsAcp::new(StubA2aAgent, Duration::from_secs(5));
+
+        for _ in 0..MAX_SESSIONS_PER_CONNECTION {
+            adapter.new_session(new_session_req()).await.unwrap();
+        }
+
+        assert!(
+            adapter.new_session(new_session_req()).await.is_err(),
+            "за потолком session/new должен отказывать"
+        );
+    }
+
+    /// Простаивающие сессии выселяются вместе с записями в лизе.
+    #[tokio::test]
+    async fn idle_sessions_release_lease_entries() {
+        let adapter = A2aAsAcp::with_session_ttl(
+            StubA2aAgent,
+            Duration::from_secs(5),
+            Duration::from_millis(50),
+        );
+
+        let session = adapter.new_session(new_session_req()).await.unwrap().session_id;
+        adapter.prompt(prompt_for(&session)).await.unwrap();
+        assert_eq!(adapter.leased_sessions().await, 1);
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        // Любое обращение прогоняет выселение.
+        adapter.new_session(new_session_req()).await.unwrap();
+
+        assert_eq!(adapter.active_sessions().await, 1, "остаётся только свежая сессия");
+        assert_eq!(adapter.leased_sessions().await, 0, "лиз просроченной сессии освобождён");
     }
 }
