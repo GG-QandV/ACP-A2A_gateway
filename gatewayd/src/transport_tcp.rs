@@ -6,15 +6,36 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use core::{A2aAsAcp, AcpAgent, HttpA2aAgent};
+use gateway_core::{A2aAsAcp, AcpAgent, HttpA2aAgent};
 use protocol::acp::{InitializeRequest, NewSessionRequest, PromptRequest, SessionId};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::Command;
 
 use crate::registry::{Registry, Transport};
+
+/// ДОБАВЛЕНО (аудит P1-5): read_line читал строку неограниченной длины —
+/// один клиент мог выесть память процесса одной строкой без \n.
+const MAX_LINE_BYTES: u64 = 8 * 1024 * 1024;
+/// ДОБАВЛЕНО (аудит P1-5): молчащее соединение висело вечно (slowloris).
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// read_line с потолком. Семантика возврата та же: Ok(0) на EOF.
+async fn read_line_limited<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    line: &mut String,
+) -> anyhow::Result<usize> {
+    let n = {
+        let mut limited = reader.take(MAX_LINE_BYTES);
+        limited.read_line(line).await?
+    };
+    if n as u64 >= MAX_LINE_BYTES {
+        anyhow::bail!("line exceeds {MAX_LINE_BYTES} bytes limit");
+    }
+    Ok(n)
+}
 
 #[derive(Debug, Deserialize)]
 struct Handshake {
@@ -54,7 +75,9 @@ async fn handle_connection(
     let mut reader = BufReader::new(read_half);
 
     let mut handshake_line = String::new();
-    reader.read_line(&mut handshake_line).await?;
+    tokio::time::timeout(HANDSHAKE_TIMEOUT, read_line_limited(&mut reader, &mut handshake_line))
+        .await
+        .map_err(|_| anyhow::anyhow!("handshake timeout"))??;
     let handshake: Handshake = serde_json::from_str(handshake_line.trim())
         .map_err(|e| anyhow::anyhow!("invalid handshake: {e}"))?;
 
@@ -98,6 +121,9 @@ async fn handle_stdio_passthrough(
     cmd.stdin(std::process::Stdio::piped());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::inherit());
+    // ИСПРАВЛЕНО (аудит P2-9): без kill_on_drop процесс агента переживал
+    // соединение и оставался сиротой при панике/отмене таска.
+    cmd.kill_on_drop(true);
 
     let mut child = cmd.spawn()?;
     let mut child_stdin = child.stdin.take().ok_or_else(|| anyhow::anyhow!("no stdin"))?;
@@ -108,7 +134,7 @@ async fn handle_stdio_passthrough(
         let mut line = String::new();
         loop {
             line.clear();
-            let n = reader.read_line(&mut line).await?;
+            let n = read_line_limited(&mut reader, &mut line).await?;
             if n == 0 {
                 break;
             }
@@ -121,7 +147,7 @@ async fn handle_stdio_passthrough(
         let mut line = String::new();
         loop {
             line.clear();
-            let n = child_stdout_reader.read_line(&mut line).await?;
+            let n = read_line_limited(&mut child_stdout_reader, &mut line).await?;
             if n == 0 {
                 break;
             }
@@ -139,9 +165,13 @@ async fn handle_stdio_passthrough(
     Ok(())
 }
 
+/// ИСПРАВЛЕНО (аудит P2-3): поле id было обязательным, поэтому
+/// JSON-RPC notification не парсился и клиент получал parse error.
+/// В ACP session/cancel — именно notification (см. core/src/agent.rs).
 #[derive(Debug, Deserialize)]
 struct JsonRpcRequest {
-    id: Value,
+    #[serde(default)]
+    id: Option<Value>,
     method: String,
     #[serde(default)]
     params: Value,
@@ -181,7 +211,7 @@ async fn handle_http_target(
     let mut line = String::new();
     loop {
         line.clear();
-        let n = reader.read_line(&mut line).await?;
+        let n = read_line_limited(&mut reader, &mut line).await?;
         if n == 0 {
             break;
         }
@@ -195,9 +225,18 @@ async fn handle_http_target(
         };
 
         let response = dispatch_acp_method(&adapter, &request).await;
+
+        // Notification (id отсутствует): по JSON-RPC ответ не отправляется.
+        let Some(id) = request.id.clone() else {
+            if let Err(e) = response {
+                tracing::warn!(method = %request.method, error = %e, "notification failed");
+            }
+            continue;
+        };
+
         match response {
-            Ok(result) => write_ok(&mut writer, request.id, result).await?,
-            Err(e) => write_error(&mut writer, request.id, -32000, &e.to_string()).await?,
+            Ok(result) => write_ok(&mut writer, id, result).await?,
+            Err(e) => write_error(&mut writer, id, -32000, &e.to_string()).await?,
         }
     }
 
@@ -222,8 +261,8 @@ async fn dispatch_acp_method(
         "session/prompt" => {
             let req: PromptRequest = serde_json::from_value(request.params.clone())?;
             match adapter.prompt(req).await? {
-                core::Reply::Complete(resp) => Ok(serde_json::to_value(resp)?),
-                core::Reply::Streaming(_) => {
+                gateway_core::Reply::Complete(resp) => Ok(serde_json::to_value(resp)?),
+                gateway_core::Reply::Streaming(_) => {
                     anyhow::bail!("Фаза 1: стриминг для ACP->A2A направления не реализован")
                 }
             }
