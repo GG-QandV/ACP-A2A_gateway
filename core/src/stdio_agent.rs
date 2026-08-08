@@ -81,6 +81,11 @@ impl StdioAcpAgent {
         })
     }
 
+    /// Публичная проверка живости — нужна супервизору и кэшу адаптеров.
+    pub async fn is_alive(&self) -> bool {
+        matches!(self.child.lock().await.try_wait(), Ok(None))
+    }
+
     async fn ensure_alive(&self) -> anyhow::Result<()> {
         let mut child = self.child.lock().await;
         match child.try_wait()? {
@@ -215,6 +220,10 @@ impl AcpAgent for StdioAcpAgent {
 
     async fn cancel(&self, session: SessionId) -> anyhow::Result<()> {
         self.notify("session/cancel", json!({ "sessionId": session.0 })).await
+    }
+
+    async fn is_alive(&self) -> bool {
+        StdioAcpAgent::is_alive(self).await
     }
 }
 
