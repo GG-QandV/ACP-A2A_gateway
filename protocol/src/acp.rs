@@ -44,6 +44,9 @@ pub struct Implementation {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InitializeResponse {
+    /// Версия протокола. claurst отвечает числом (1), а не строкой —
+    /// принимаем оба варианта.
+    #[serde(default, deserialize_with = "de_version")]
     pub protocol_version: String,
     #[serde(default)]
     pub agent_capabilities: AgentCapabilities,
@@ -51,6 +54,23 @@ pub struct InitializeResponse {
     pub agent_info: Option<Implementation>,
     #[serde(default)]
     pub auth_methods: Vec<AuthMethod>,
+}
+
+fn de_version<'de, D>(d: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Version {
+        S(String),
+        N(serde_json::Value),
+    }
+    match Version::deserialize(d)? {
+        Version::S(s) => Ok(s),
+        Version::N(v) => Ok(v.to_string()),
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
