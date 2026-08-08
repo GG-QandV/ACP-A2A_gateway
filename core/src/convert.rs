@@ -197,6 +197,12 @@ impl<T: AcpAgent> AcpAsA2a<T> {
             }
         }
 
+        // ИСПРАВЛЕНО (найдено live-тестом): сначала приводим агента в
+        // рабочее состояние (при необходимости — с перезапуском), и
+        // только потом читаем поколение. Иначе сверка шла со старым
+        // номером, промпт уходил в свежий процесс со старым sessionId,
+        // и клиент получал «Invalid params» от агента вместо ContextLost.
+        self.inner.ensure_ready().await?;
         let generation = self.inner.generation().await;
 
         if let Some(entry) = sessions.get(context) {
@@ -560,11 +566,20 @@ mod tests {
         /// Имитация перезапуска процесса: поколение растёт, как у
         /// SupervisedStdioAgent после респавна.
         generation: std::sync::atomic::AtomicU64,
+        /// Процесс убит и ждёт ленивого перезапуска в ensure_ready().
+        dead: std::sync::atomic::AtomicBool,
     }
 
     impl EchoAcpAgent {
         fn simulate_restart(&self) {
             self.generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        /// Процесс убит, но перезапуска ещё не было — поколение
+        /// поднимется только внутри ensure_ready(), как у настоящего
+        /// SupervisedStdioAgent с ленивым респавном.
+        fn simulate_kill(&self) {
+            self.dead.store(true, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
@@ -601,6 +616,15 @@ mod tests {
         }
 
         async fn cancel(&self, _session: SessionId) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        /// Ленивый респавн ровно как у супервизора: смерть процесса
+        /// обнаруживается здесь, и здесь же растёт поколение.
+        async fn ensure_ready(&self) -> anyhow::Result<()> {
+            if self.dead.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                self.generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
             Ok(())
         }
 
@@ -1000,6 +1024,60 @@ mod tests {
         adapter.send_task_as(owner, task_in_context("t-1", "ctx-new", "раз")).await.unwrap();
         adapter.send_task_as(owner, task_in_context("t-2", "ctx-new", "два")).await.unwrap();
 
+        assert_eq!(adapter.active_sessions().await, 1);
+    }
+
+    // ---------------------------------------------------------------
+    // Регрессии на дефекты, найденные live-тестом на claurst
+    // ---------------------------------------------------------------
+
+    /// Дефект 1 из live-теста: при ленивом респавне поколение читалось
+    /// ДО перезапуска, сверка проходила, промпт уходил в свежий процесс
+    /// со старым sessionId, и клиент получал «Invalid params» от агента.
+    /// ContextLost срабатывал только со второго обращения.
+    ///
+    /// Здесь агент убит, но ещё не перезапущен — ровно то состояние,
+    /// в котором приходит ПЕРВЫЙ запрос после kill.
+    #[tokio::test]
+    async fn first_request_after_kill_reports_context_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = adapter_for_test(dir.path());
+        let owner = Owner::from_token("token-alice");
+
+        adapter.send_task_as(owner, task_in_context("t-1", "ctx-1", "запомни 42")).await.unwrap();
+
+        // Процесс убит; перезапуск произойдёт лениво, внутри вызова.
+        adapter.inner.simulate_kill();
+
+        let err = adapter
+            .send_task_as(owner, task_in_context("t-2", "ctx-1", "что я просил запомнить?"))
+            .await
+            .err()
+            .expect("первый же запрос после смерти агента должен дать ContextLost");
+
+        assert!(
+            err.downcast_ref::<ContextLost>().is_some(),
+            "ожидался ContextLost на ПЕРВОМ обращении, получено: {err}"
+        );
+    }
+
+    /// И сразу после пометки разговор восстанавливается — одного
+    /// уведомления клиенту достаточно.
+    #[tokio::test]
+    async fn context_recovers_right_after_kill_notice() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = adapter_for_test(dir.path());
+        let owner = Owner::from_token("token-alice");
+
+        adapter.send_task_as(owner, task_in_context("t-1", "ctx-1", "раз")).await.unwrap();
+        adapter.inner.simulate_kill();
+
+        assert!(adapter
+            .send_task_as(owner, task_in_context("t-2", "ctx-1", "два"))
+            .await
+            .is_err());
+
+        adapter.send_task_as(owner, task_in_context("t-3", "ctx-1", "три")).await.unwrap();
         assert_eq!(adapter.active_sessions().await, 1);
     }
 }

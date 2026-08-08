@@ -160,6 +160,12 @@ impl AcpAgent for SupervisedStdioAgent {
         self.healthy().await?.cancel(session).await
     }
 
+    /// Форсирует проверку живости и, при необходимости, перезапуск —
+    /// поэтому вызванный следом generation() уже актуален.
+    async fn ensure_ready(&self) -> anyhow::Result<()> {
+        self.healthy().await.map(|_| ())
+    }
+
     async fn generation(&self) -> u64 {
         self.generation.load(Ordering::SeqCst)
     }
