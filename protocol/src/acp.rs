@@ -1,4 +1,4 @@
-//! protocol/src/acp.rs — ТОЧНАЯ схема по agentclientprotocol.com/protocol/v1/schema
+//! protocol/src/acp.rs — точная схема по agentclientprotocol.com/protocol/v1/schema
 
 use serde::{Deserialize, Serialize};
 

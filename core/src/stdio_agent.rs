@@ -1,8 +1,8 @@
 //! core/src/stdio_agent.rs
 //!
 //! StdioAcpAgent — реальная реализация AcpAgent через spawn процесса.
-//! Запросы коррелируются по JSON-RPC id через oneshot-канал. Если
-//! процесс умирает, pending-запросы получают ошибку вместо зависания.
+//! Модель: один процесс на инстанс, запросы коррелируются по JSON-RPC id
+//! через oneshot-канал. session/cancel — notification (без id).
 
 use std::collections::HashMap;
 use std::process::Stdio;
@@ -184,6 +184,7 @@ impl AcpAgent for StdioAcpAgent {
 
 impl Drop for StdioAcpAgent {
     fn drop(&mut self) {
-        // Best-effort: асинхронный kill недоступен в Drop.
+        // Best-effort: асинхронный kill недоступен в Drop — известное
+        // ограничение MVP, нормальный путь остановки — явный shutdown.
     }
 }

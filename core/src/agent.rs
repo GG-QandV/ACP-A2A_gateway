@@ -1,4 +1,4 @@
-//! core/src/agent.rs
+//! core/src/agent.rs — trait'ы под реальные Request/Response типы протоколов.
 
 use async_trait::async_trait;
 use protocol::acp::{
@@ -19,6 +19,8 @@ pub trait AcpAgent: Send + Sync {
         req: PromptRequest,
     ) -> anyhow::Result<Reply<PromptResponse, SessionUpdate>>;
 
+    /// ACP-канон: session/cancel — notification, без ответа. Поэтому
+    /// сигнатура возвращает (), а не структуру с результатом.
     async fn cancel(&self, session: SessionId) -> anyhow::Result<()>;
 }
 
@@ -29,5 +31,6 @@ pub trait A2aAgent: Send + Sync {
     async fn send_task(&self, task: Task) -> anyhow::Result<Reply<Task, A2aEvent>>;
     async fn get_task(&self, id: TaskId) -> anyhow::Result<Task>;
 
+    /// A2A-канон: task/cancel ДОЛЖЕН вернуть Task (не notification).
     async fn cancel_task(&self, id: TaskId) -> anyhow::Result<Task>;
 }

@@ -1,5 +1,5 @@
-//! gatewayd/src/transport_tcp.rs — направления 1 (ACP<->ACP passthrough)
-//! и 3 (ACP-клиент -> A2A-агент через конвертер).
+//! gatewayd/src/transport_tcp.rs
+//! Направления 1 (ACP<->ACP passthrough) и 3 (ACP-клиент -> A2A-агент).
 
 use std::collections::HashMap;
 use std::path::PathBuf;

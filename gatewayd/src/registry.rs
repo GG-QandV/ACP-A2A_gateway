@@ -1,4 +1,6 @@
 //! gatewayd/src/registry.rs
+//! Плоский реестр агентов + токен-проверка. Токен — allow/deny на вход
+//! в гейтвей, не привязан к списку агентов.
 
 use std::collections::{HashMap, HashSet};
 
@@ -20,7 +22,6 @@ pub struct AgentEntry {
     pub transport: Transport,
 }
 
-/// Токен — allow/deny на вход в gateway, не привязан к конкретным агентам.
 pub struct Registry {
     tokens: HashSet<String>,
     agents: HashMap<String, AgentEntry>,

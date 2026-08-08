@@ -1,4 +1,4 @@
-//! protocol/src/a2a.rs — ТОЧНАЯ схема A2A v1.0 (a2a-protocol.org/specification).
+//! protocol/src/a2a.rs — точная схема A2A v1.0 (a2a-protocol.org/specification)
 
 use serde::{Deserialize, Serialize};
 
@@ -37,7 +37,7 @@ pub struct AgentSkill {
     pub description: Option<String>,
 }
 
-// --- TaskState ---
+// --- TaskState — 8 состояний ---
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]

@@ -1,8 +1,11 @@
 //! core/src/lease.rs
 //!
-//! TurnLease: сериализация promptов на одну сессию. Fail-closed: если
-//! лиз не получен за timeout, вызывающий код НЕ входит в критическую
-//! секцию (в отличие от тихого зависания).
+//! TurnLease: сериализация promptов на одну сессию. Без него два
+//! одновременных session/prompt (или task/send) к одному ACP-процессу
+//! перемешивают его stdin/stdout поток.
+//!
+//! Fail-closed: если лиз не получен за timeout, вызывающий код НЕ входит
+//! в критическую секцию (в отличие от тихого зависания).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -21,6 +24,8 @@ pub struct TurnLease {
     locks: Mutex<HashMap<SessionId, Arc<Mutex<()>>>>,
 }
 
+/// RAII guard: лиз освобождается автоматически при Drop, даже если
+/// вызывающий код вернётся через `?` на середине обработки.
 pub struct TurnGuard(#[allow(dead_code)] OwnedMutexGuard<()>);
 
 impl TurnLease {
@@ -40,6 +45,7 @@ impl TurnLease {
         }
     }
 
+    /// Вызывается при закрытии сессии, чтобы не накапливать записи в HashMap.
     pub async fn forget(&self, session: &SessionId) {
         self.locks.lock().await.remove(session);
     }

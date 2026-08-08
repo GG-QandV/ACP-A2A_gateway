@@ -1,5 +1,7 @@
-//! core/src/convert.rs — финальная версия. lease_timeout передаётся
-//! через конструктор, хардкода Duration::from_secs(30) нет.
+//! core/src/convert.rs — финальная версия. lease_timeout передаётся через
+//! конструктор, хардкода Duration::from_secs(30) нигде нет — таймаут
+//! настраивается вызывающим кодом (main.rs -> transport_*.rs), который
+//! читает его из config.yaml (turn_lease_timeout_secs).
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -64,7 +66,7 @@ fn prompt_to_message(p: PromptRequest) -> Message {
 }
 
 // =========================================================================
-// 2. TaskState <-> StopReason
+// 2. TaskState <-> StopReason — НЕ биекция, задокументировано явно.
 // =========================================================================
 
 fn task_state_to_stop_reason(state: TaskState) -> anyhow::Result<StopReason> {
@@ -90,7 +92,7 @@ fn stop_reason_to_task_state(sr: StopReason) -> TaskState {
 }
 
 // =========================================================================
-// 3. AcpAsA2a
+// 3. AcpAsA2a — A2A-клиент видит ACP-агента.
 // =========================================================================
 
 pub struct AcpAsA2a<T: AcpAgent> {
@@ -211,7 +213,7 @@ impl<T: AcpAgent + Send + Sync> A2aAgent for AcpAsA2a<T> {
 }
 
 // =========================================================================
-// 4. A2aAsAcp
+// 4. A2aAsAcp — ACP-клиент видит A2A-агента.
 // =========================================================================
 
 pub struct A2aAsAcp<T: A2aAgent> {

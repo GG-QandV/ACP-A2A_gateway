@@ -1,4 +1,4 @@
-//! core/src/lib.rs
+//! core/src/lib.rs — финальная версия для MVP: все модули ядра на месте.
 
 pub mod agent;
 pub mod convert;

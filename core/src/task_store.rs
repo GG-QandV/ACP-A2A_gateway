@@ -1,7 +1,8 @@
 //! core/src/task_store.rs
 //!
-//! Файловое хранилище задач: один JSON-файл на задачу, atomic write через
-//! tmp+rename, переживает рестарт процесса.
+//! Файловое хранилище задач: закрывает get_task в AcpAsA2a (см. §5.3 ТЗ).
+//! Один JSON-файл на задачу, atomic write через tmp+rename, переживает
+//! рестарт процесса (но не обязательно reboot машины, если base_dir = /tmp).
 
 use std::path::PathBuf;
 

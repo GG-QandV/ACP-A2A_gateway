@@ -1,5 +1,7 @@
-//! gatewayd/src/main.rs — читает config.yaml, строит Registry, поднимает
-//! TCP (направления 1 и 3) и HTTP (направления 2 и 4) параллельно.
+//! gatewayd/src/main.rs
+//! Читает config.yaml, строит Registry, поднимает TCP и HTTP параллельно.
+//! Направления 1 и 3 (ACP-клиент как входящая сторона) — TCP.
+//! Направления 2 и 4 (A2A-клиент как входящая сторона) — HTTP.
 
 mod registry;
 mod transport_a2a_passthrough;
@@ -63,7 +65,10 @@ fn build_registry(raw: &RawConfig) -> Registry {
                 RawAgentEntry::Stdio { command, cwd, env } => Transport::Stdio {
                     command: command.clone(),
                     cwd: cwd.clone(),
-                    env: env.iter().map(|(k, v)| (k.clone(), resolve_env_placeholders(v))).collect(),
+                    env: env
+                        .iter()
+                        .map(|(k, v)| (k.clone(), resolve_env_placeholders(v)))
+                        .collect(),
                 },
                 RawAgentEntry::Http { url, push_token } => Transport::Http {
                     url: url.clone(),

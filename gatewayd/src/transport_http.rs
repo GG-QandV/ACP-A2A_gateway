@@ -1,4 +1,6 @@
-//! gatewayd/src/transport_http.rs — направление 4: A2A-клиент -> ACP-агент.
+//! gatewayd/src/transport_http.rs
+//! Направление 4: A2A-клиент -> ACP-агент.
+//! Эндпоинты: GET /agents/:id/.well-known/agent.json, POST /agents/:id/rpc
 
 use std::collections::HashMap;
 use std::path::PathBuf;
