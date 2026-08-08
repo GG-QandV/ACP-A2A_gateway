@@ -30,7 +30,9 @@ type UpdatesMap = Arc<Mutex<HashMap<String, Vec<protocol::acp::ContentBlock>>>>;
 
 pub struct StdioAcpAgent {
     child: Mutex<Child>,
-    stdin: Mutex<tokio::process::ChildStdin>,
+    /// Arc, потому что писать в stdin теперь должен и reader-таск:
+    /// на запросы агента к клиенту обязан приходить ответ.
+    stdin: Arc<Mutex<tokio::process::ChildStdin>>,
     next_id: AtomicU64,
     pending: PendingMap,
     updates: UpdatesMap,
@@ -67,18 +69,29 @@ impl StdioAcpAgent {
         let stdin = child.stdin.take().ok_or_else(|| anyhow::anyhow!("no stdin"))?;
         let stdout = child.stdout.take().ok_or_else(|| anyhow::anyhow!("no stdout"))?;
 
+        let stdin = Arc::new(Mutex::new(stdin));
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let updates: UpdatesMap = Arc::new(Mutex::new(HashMap::new()));
-        spawn_reader_task(BufReader::new(stdout), pending.clone(), updates.clone());
+        spawn_reader_task(
+            BufReader::new(stdout),
+            pending.clone(),
+            updates.clone(),
+            stdin.clone(),
+        );
 
         Ok(Self {
             child: Mutex::new(child),
-            stdin: Mutex::new(stdin),
+            stdin,
             next_id: AtomicU64::new(1),
             pending,
             updates,
             call_timeout,
         })
+    }
+
+    /// Публичная проверка живости — нужна супервизору и кэшу адаптеров.
+    pub async fn is_alive(&self) -> bool {
+        matches!(self.child.lock().await.try_wait(), Ok(None))
     }
 
     async fn ensure_alive(&self) -> anyhow::Result<()> {
@@ -144,6 +157,7 @@ fn spawn_reader_task(
     mut reader: BufReader<tokio::process::ChildStdout>,
     pending: PendingMap,
     updates: UpdatesMap,
+    stdin: Arc<Mutex<tokio::process::ChildStdin>>,
 ) {
     tokio::spawn(async move {
         let mut line = String::new();
@@ -160,11 +174,35 @@ fn spawn_reader_task(
                 Err(_) => continue,
             };
 
+            // ИСПРАВЛЕНО (найдено live-тестом): раньше ответом считалась
+            // ЛЮБАЯ строка с числовым id. Но ACP — двусторонний JSON-RPC:
+            // агент сам шлёт клиенту запросы (session/request_permission,
+            // fs/read_text_file), и нумерация их id начинается с 1, то есть
+            // сталкивается с нашей. Такой запрос агента съедал запись из
+            // pending, наш настоящий ответ разрешать было уже некому — и
+            // вызов висел до таймаута. Именно это давало стабильный
+            // «agent did not respond to session/prompt within 60s» при
+            // продолжении разговора: на втором ходу агент успевал о
+            // чём-нибудь спросить.
+            //
+            // Различаем по наличию "method": оно есть у запросов и
+            // нотификаций и отсутствует у ответов.
+            if parsed.get("method").is_some() {
+                match parsed.get("id") {
+                    // Запрос агента к клиенту. Отвечать обязаны: без
+                    // ответа агент виснет на своей стороне.
+                    Some(request_id) => {
+                        reply_method_not_found(&stdin, request_id.clone(), &parsed).await;
+                    }
+                    // Нотификация: AgentMessageChunk копится по sessionId
+                    // и прикладывается к PromptResponse в конце хода
+                    // (аудит P2-1).
+                    None => collect_session_update(&parsed, &updates).await,
+                }
+                continue;
+            }
+
             let Some(id) = parsed.get("id").and_then(Value::as_u64) else {
-                // ИСПРАВЛЕНО (аудит P2-1): нотификация агента больше не
-                // выбрасывается — AgentMessageChunk копится по sessionId
-                // и прикладывается к PromptResponse в конце хода.
-                collect_session_update(&parsed, &updates).await;
                 continue;
             };
 
@@ -184,6 +222,34 @@ fn spawn_reader_task(
             let _ = tx.send(Err("agent stdout closed (process exited)".to_string()));
         }
     });
+}
+
+
+/// Ответ на запрос агента к клиенту. Клиентские возможности (запрос
+/// разрешений, доступ к файлам, терминал) шлюзом не реализованы —
+/// сообщаем об этом честно, вместо того чтобы молчать и подвешивать
+/// агента. Возможности заявлены пустыми в initialize, так что
+/// корректный агент такие запросы слать не должен.
+async fn reply_method_not_found(
+    stdin: &Arc<Mutex<tokio::process::ChildStdin>>,
+    id: Value,
+    request: &Value,
+) {
+    let method = request.get("method").and_then(Value::as_str).unwrap_or("<unknown>");
+    tracing::warn!(%method, "агент запросил у клиента метод, который шлюз не поддерживает");
+
+    let response = json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": -32601,
+            "message": format!("gateway не реализует клиентский метод {method}"),
+        }
+    });
+
+    let Ok(mut line) = serde_json::to_vec(&response) else { return };
+    line.push(b'\n');
+    let _ = stdin.lock().await.write_all(&line).await;
 }
 
 #[async_trait]
@@ -215,6 +281,10 @@ impl AcpAgent for StdioAcpAgent {
 
     async fn cancel(&self, session: SessionId) -> anyhow::Result<()> {
         self.notify("session/cancel", json!({ "sessionId": session.0 })).await
+    }
+
+    async fn is_alive(&self) -> bool {
+        StdioAcpAgent::is_alive(self).await
     }
 }
 

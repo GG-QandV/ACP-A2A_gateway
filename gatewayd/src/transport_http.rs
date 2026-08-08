@@ -12,7 +12,9 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Json};
 use axum::routing::{get, post};
 use axum::Router;
-use gateway_core::{A2aAgent, AcpAsA2a, Owner, StdioAcpAgent};
+use gateway_core::{
+    A2aAgent, AcpAsA2a, ContextLost, Owner, SpawnConfig, SupervisedStdioAgent,
+};
 use protocol::a2a::{Task, TaskId};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -25,7 +27,7 @@ pub struct HttpState {
     lease_timeout: Duration,
     /// ДОБАВЛЕНО (аудит P2-11): таймаут RPC к stdio-агенту из конфига.
     call_timeout: Duration,
-    adapters: tokio::sync::Mutex<HashMap<String, Arc<AcpAsA2a<StdioAcpAgent>>>>,
+    adapters: tokio::sync::Mutex<HashMap<String, Arc<AcpAsA2a<SupervisedStdioAgent>>>>,
 }
 
 pub fn router(
@@ -59,8 +61,12 @@ fn extract_bearer(headers: &HeaderMap) -> Option<String> {
 async fn get_or_spawn_adapter(
     state: &Arc<HttpState>,
     agent_id: &str,
-) -> anyhow::Result<Arc<AcpAsA2a<StdioAcpAgent>>> {
+) -> anyhow::Result<Arc<AcpAsA2a<SupervisedStdioAgent>>> {
     let mut adapters = state.adapters.lock().await;
+    // ИСПРАВЛЕНО (аудит P2-10): раньше кэш отдавал адаптер, не
+    // интересуясь, жив ли за ним процесс. Теперь мёртвый процесс
+    // поднимает сам адаптер (через SupervisedStdioAgent), а кэш
+    // остаётся валидным — пересоздавать его больше не нужно.
     if let Some(existing) = adapters.get(agent_id) {
         return Ok(existing.clone());
     }
@@ -76,10 +82,16 @@ async fn get_or_spawn_adapter(
     };
 
     let default_cwd = cwd.clone().unwrap_or_else(|| ".".to_string());
-    let stdio_agent = StdioAcpAgent::spawn(&command, &cwd, &env, state.call_timeout).await?;
+    let supervised = SupervisedStdioAgent::spawn(SpawnConfig {
+        command,
+        cwd,
+        env,
+        call_timeout: state.call_timeout,
+    })
+    .await?;
 
     let adapter = Arc::new(AcpAsA2a::new(
-        stdio_agent,
+        supervised,
         default_cwd,
         state.task_store_dir.join(agent_id),
         state.lease_timeout,
@@ -145,16 +157,26 @@ async fn rpc_handler(
     let result = dispatch_a2a_method(&adapter, owner, &request).await;
     match result {
         Ok(value) => Json(json!({ "jsonrpc": "2.0", "id": request.id, "result": value })).into_response(),
+        // ДОБАВЛЕНО (аудит P2-10): потеря контекста — не «что-то пошло
+        // не так». Клиент должен отличить её от прочих ошибок, чтобы
+        // начать разговор заново, а не молча продолжать в пустоту.
+        Err(e) if e.downcast_ref::<ContextLost>().is_some() => {
+            rpc_error(request.id, StatusCode::CONFLICT, CONTEXT_LOST_CODE, &e.to_string())
+        }
         Err(e) => rpc_error(request.id, StatusCode::OK, -32000, &e.to_string()),
     }
 }
+
+/// Код ошибки для потерянного контекста. Диапазон -32000..-32099
+/// отведён JSON-RPC под ошибки приложения.
+const CONTEXT_LOST_CODE: i64 = -32010;
 
 fn rpc_error(id: Value, status: StatusCode, code: i64, message: &str) -> axum::response::Response {
     (status, Json(json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } }))).into_response()
 }
 
 async fn dispatch_a2a_method(
-    adapter: &Arc<AcpAsA2a<StdioAcpAgent>>,
+    adapter: &Arc<AcpAsA2a<SupervisedStdioAgent>>,
     owner: Owner,
     request: &JsonRpcRequest,
 ) -> anyhow::Result<Value> {
