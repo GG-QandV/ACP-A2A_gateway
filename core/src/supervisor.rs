@@ -23,8 +23,8 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use protocol::acp::{
-    InitializeRequest, InitializeResponse, NewSessionRequest, NewSessionResponse, PromptRequest,
-    PromptResponse, SessionId, SessionUpdate,
+    ClientCapabilities, Implementation, InitializeRequest, InitializeResponse, NewSessionRequest,
+    NewSessionResponse, PromptRequest, PromptResponse, SessionId, SessionUpdate,
 };
 use tokio::sync::Mutex;
 
@@ -49,10 +49,19 @@ pub struct SpawnConfig {
     pub cwd: Option<String>,
     pub env: HashMap<String, String>,
     pub call_timeout: Duration,
+    /// Версия ACP, заявляемая шлюзом при рукопожатии.
+    pub protocol_version: String,
+}
+
+impl SpawnConfig {
+    pub const DEFAULT_PROTOCOL_VERSION: &'static str = "1";
 }
 
 struct Current {
     agent: Arc<StdioAcpAgent>,
+    /// Ответ на initialize текущего процесса. Рукопожатие делается ОДИН
+    /// раз на процесс, сразу после спавна, и его результат переиспользуется.
+    init: InitializeResponse,
     generation: u64,
     /// Момент последнего спавна — по нему выдерживается backoff, чтобы
     /// агент, падающий на старте, не перезапускался в цикле.
@@ -80,6 +89,33 @@ impl SupervisedStdioAgent {
         config: SpawnConfig,
         respawn_backoff: Duration,
     ) -> anyhow::Result<Self> {
+        let (agent, init) = Self::spawn_and_handshake(&config).await?;
+
+        Ok(Self {
+            config,
+            current: Mutex::new(Current {
+                agent,
+                init,
+                generation: 1,
+                spawned_at: Instant::now(),
+            }),
+            generation: AtomicU64::new(1),
+            respawn_backoff,
+        })
+    }
+
+    /// ИСПРАВЛЕНО (найдено при разборе live-теста): initialize вызывался
+    /// ТОЛЬКО из card(), то есть при запросе agent.json. Клиент, идущий
+    /// сразу в message/send, доводил агента до session/new без
+    /// рукопожатия — прямое нарушение ACP. После респавна свежий процесс
+    /// не получал initialize вообще никогда, даже если исходный получил.
+    ///
+    /// Теперь рукопожатие — часть подъёма процесса: каждый живой
+    /// процесс инициализирован ровно один раз, и первый, и любой
+    /// последующий.
+    async fn spawn_and_handshake(
+        config: &SpawnConfig,
+    ) -> anyhow::Result<(Arc<StdioAcpAgent>, InitializeResponse)> {
         let agent = StdioAcpAgent::spawn(
             &config.command,
             &config.cwd,
@@ -88,16 +124,22 @@ impl SupervisedStdioAgent {
         )
         .await?;
 
-        Ok(Self {
-            config,
-            current: Mutex::new(Current {
-                agent: Arc::new(agent),
-                generation: 1,
-                spawned_at: Instant::now(),
-            }),
-            generation: AtomicU64::new(1),
-            respawn_backoff,
-        })
+        let init = agent
+            .initialize(InitializeRequest {
+                protocol_version: config.protocol_version.clone(),
+                // Клиентские возможности шлюза пусты сознательно: fs,
+                // терминал и запрос разрешений он не реализует, а значит
+                // не должен их заявлять. Корректный агент, увидев это,
+                // не станет слать встречные запросы.
+                client_capabilities: ClientCapabilities::default(),
+                client_info: Some(Implementation {
+                    name: "acp-a2a-gateway".into(),
+                    version: env!("CARGO_PKG_VERSION").into(),
+                }),
+            })
+            .await?;
+
+        Ok((Arc::new(agent), init))
     }
 
     /// Живой агент. Если процесс умер — поднимает новый и увеличивает
@@ -122,15 +164,10 @@ impl SupervisedStdioAgent {
             "процесс агента мёртв, перезапуск; разговоры прошлого поколения будут помечены потерянными"
         );
 
-        let fresh = StdioAcpAgent::spawn(
-            &self.config.command,
-            &self.config.cwd,
-            &self.config.env,
-            self.config.call_timeout,
-        )
-        .await?;
+        let (fresh, init) = Self::spawn_and_handshake(&self.config).await?;
 
-        current.agent = Arc::new(fresh);
+        current.agent = fresh;
+        current.init = init;
         current.generation += 1;
         current.spawned_at = Instant::now();
         self.generation.store(current.generation, Ordering::SeqCst);
@@ -141,8 +178,12 @@ impl SupervisedStdioAgent {
 
 #[async_trait]
 impl AcpAgent for SupervisedStdioAgent {
-    async fn initialize(&self, req: InitializeRequest) -> anyhow::Result<InitializeResponse> {
-        self.healthy().await?.initialize(req).await
+    /// Рукопожатие уже сделано при подъёме процесса — повторно слать
+    /// initialize нельзя, ACP этого не предполагает. Отдаём сохранённый
+    /// ответ живого процесса.
+    async fn initialize(&self, _req: InitializeRequest) -> anyhow::Result<InitializeResponse> {
+        self.healthy().await?;
+        Ok(self.current.lock().await.init.clone())
     }
 
     async fn new_session(&self, req: NewSessionRequest) -> anyhow::Result<NewSessionResponse> {

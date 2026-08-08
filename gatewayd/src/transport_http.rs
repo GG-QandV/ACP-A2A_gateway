@@ -87,6 +87,7 @@ async fn get_or_spawn_adapter(
         cwd,
         env,
         call_timeout: state.call_timeout,
+        protocol_version: SpawnConfig::DEFAULT_PROTOCOL_VERSION.to_string(),
     })
     .await?;
 
