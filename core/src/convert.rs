@@ -18,8 +18,10 @@ use protocol::a2a::{
 
 use crate::agent::{A2aAgent, AcpAgent};
 use crate::lease::TurnLease;
+use crate::owner::Owner;
 use crate::reply::Reply;
-use crate::task_store::TaskStore;
+use crate::supervisor::ContextLost;
+use crate::task_store::{OwnedTask, TaskStore};
 
 // =========================================================================
 // 1. Content mapping
@@ -111,32 +113,15 @@ fn stop_reason_to_task_state(sr: StopReason) -> TaskState {
 // 3. AcpAsA2a — A2A-клиент видит ACP-агента.
 // =========================================================================
 
-/// Владелец разговора. Хранится как хеш токена, а не сам токен: для
-/// проверки «тот же клиент?» достаточно равенства, а держать секреты в
-/// памяти дольше необходимого незачем.
-///
-/// `Anonymous` — вызовы через голый трейт `A2aAgent`, без транспортного
-/// контекста. Это отдельная корзина: анонимные вызовы изолированы от
-/// токенных и друг с другом делят контекст только по явному contextId.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Owner {
-    Anonymous,
-    Token(u64),
-}
-
-impl Owner {
-    pub fn from_token(token: &str) -> Self {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        token.hash(&mut hasher);
-        Owner::Token(hasher.finish())
-    }
-}
-
 struct SessionEntry {
     session_id: SessionId,
     owner: Owner,
     last_used: std::time::Instant,
+    /// ДОБАВЛЕНО (аудит P2-10): поколение процесса агента, в котором
+    /// эта ACP-сессия была заведена. Если процесс с тех пор
+    /// перезапускался, сессии больше нет — и клиент должен узнать об
+    /// этом явно, а не продолжать разговор в пустоту.
+    generation: u64,
 }
 
 /// Потолок числа одновременных разговоров на одного агента. Без него
@@ -212,12 +197,33 @@ impl<T: AcpAgent> AcpAsA2a<T> {
             }
         }
 
-        if let Some(entry) = sessions.get_mut(context) {
+        // ИСПРАВЛЕНО (найдено live-тестом): сначала приводим агента в
+        // рабочее состояние (при необходимости — с перезапуском), и
+        // только потом читаем поколение. Иначе сверка шла со старым
+        // номером, промпт уходил в свежий процесс со старым sessionId,
+        // и клиент получал «Invalid params» от агента вместо ContextLost.
+        self.inner.ensure_ready().await?;
+        let generation = self.inner.generation().await;
+
+        if let Some(entry) = sessions.get(context) {
             // Владелец разговора зафиксирован при создании: чужой
             // contextId не даёт подключиться к чужой сессии.
             if entry.owner != owner {
                 anyhow::bail!("contextId принадлежит другому клиенту");
             }
+
+            // ИСПРАВЛЕНО (аудит P2-10): пережившая перезапуск агента
+            // запись указывает на несуществующую ACP-сессию. Сообщаем
+            // о потере контекста и убираем запись — повторный запрос
+            // с тем же contextId начнёт разговор заново.
+            if entry.generation != generation {
+                let previous = entry.generation;
+                let stale = sessions.remove(context).expect("запись только что читалась");
+                self.lease.forget(&stale.session_id).await;
+                return Err(ContextLost { previous, current: generation }.into());
+            }
+
+            let entry = sessions.get_mut(context).expect("запись только что читалась");
             entry.last_used = now;
             return Ok(entry.session_id.clone());
         }
@@ -239,7 +245,12 @@ impl<T: AcpAgent> AcpAsA2a<T> {
 
         sessions.insert(
             context.clone(),
-            SessionEntry { session_id: resp.session_id.clone(), owner, last_used: now },
+            SessionEntry {
+                session_id: resp.session_id.clone(),
+                owner,
+                last_used: now,
+                generation,
+            },
         );
         Ok(resp.session_id)
     }
@@ -273,9 +284,12 @@ impl<T: AcpAgent> AcpAsA2a<T> {
     /// неизвестен — полное решение требует поля владельца в TaskStore
     /// и вынесено в отдельный пункт.
     pub async fn get_task_as(&self, owner: Owner, id: TaskId) -> anyhow::Result<Task> {
-        let task = self.tasks.load(&id).await?;
-        self.assert_owns(&task.context_id, owner).await?;
-        Ok(task)
+        let stored = self.tasks.load_owned(&id).await?;
+        assert_owner_matches(&stored, owner)?;
+        // Второй рубеж: если задача из старого формата (владелец не
+        // записан), но её разговор ещё жив — спрашиваем у реестра сессий.
+        self.assert_owns(&stored.task.context_id, owner).await?;
+        Ok(stored.task)
     }
 
     /// Отмена с проверкой владельца. Отменяется сессия того разговора,
@@ -283,7 +297,9 @@ impl<T: AcpAgent> AcpAsA2a<T> {
     pub async fn cancel_task_as(&self, owner: Owner, id: TaskId) -> anyhow::Result<Task> {
         // ИСПРАВЛЕНО (аудит P2-4): возвращалась пустышка с пустым
         // context_id, а сохранённая задача затиралась ею же.
-        let mut result = self.tasks.load(&id).await?;
+        let stored = self.tasks.load_owned(&id).await?;
+        assert_owner_matches(&stored, owner)?;
+        let mut result = stored.task;
         self.assert_owns(&result.context_id, owner).await?;
 
         let session = self.lookup_session(&result.context_id, owner).await?;
@@ -291,13 +307,15 @@ impl<T: AcpAgent> AcpAsA2a<T> {
 
         result.status.state = TaskState::Canceled;
         result.status.timestamp = now_iso8601();
-        self.tasks.save(&result).await?;
+        self.tasks.save(&result, owner).await?;
         Ok(result)
     }
 
     /// Разговор либо принадлежит этому владельцу, либо уже забыт
-    /// (выселен по TTL) — во втором случае претендовать не на что и
-    /// отказывать не за что.
+    /// (выселен по TTL). Раньше «забыт» означало «пропускаем» — это и
+    /// была дыра P1-2. Теперь основную проверку делает атрибуция в
+    /// хранилище, а эта остаётся вторым рубежом для записей старого
+    /// формата, у которых владелец не записан.
     async fn assert_owns(&self, context: &ContextId, owner: Owner) -> anyhow::Result<()> {
         let sessions = self.sessions.lock().await;
         match sessions.get(context) {
@@ -358,7 +376,7 @@ impl<T: AcpAgent> AcpAsA2a<T> {
                     artifacts,
                     metadata: None,
                 };
-                self.tasks.save(&result).await?;
+                self.tasks.save(&result, owner).await?;
                 Ok(Reply::Complete(result))
             }
             // ИСПРАВЛЕНО (аудит P2-7): unreachable! = паника воркер-таска
@@ -484,6 +502,21 @@ impl<T: A2aAgent + Send + Sync> AcpAgent for A2aAsAcp<T> {
     }
 }
 
+/// ИСПРАВЛЕНО (аудит P1-2): владелец берётся из хранилища, поэтому
+/// проверка переживает выселение сессии по TTL и рестарт шлюза.
+///
+/// Задачи без записанного владельца (созданы до введения конвертов)
+/// не отклоняются по этому рубежу — иначе обновление шлюза сделало бы
+/// уже накопленные задачи недоступными их же владельцам.
+fn assert_owner_matches(stored: &OwnedTask, owner: Owner) -> anyhow::Result<()> {
+    match stored.owner {
+        Some(recorded) if recorded != owner => {
+            anyhow::bail!("задача принадлежит другому клиенту")
+        }
+        _ => Ok(()),
+    }
+}
+
 fn now_iso8601() -> Option<String> {
     Some(chrono::Utc::now().to_rfc3339())
 }
@@ -530,6 +563,24 @@ mod tests {
     struct EchoAcpAgent {
         sessions_created: std::sync::atomic::AtomicUsize,
         last_prompt_session: std::sync::Mutex<Option<SessionId>>,
+        /// Имитация перезапуска процесса: поколение растёт, как у
+        /// SupervisedStdioAgent после респавна.
+        generation: std::sync::atomic::AtomicU64,
+        /// Процесс убит и ждёт ленивого перезапуска в ensure_ready().
+        dead: std::sync::atomic::AtomicBool,
+    }
+
+    impl EchoAcpAgent {
+        fn simulate_restart(&self) {
+            self.generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        /// Процесс убит, но перезапуска ещё не было — поколение
+        /// поднимется только внутри ensure_ready(), как у настоящего
+        /// SupervisedStdioAgent с ленивым респавном.
+        fn simulate_kill(&self) {
+            self.dead.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 
     #[async_trait]
@@ -566,6 +617,19 @@ mod tests {
 
         async fn cancel(&self, _session: SessionId) -> anyhow::Result<()> {
             Ok(())
+        }
+
+        /// Ленивый респавн ровно как у супервизора: смерть процесса
+        /// обнаруживается здесь, и здесь же растёт поколение.
+        async fn ensure_ready(&self) -> anyhow::Result<()> {
+            if self.dead.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                self.generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            Ok(())
+        }
+
+        async fn generation(&self) -> u64 {
+            self.generation.load(std::sync::atomic::Ordering::SeqCst)
         }
     }
 
@@ -805,5 +869,215 @@ mod tests {
         let canceled = adapter.cancel_task_as(owner, TaskId("t-a".into())).await.unwrap();
         assert_eq!(canceled.context_id.0, "ctx-a");
         assert_eq!(canceled.status.state, TaskState::Canceled);
+    }
+
+    // ---------------------------------------------------------------
+    // Регрессии на аудит P1-2: атрибуция переживает жизнь сессии
+    // ---------------------------------------------------------------
+
+    /// Главная регрессия P1-2: раньше проверка владельца держалась
+    /// только на живом реестре сессий, поэтому после выселения по TTL
+    /// чужая задача снова становилась доступна любому токену.
+    #[tokio::test]
+    async fn foreign_owner_denied_after_session_eviction() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = AcpAsA2a::with_session_ttl(
+            EchoAcpAgent::default(),
+            ".".into(),
+            dir.path(),
+            Duration::from_secs(5),
+            Duration::from_millis(50),
+        );
+
+        let alice = Owner::from_token("token-alice");
+        let mallory = Owner::from_token("token-mallory");
+
+        adapter.send_task_as(alice, task_in_context("t-1", "ctx-secret", "тайна")).await.unwrap();
+
+        // Выселяем разговор: обращение с другим контекстом прогоняет TTL.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        adapter.send_task_as(mallory, task_in_context("t-2", "ctx-other", "своё")).await.unwrap();
+
+        // Сессия alice забыта, но атрибуция задачи осталась в хранилище.
+        assert!(
+            adapter.get_task_as(mallory, TaskId("t-1".into())).await.is_err(),
+            "чужая задача не должна открываться после выселения сессии"
+        );
+        assert!(adapter.get_task_as(alice, TaskId("t-1".into())).await.is_ok());
+    }
+
+    /// Атрибуция переживает рестарт процесса: новый адаптер над тем же
+    /// каталогом хранилища по-прежнему различает владельцев.
+    #[tokio::test]
+    async fn ownership_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let alice = Owner::from_token("token-alice");
+        let mallory = Owner::from_token("token-mallory");
+
+        {
+            let adapter = adapter_for_test(dir.path());
+            adapter.send_task_as(alice, task_in_context("t-1", "ctx-1", "привет")).await.unwrap();
+        }
+
+        // Новый адаптер = пустой реестр сессий, как после рестарта.
+        let restarted = adapter_for_test(dir.path());
+        assert_eq!(restarted.active_sessions().await, 0);
+
+        assert!(restarted.get_task_as(mallory, TaskId("t-1".into())).await.is_err());
+        assert!(restarted.get_task_as(alice, TaskId("t-1".into())).await.is_ok());
+    }
+
+    /// Анонимный вызов не должен вскрывать задачи токенных клиентов.
+    #[tokio::test]
+    async fn anonymous_cannot_read_token_owned_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = adapter_for_test(dir.path());
+        let alice = Owner::from_token("token-alice");
+
+        adapter.send_task_as(alice, task_in_context("t-1", "ctx-1", "привет")).await.unwrap();
+
+        assert!(adapter.get_task(TaskId("t-1".into())).await.is_err());
+    }
+
+    // ---------------------------------------------------------------
+    // Регрессии на аудит P2-10: перезапуск агента помечает разговоры
+    // ---------------------------------------------------------------
+
+    /// Главная регрессия: после перезапуска агента обращение к старому
+    /// разговору должно дать явную ошибку потери контекста, а не тихо
+    /// продолжиться в пустой сессии, где агент ничего не помнит.
+    #[tokio::test]
+    async fn restart_marks_old_context_as_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = adapter_for_test(dir.path());
+        let owner = Owner::from_token("token-alice");
+
+        adapter.send_task_as(owner, task_in_context("t-1", "ctx-1", "запомни 42")).await.unwrap();
+
+        adapter.inner.simulate_restart();
+
+        let err = adapter
+            .send_task_as(owner, task_in_context("t-2", "ctx-1", "что я просил запомнить?"))
+            .await
+            .err()
+            .expect("разговор прошлого поколения должен быть помечен потерянным");
+
+        assert!(
+            err.downcast_ref::<ContextLost>().is_some(),
+            "ошибка должна быть типизированной, чтобы транспорт отличил её: {err}"
+        );
+    }
+
+    /// Пометка одноразовая: клиент узнал о потере — следующий запрос с
+    /// тем же contextId начинает разговор заново и работает.
+    #[tokio::test]
+    async fn context_recovers_after_lost_notice() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = adapter_for_test(dir.path());
+        let owner = Owner::from_token("token-alice");
+
+        adapter.send_task_as(owner, task_in_context("t-1", "ctx-1", "раз")).await.unwrap();
+        adapter.inner.simulate_restart();
+
+        assert!(adapter
+            .send_task_as(owner, task_in_context("t-2", "ctx-1", "два"))
+            .await
+            .is_err());
+
+        // Второе обращение уже создаёт свежую сессию нового поколения.
+        adapter.send_task_as(owner, task_in_context("t-3", "ctx-1", "три")).await.unwrap();
+        assert_eq!(adapter.active_sessions().await, 1);
+    }
+
+    /// Перезапуск не должен превращаться в дыру: чужой contextId
+    /// отклоняется по владельцу раньше, чем сработает пометка.
+    #[tokio::test]
+    async fn restart_does_not_bypass_ownership_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = adapter_for_test(dir.path());
+        let alice = Owner::from_token("token-alice");
+        let mallory = Owner::from_token("token-mallory");
+
+        adapter.send_task_as(alice, task_in_context("t-1", "ctx-secret", "тайна")).await.unwrap();
+        adapter.inner.simulate_restart();
+
+        let err = adapter
+            .send_task_as(mallory, task_in_context("t-2", "ctx-secret", "подсяду"))
+            .await
+            .err()
+            .expect("чужой контекст должен отклоняться и после перезапуска");
+
+        assert!(
+            err.downcast_ref::<ContextLost>().is_none(),
+            "чужаку нельзя сообщать даже факт существования контекста"
+        );
+    }
+
+    /// Разговоры, заведённые уже после перезапуска, не помечаются.
+    #[tokio::test]
+    async fn new_contexts_after_restart_are_not_marked() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = adapter_for_test(dir.path());
+        let owner = Owner::from_token("token-alice");
+
+        adapter.inner.simulate_restart();
+        adapter.send_task_as(owner, task_in_context("t-1", "ctx-new", "раз")).await.unwrap();
+        adapter.send_task_as(owner, task_in_context("t-2", "ctx-new", "два")).await.unwrap();
+
+        assert_eq!(adapter.active_sessions().await, 1);
+    }
+
+    // ---------------------------------------------------------------
+    // Регрессии на дефекты, найденные live-тестом на claurst
+    // ---------------------------------------------------------------
+
+    /// Дефект 1 из live-теста: при ленивом респавне поколение читалось
+    /// ДО перезапуска, сверка проходила, промпт уходил в свежий процесс
+    /// со старым sessionId, и клиент получал «Invalid params» от агента.
+    /// ContextLost срабатывал только со второго обращения.
+    ///
+    /// Здесь агент убит, но ещё не перезапущен — ровно то состояние,
+    /// в котором приходит ПЕРВЫЙ запрос после kill.
+    #[tokio::test]
+    async fn first_request_after_kill_reports_context_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = adapter_for_test(dir.path());
+        let owner = Owner::from_token("token-alice");
+
+        adapter.send_task_as(owner, task_in_context("t-1", "ctx-1", "запомни 42")).await.unwrap();
+
+        // Процесс убит; перезапуск произойдёт лениво, внутри вызова.
+        adapter.inner.simulate_kill();
+
+        let err = adapter
+            .send_task_as(owner, task_in_context("t-2", "ctx-1", "что я просил запомнить?"))
+            .await
+            .err()
+            .expect("первый же запрос после смерти агента должен дать ContextLost");
+
+        assert!(
+            err.downcast_ref::<ContextLost>().is_some(),
+            "ожидался ContextLost на ПЕРВОМ обращении, получено: {err}"
+        );
+    }
+
+    /// И сразу после пометки разговор восстанавливается — одного
+    /// уведомления клиенту достаточно.
+    #[tokio::test]
+    async fn context_recovers_right_after_kill_notice() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = adapter_for_test(dir.path());
+        let owner = Owner::from_token("token-alice");
+
+        adapter.send_task_as(owner, task_in_context("t-1", "ctx-1", "раз")).await.unwrap();
+        adapter.inner.simulate_kill();
+
+        assert!(adapter
+            .send_task_as(owner, task_in_context("t-2", "ctx-1", "два"))
+            .await
+            .is_err());
+
+        adapter.send_task_as(owner, task_in_context("t-3", "ctx-1", "три")).await.unwrap();
+        assert_eq!(adapter.active_sessions().await, 1);
     }
 }

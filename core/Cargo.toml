@@ -17,6 +17,7 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+tracing = { workspace = true }  # ДОБАВЛЕНО (аудит P2-10): супервизор логирует перезапуски
 chrono = { version = "0.4", features = ["clock"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }
 
