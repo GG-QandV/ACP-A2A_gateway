@@ -49,12 +49,14 @@ pub struct SpawnConfig {
     pub cwd: Option<String>,
     pub env: HashMap<String, String>,
     pub call_timeout: Duration,
-    /// Версия ACP, заявляемая шлюзом при рукопожатии.
-    pub protocol_version: String,
+    /// Версия ACP, заявляемая шлюзом при рукопожатии. Число, как в
+    /// протоколе — раньше была строка, и шлюз слал агенту "1".
+    pub protocol_version: protocol::acp::ProtocolVersion,
 }
 
 impl SpawnConfig {
-    pub const DEFAULT_PROTOCOL_VERSION: &'static str = "1";
+    pub const DEFAULT_PROTOCOL_VERSION: protocol::acp::ProtocolVersion =
+        protocol::acp::DEFAULT_PROTOCOL_VERSION;
 }
 
 struct Current {
@@ -126,7 +128,7 @@ impl SupervisedStdioAgent {
 
         let init = agent
             .initialize(InitializeRequest {
-                protocol_version: config.protocol_version.clone(),
+                protocol_version: config.protocol_version,
                 // Клиентские возможности шлюза пусты сознательно: fs,
                 // терминал и запрос разрешений он не реализует, а значит
                 // не должен их заявлять. Корректный агент, увидев это,

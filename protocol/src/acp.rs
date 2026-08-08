@@ -10,7 +10,14 @@ pub struct SessionId(pub String);
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InitializeRequest {
-    pub protocol_version: String,
+    /// ИЗМЕНЕНО: было String. По ACP версия протокола — число, и шлюз
+    /// обязан слать её числом; толерантность уместна на приёме, но не
+    /// в собственном представлении (закон Постела: либерален на входе,
+    /// строг на выходе). Раньше внутренний тип не соответствовал
+    /// протоколу, и шлюз отправлял агенту строку "1" — claurst это
+    /// проглотил, строгий парсер отверг бы.
+    #[serde(deserialize_with = "de_protocol_version")]
+    pub protocol_version: ProtocolVersion,
     #[serde(default)]
     pub client_capabilities: ClientCapabilities,
     #[serde(default)]
@@ -44,10 +51,12 @@ pub struct Implementation {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InitializeResponse {
-    /// Версия протокола. claurst отвечает числом (1), а не строкой —
-    /// принимаем оба варианта.
-    #[serde(default, deserialize_with = "de_version")]
-    pub protocol_version: String,
+    /// Версия протокола. claurst отвечает числом (1), встречаются
+    /// реализации со строкой — принимаем оба, храним и отдаём числом.
+    // default = функция, а не Default::default(): у u32 он равен 0,
+    // а отсутствующее поле означает версию 1, не нулевую.
+    #[serde(default = "default_protocol_version", deserialize_with = "de_protocol_version")]
+    pub protocol_version: ProtocolVersion,
     #[serde(default)]
     pub agent_capabilities: AgentCapabilities,
     #[serde(default)]
@@ -56,20 +65,41 @@ pub struct InitializeResponse {
     pub auth_methods: Vec<AuthMethod>,
 }
 
-fn de_version<'de, D>(d: D) -> Result<String, D::Error>
+/// Версия ACP. Сериализуется всегда числом.
+pub type ProtocolVersion = u32;
+
+/// Версия по умолчанию, если агент поле не прислал.
+pub const DEFAULT_PROTOCOL_VERSION: ProtocolVersion = 1;
+
+fn default_protocol_version() -> ProtocolVersion {
+    DEFAULT_PROTOCOL_VERSION
+}
+
+/// Либеральный приём: число, строка с числом или строка вида "1.0"
+/// (берём мажорную часть). Всё, что не разбирается, — ошибка на границе,
+/// а не мусор, доехавший до логики.
+fn de_protocol_version<'de, D>(d: D) -> Result<ProtocolVersion, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    use serde::Deserialize;
+    use serde::de::Error as _;
+
     #[derive(Deserialize)]
     #[serde(untagged)]
-    enum Version {
-        S(String),
-        N(serde_json::Value),
+    enum Raw {
+        Number(u32),
+        Text(String),
     }
-    match Version::deserialize(d)? {
-        Version::S(s) => Ok(s),
-        Version::N(v) => Ok(v.to_string()),
+
+    match Option::<Raw>::deserialize(d)? {
+        None => Ok(DEFAULT_PROTOCOL_VERSION),
+        Some(Raw::Number(n)) => Ok(n),
+        Some(Raw::Text(s)) => {
+            let major = s.split('.').next().unwrap_or("").trim();
+            major.parse::<ProtocolVersion>().map_err(|_| {
+                D::Error::custom(format!("protocolVersion: не разобрать версию из {s:?}"))
+            })
+        }
     }
 }
 

@@ -58,10 +58,61 @@ fn extract_bearer(headers: &HeaderMap) -> Option<String> {
         .map(str::to_string)
 }
 
+/// ИСПРАВЛЕНО: раньше на этом пути возвращалась одна безликая
+/// anyhow-ошибка, и вызывающий код отвечал 404 / -32601 одинаково на
+/// «нет такого агента», «процесс не поднялся» и «рукопожатие
+/// провалилось». Сообщение врало о природе проблемы: отказ агента
+/// выглядел как опечатка в agent_id, из-за чего диагностика по логам и
+/// статусам вела не туда. В проде это цена каждого инцидента, а не
+/// одного отладочного цикла.
+#[derive(Debug, thiserror::Error)]
+enum AdapterError {
+    #[error("unknown agent_id: {0}")]
+    UnknownAgent(String),
+
+    #[error("agent_id={0} не является stdio/ACP агентом (для A2A-целей используйте /a2a-proxy)")]
+    NotAcpAgent(String),
+
+    #[error("агент {agent_id} недоступен: {source}")]
+    Unavailable {
+        agent_id: String,
+        #[source]
+        source: anyhow::Error,
+    },
+}
+
+impl AdapterError {
+    /// 404 — про адресацию: такого агента в реестре нет, и повтор
+    /// запроса ничего не изменит.
+    /// 503 — про доступность: агент настроен, но сейчас не поднимается;
+    /// запрос имеет смысл повторить позже.
+    fn status(&self) -> StatusCode {
+        match self {
+            Self::UnknownAgent(_) => StatusCode::NOT_FOUND,
+            Self::NotAcpAgent(_) => StatusCode::BAD_REQUEST,
+            Self::Unavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
+        }
+    }
+
+    /// -32601 (method not found) уместен только для несуществующего
+    /// агента. Отказ запуска — ошибка приложения, а не адресации.
+    fn rpc_code(&self) -> i64 {
+        match self {
+            Self::UnknownAgent(_) => -32601,
+            Self::NotAcpAgent(_) => -32602,
+            Self::Unavailable { .. } => AGENT_UNAVAILABLE_CODE,
+        }
+    }
+}
+
+/// Код для «агент настроен, но не поднимается». Отдельный, чтобы клиент
+/// мог отличить временный отказ от постоянного и решить, повторять ли.
+const AGENT_UNAVAILABLE_CODE: i64 = -32020;
+
 async fn get_or_spawn_adapter(
     state: &Arc<HttpState>,
     agent_id: &str,
-) -> anyhow::Result<Arc<AcpAsA2a<SupervisedStdioAgent>>> {
+) -> Result<Arc<AcpAsA2a<SupervisedStdioAgent>>, AdapterError> {
     let mut adapters = state.adapters.lock().await;
     // ИСПРАВЛЕНО (аудит P2-10): раньше кэш отдавал адаптер, не
     // интересуясь, жив ли за ним процесс. Теперь мёртвый процесс
@@ -74,11 +125,11 @@ async fn get_or_spawn_adapter(
     let entry = state
         .registry
         .lookup(agent_id)
-        .ok_or_else(|| anyhow::anyhow!("unknown agent_id: {agent_id}"))?
+        .ok_or_else(|| AdapterError::UnknownAgent(agent_id.to_string()))?
         .clone();
 
     let Transport::Stdio { command, cwd, env } = entry.transport else {
-        anyhow::bail!("agent_id={agent_id} is not a stdio/ACP agent (use direct A2A proxy instead)")
+        return Err(AdapterError::NotAcpAgent(agent_id.to_string()));
     };
 
     let default_cwd = cwd.clone().unwrap_or_else(|| ".".to_string());
@@ -87,9 +138,15 @@ async fn get_or_spawn_adapter(
         cwd,
         env,
         call_timeout: state.call_timeout,
-        protocol_version: SpawnConfig::DEFAULT_PROTOCOL_VERSION.to_string(),
+        protocol_version: SpawnConfig::DEFAULT_PROTOCOL_VERSION,
     })
-    .await?;
+    .await
+    .map_err(|source| {
+        // Логируем причину целиком: клиенту уходит короткий текст,
+        // оператору нужен полный контекст отказа.
+        tracing::error!(agent_id, error = ?source, "не удалось поднять агента");
+        AdapterError::Unavailable { agent_id: agent_id.to_string(), source }
+    })?;
 
     let adapter = Arc::new(AcpAsA2a::new(
         supervised,
@@ -120,7 +177,7 @@ async fn agent_card(
             Ok(card) => Json(card).into_response(),
             Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": e.to_string()}))).into_response(),
         },
-        Err(e) => (StatusCode::NOT_FOUND, Json(json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (e.status(), Json(json!({"error": e.to_string()}))).into_response(),
     }
 }
 
@@ -148,7 +205,7 @@ async fn rpc_handler(
 
     let adapter = match get_or_spawn_adapter(&state, &agent_id).await {
         Ok(a) => a,
-        Err(e) => return rpc_error(request.id, StatusCode::NOT_FOUND, -32601, &e.to_string()),
+        Err(e) => return rpc_error(request.id, e.status(), e.rpc_code(), &e.to_string()),
     };
 
     // ИСПРАВЛЕНО (аудит P1-1): владелец разговора выводится из токена
@@ -265,4 +322,51 @@ fn uuid_stub() -> String {
     }
     let hex: String = buf.iter().map(|b| format!("{b:02x}")).collect();
     format!("{millis:x}-{hex}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Регрессия: раньше все три причины отдавали 404 / -32601, и отказ
+    /// запуска агента выглядел в логах как опечатка в agent_id.
+    #[test]
+    fn unknown_agent_is_addressing_error() {
+        let e = AdapterError::UnknownAgent("нет-такого".into());
+        assert_eq!(e.status(), StatusCode::NOT_FOUND);
+        assert_eq!(e.rpc_code(), -32601);
+    }
+
+    #[test]
+    fn failed_spawn_is_availability_error() {
+        let e = AdapterError::Unavailable {
+            agent_id: "claurst-main".into(),
+            source: anyhow::anyhow!("рукопожатие не удалось"),
+        };
+        assert_eq!(
+            e.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "агент настроен, но не поднялся — это 503, а не 404"
+        );
+        assert_eq!(e.rpc_code(), AGENT_UNAVAILABLE_CODE);
+    }
+
+    #[test]
+    fn wrong_transport_is_client_error() {
+        let e = AdapterError::NotAcpAgent("ops-agent".into());
+        assert_eq!(e.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Причина отказа должна доходить до текста ошибки: оператор читает
+    /// её в ответе и в логе, и «недоступен» без причины бесполезно.
+    #[test]
+    fn unavailable_message_keeps_cause() {
+        let e = AdapterError::Unavailable {
+            agent_id: "claurst-main".into(),
+            source: anyhow::anyhow!("protocolVersion: не разобрать версию"),
+        };
+        let text = e.to_string();
+        assert!(text.contains("claurst-main"));
+        assert!(text.contains("не разобрать версию"));
+    }
 }
