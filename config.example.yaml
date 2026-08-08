@@ -28,6 +28,7 @@ agents:
 
 task_store_dir: "/tmp/gateway/tasks"
 turn_lease_timeout_secs: 30
+agent_call_timeout_secs: 120   # ДОБАВЛЕНО (аудит P2-11): было захардкожено 60s в stdio_agent.rs
 
 # Использование (после запуска gatewayd config.yaml):
 #

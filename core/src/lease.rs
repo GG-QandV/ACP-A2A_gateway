@@ -51,8 +51,68 @@ impl TurnLease {
     }
 }
 
-impl From<TurnLeaseTimeoutError> for anyhow::Error {
-    fn from(e: TurnLeaseTimeoutError) -> Self {
-        anyhow::anyhow!(e)
+// ИСПРАВЛЕНО (найдено компилятором, E0119): ручной
+// `impl From<TurnLeaseTimeoutError> for anyhow::Error` конфликтовал с
+// blanket-impl из anyhow (`impl<E: StdError + Send + Sync> From<E>`).
+// TurnLeaseTimeoutError уже реализует StdError через thiserror, поэтому
+// конверсия через `?` работает и без этого impl — он просто лишний.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    /// Тесты из docs/03-dev-guide-testing.md — в репо отсутствовали.
+    #[tokio::test]
+    async fn second_acquire_waits_for_first_release() {
+        let lease = TurnLease::default();
+        let session = SessionId("s-1".into());
+
+        let guard = lease.acquire(&session, Duration::from_secs(1)).await.unwrap();
+        let start = Instant::now();
+
+        let lease_ref = &lease;
+        let session_ref = &session;
+        let holder = async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            drop(guard);
+        };
+        let waiter = async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            lease_ref.acquire(session_ref, Duration::from_secs(1)).await
+        };
+
+        let (_, second) = tokio::join!(holder, waiter);
+        assert!(second.is_ok());
+        assert!(start.elapsed() >= Duration::from_millis(100));
+    }
+
+    #[tokio::test]
+    async fn acquire_times_out_instead_of_hanging() {
+        let lease = TurnLease::default();
+        let session = SessionId("s-2".into());
+
+        let _held = lease.acquire(&session, Duration::from_secs(1)).await.unwrap();
+        let result = lease.acquire(&session, Duration::from_millis(50)).await;
+
+        // Fail-closed: ошибка, а не паника и не тихий проход в критическую секцию.
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn different_sessions_do_not_block_each_other() {
+        let lease = TurnLease::default();
+        let _a = lease.acquire(&SessionId("a".into()), Duration::from_millis(50)).await.unwrap();
+        let b = lease.acquire(&SessionId("b".into()), Duration::from_millis(50)).await;
+        assert!(b.is_ok());
+    }
+
+    #[tokio::test]
+    async fn forget_removes_session_entry() {
+        let lease = TurnLease::default();
+        let session = SessionId("s-3".into());
+        drop(lease.acquire(&session, Duration::from_millis(50)).await.unwrap());
+        lease.forget(&session).await;
+        assert!(lease.locks.lock().await.is_empty());
     }
 }

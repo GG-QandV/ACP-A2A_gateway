@@ -25,6 +25,14 @@ struct RawConfig {
     agents: HashMap<String, RawAgentEntry>,
     task_store_dir: PathBuf,
     turn_lease_timeout_secs: u64,
+    /// ДОБАВЛЕНО (аудит P2-11): таймаут одного JSON-RPC вызова к
+    /// stdio-агенту. Был захардкожен как 60s в core/src/stdio_agent.rs.
+    #[serde(default = "default_agent_call_timeout_secs")]
+    agent_call_timeout_secs: u64,
+}
+
+fn default_agent_call_timeout_secs() -> u64 {
+    120
 }
 
 fn default_http_listen() -> String {
@@ -46,40 +54,51 @@ enum RawAgentEntry {
     },
 }
 
-fn resolve_env_placeholders(value: &str) -> String {
-    if let Some(var_name) = value.strip_prefix("{env:").and_then(|s| s.strip_suffix('}')) {
-        std::env::var(var_name).unwrap_or_default()
-    } else {
-        value.to_string()
+/// ИСПРАВЛЕНО (аудит P1-10): было unwrap_or_default() — отсутствующая
+/// переменная молча становилась пустым ключом/токеном, и шлюз стартовал
+/// с нерабочей авторизацией. Теперь это ошибка конфигурации на старте.
+fn resolve_env_placeholders(value: &str) -> anyhow::Result<String> {
+    match value.strip_prefix("{env:").and_then(|s| s.strip_suffix('}')) {
+        Some(var_name) => std::env::var(var_name).with_context(|| {
+            format!("переменная окружения {var_name} не задана (конфиг: {value})")
+        }),
+        None => Ok(value.to_string()),
     }
 }
 
-fn build_registry(raw: &RawConfig) -> Registry {
+fn build_registry(raw: &RawConfig) -> anyhow::Result<Registry> {
+    // ДОБАВЛЕНО (аудит P1-10): пустой токен в списке = открытый вход для
+    // клиента, приславшего "". Ловим на старте, а не в проде.
+    if raw.tokens.is_empty() || raw.tokens.iter().any(|t| t.trim().is_empty()) {
+        anyhow::bail!("config.tokens: список пуст или содержит пустой токен");
+    }
     let tokens: std::collections::HashSet<String> = raw.tokens.iter().cloned().collect();
 
-    let agents: HashMap<String, AgentEntry> = raw
-        .agents
-        .iter()
-        .map(|(id, entry)| {
-            let transport = match entry {
-                RawAgentEntry::Stdio { command, cwd, env } => Transport::Stdio {
-                    command: command.clone(),
-                    cwd: cwd.clone(),
-                    env: env
-                        .iter()
-                        .map(|(k, v)| (k.clone(), resolve_env_placeholders(v)))
-                        .collect(),
+    let mut agents: HashMap<String, AgentEntry> = HashMap::new();
+    for (id, entry) in &raw.agents {
+        let transport = match entry {
+            RawAgentEntry::Stdio { command, cwd, env } => {
+                if command.is_empty() {
+                    anyhow::bail!("agent {id}: command пустой");
+                }
+                let mut resolved = HashMap::new();
+                for (k, v) in env {
+                    resolved.insert(k.clone(), resolve_env_placeholders(v)?);
+                }
+                Transport::Stdio { command: command.clone(), cwd: cwd.clone(), env: resolved }
+            }
+            RawAgentEntry::Http { url, push_token } => Transport::Http {
+                url: url.clone(),
+                push_token: match push_token {
+                    Some(t) => Some(resolve_env_placeholders(t)?),
+                    None => None,
                 },
-                RawAgentEntry::Http { url, push_token } => Transport::Http {
-                    url: url.clone(),
-                    push_token: push_token.as_deref().map(resolve_env_placeholders),
-                },
-            };
-            (id.clone(), AgentEntry { transport })
-        })
-        .collect();
+            },
+        };
+        agents.insert(id.clone(), AgentEntry { transport });
+    }
 
-    Registry::new(tokens, agents)
+    Ok(Registry::new(tokens, agents))
 }
 
 #[tokio::main]
@@ -96,8 +115,9 @@ async fn main() -> anyhow::Result<()> {
     let http_listen = raw_config.http_listen.clone();
     let task_store_dir = raw_config.task_store_dir.clone();
     let lease_timeout = std::time::Duration::from_secs(raw_config.turn_lease_timeout_secs);
+    let call_timeout = std::time::Duration::from_secs(raw_config.agent_call_timeout_secs);
 
-    let registry = std::sync::Arc::new(build_registry(&raw_config));
+    let registry = std::sync::Arc::new(build_registry(&raw_config)?);
 
     tracing::info!(%tcp_listen, %http_listen, "starting acp-a2a gateway (dual transport, 3 directions)");
 
@@ -109,7 +129,12 @@ async fn main() -> anyhow::Result<()> {
 
     let http_registry = registry.clone();
     let http_server = tokio::spawn(async move {
-        let direction_4 = transport_http::router(http_registry.clone(), task_store_dir, lease_timeout);
+        let direction_4 = transport_http::router(
+            http_registry.clone(),
+            task_store_dir,
+            lease_timeout,
+            call_timeout,
+        );
         let direction_2 = transport_a2a_passthrough::router(http_registry);
         let app = direction_4.merge(direction_2);
 

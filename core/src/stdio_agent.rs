@@ -23,12 +23,20 @@ use crate::agent::AcpAgent;
 use crate::reply::Reply;
 
 type PendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>;
+/// ДОБАВЛЕНО (аудит P2-1): накопитель AgentMessageChunk по sessionId.
+/// Раньше reader-таск отбрасывал все нотификации агента (`continue`),
+/// то есть весь текст ответа терялся.
+type UpdatesMap = Arc<Mutex<HashMap<String, Vec<protocol::acp::ContentBlock>>>>;
 
 pub struct StdioAcpAgent {
     child: Mutex<Child>,
     stdin: Mutex<tokio::process::ChildStdin>,
     next_id: AtomicU64,
     pending: PendingMap,
+    updates: UpdatesMap,
+    /// ДОБАВЛЕНО (аудит P2-11): было захардкожено `from_secs(60)`,
+    /// что противоречило настраиваемому turn_lease_timeout_secs.
+    call_timeout: std::time::Duration,
 }
 
 impl StdioAcpAgent {
@@ -36,6 +44,7 @@ impl StdioAcpAgent {
         command: &[String],
         cwd: &Option<String>,
         env: &HashMap<String, String>,
+        call_timeout: std::time::Duration,
     ) -> anyhow::Result<Self> {
         let (program, args) = command
             .split_first()
@@ -50,19 +59,25 @@ impl StdioAcpAgent {
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::inherit());
+        // ИСПРАВЛЕНО (аудит P2-9): без этого процесс агента переживал
+        // адаптер и оставался сиротой (пустой impl Drop ничего не делал).
+        cmd.kill_on_drop(true);
 
         let mut child = cmd.spawn()?;
         let stdin = child.stdin.take().ok_or_else(|| anyhow::anyhow!("no stdin"))?;
         let stdout = child.stdout.take().ok_or_else(|| anyhow::anyhow!("no stdout"))?;
 
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
-        spawn_reader_task(BufReader::new(stdout), pending.clone());
+        let updates: UpdatesMap = Arc::new(Mutex::new(HashMap::new()));
+        spawn_reader_task(BufReader::new(stdout), pending.clone(), updates.clone());
 
         Ok(Self {
             child: Mutex::new(child),
             stdin: Mutex::new(stdin),
             next_id: AtomicU64::new(1),
             pending,
+            updates,
+            call_timeout,
         })
     }
 
@@ -96,9 +111,16 @@ impl StdioAcpAgent {
             })?;
         }
 
-        let result = tokio::time::timeout(std::time::Duration::from_secs(60), rx)
-            .await
-            .map_err(|_| anyhow::anyhow!("agent did not respond to {method} within 60s"))?
+        let waited = tokio::time::timeout(self.call_timeout, rx).await;
+
+        // ИСПРАВЛЕНО (аудит P2-14): при таймауте запись оставалась в
+        // pending навсегда — утечка на каждый истёкший запрос.
+        let Ok(received) = waited else {
+            self.pending.lock().await.remove(&id);
+            anyhow::bail!("agent did not respond to {method} within {:?}", self.call_timeout);
+        };
+
+        let result = received
             .map_err(|_| anyhow::anyhow!("agent reader task dropped (process likely dead)"))?;
 
         match result {
@@ -121,6 +143,7 @@ impl StdioAcpAgent {
 fn spawn_reader_task(
     mut reader: BufReader<tokio::process::ChildStdout>,
     pending: PendingMap,
+    updates: UpdatesMap,
 ) {
     tokio::spawn(async move {
         let mut line = String::new();
@@ -138,6 +161,10 @@ fn spawn_reader_task(
             };
 
             let Some(id) = parsed.get("id").and_then(Value::as_u64) else {
+                // ИСПРАВЛЕНО (аудит P2-1): нотификация агента больше не
+                // выбрасывается — AgentMessageChunk копится по sessionId
+                // и прикладывается к PromptResponse в конце хода.
+                collect_session_update(&parsed, &updates).await;
                 continue;
             };
 
@@ -173,7 +200,16 @@ impl AcpAgent for StdioAcpAgent {
         &self,
         req: PromptRequest,
     ) -> anyhow::Result<Reply<PromptResponse, SessionUpdate>> {
-        let resp: PromptResponse = self.call("session/prompt", req).await?;
+        let session_key = req.session_id.0.clone();
+        // Хвост предыдущего хода не должен попасть в текущий ответ.
+        self.updates.lock().await.remove(&session_key);
+
+        let mut resp: PromptResponse = self.call("session/prompt", req).await?;
+
+        let collected = self.updates.lock().await.remove(&session_key).unwrap_or_default();
+        if resp.content.is_empty() {
+            resp.content = collected;
+        }
         Ok(Reply::Complete(resp))
     }
 
@@ -182,9 +218,28 @@ impl AcpAgent for StdioAcpAgent {
     }
 }
 
-impl Drop for StdioAcpAgent {
-    fn drop(&mut self) {
-        // Best-effort: асинхронный kill недоступен в Drop — известное
-        // ограничение MVP, нормальный путь остановки — явный shutdown.
+// ИСПРАВЛЕНО (аудит P2-9): пустой impl Drop удалён — он только
+// маскировал утечку процессов. Его роль выполняет kill_on_drop(true),
+// выставленный в spawn().
+
+/// Извлекает контентный чанк из session/update и складывает в накопитель.
+/// Служебные апдейты (tool_call, plan, usage) и мысли агента в ответ
+/// не попадают — это не текст ответа модели.
+async fn collect_session_update(parsed: &Value, updates: &UpdatesMap) {
+    if parsed.get("method").and_then(Value::as_str) != Some("session/update") {
+        return;
     }
+    let Some(params) = parsed.get("params") else { return };
+    let Some(session_id) = params.get("sessionId").and_then(Value::as_str) else { return };
+    let Some(update) = params.get("update") else { return };
+
+    if update.get("sessionUpdate").and_then(Value::as_str) != Some("agent_message_chunk") {
+        return;
+    }
+    let Some(content) = update.get("content") else { return };
+    let Ok(block) = serde_json::from_value::<protocol::acp::ContentBlock>(content.clone()) else {
+        return;
+    };
+
+    updates.lock().await.entry(session_id.to_string()).or_default().push(block);
 }

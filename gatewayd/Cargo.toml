@@ -9,7 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 protocol = { path = "../protocol" }
-core = { path = "../core" }
+gateway-core = { path = "../core" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
