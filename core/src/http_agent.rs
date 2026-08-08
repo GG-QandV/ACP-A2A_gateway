@@ -87,7 +87,9 @@ struct JsonRpcError {
     message: String,
 }
 
-#[derive(Debug, Deserialize)]
+// ИСПРАВЛЕНО (найдено компилятором, E0277): был derive(Deserialize),
+// хотя структура используется как ИСХОДЯЩИЕ params в call<P: Serialize>.
+#[derive(Debug, Serialize)]
 struct GetTaskParams<'a> {
     id: &'a str,
 }

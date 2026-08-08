@@ -193,6 +193,14 @@ pub enum StopReason {
 #[serde(rename_all = "camelCase")]
 pub struct PromptResponse {
     pub stop_reason: StopReason,
+    /// ДОБАВЛЕНО (аудит P2-1): содержательный ответ агента. Приходит от
+    /// агента через session/update-нотификации (AgentMessageChunk) —
+    /// раньше их некуда было положить и они выбрасывались, из-за чего
+    /// A2A-клиент получал Task вообще без Part'ов.
+    /// Поле опционально: агенты, кладущие контент прямо в результат
+    /// session/prompt, тоже работают.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub content: Vec<ContentBlock>,
 }
 
 // --- session/update ---

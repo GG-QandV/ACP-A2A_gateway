@@ -12,7 +12,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Json};
 use axum::routing::{get, post};
 use axum::Router;
-use core::{A2aAgent, AcpAsA2a, StdioAcpAgent};
+use gateway_core::{A2aAgent, AcpAsA2a, StdioAcpAgent};
 use protocol::a2a::{Task, TaskId};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -23,14 +23,22 @@ pub struct HttpState {
     registry: Arc<Registry>,
     task_store_dir: PathBuf,
     lease_timeout: Duration,
+    /// ДОБАВЛЕНО (аудит P2-11): таймаут RPC к stdio-агенту из конфига.
+    call_timeout: Duration,
     adapters: tokio::sync::Mutex<HashMap<String, Arc<AcpAsA2a<StdioAcpAgent>>>>,
 }
 
-pub fn router(registry: Arc<Registry>, task_store_dir: PathBuf, lease_timeout: Duration) -> Router {
+pub fn router(
+    registry: Arc<Registry>,
+    task_store_dir: PathBuf,
+    lease_timeout: Duration,
+    call_timeout: Duration,
+) -> Router {
     let state = Arc::new(HttpState {
         registry,
         task_store_dir,
         lease_timeout,
+        call_timeout,
         adapters: tokio::sync::Mutex::new(HashMap::new()),
     });
 
@@ -68,7 +76,7 @@ async fn get_or_spawn_adapter(
     };
 
     let default_cwd = cwd.clone().unwrap_or_else(|| ".".to_string());
-    let stdio_agent = StdioAcpAgent::spawn(&command, &cwd, &env).await?;
+    let stdio_agent = StdioAcpAgent::spawn(&command, &cwd, &env, state.call_timeout).await?;
 
     let adapter = Arc::new(AcpAsA2a::new(
         stdio_agent,
@@ -149,8 +157,8 @@ async fn dispatch_a2a_method(
         "message/send" => {
             let task: Task = build_task_from_send_params(&request.params)?;
             match adapter.send_task(task).await? {
-                core::Reply::Complete(t) => Ok(serde_json::to_value(t)?),
-                core::Reply::Streaming(_) => {
+                gateway_core::Reply::Complete(t) => Ok(serde_json::to_value(t)?),
+                gateway_core::Reply::Streaming(_) => {
                     anyhow::bail!("Фаза 1: streaming не реализован для A2A->ACP направления")
                 }
             }
@@ -191,7 +199,28 @@ fn build_task_from_send_params(params: &Value) -> anyhow::Result<Task> {
     })
 }
 
+/// ИСПРАВЛЕНО (аудит P1-3): был голый наносекундный таймстамп —
+/// предсказуемый и перечислимый ID задачи, что вместе с отсутствием
+/// проверки владельца в tasks/get открывало чужие задачи. Плюс убран
+/// unwrap() на системном времени.
 fn uuid_stub() -> String {
+    use std::io::Read;
     use std::time::{SystemTime, UNIX_EPOCH};
-    format!("{:x}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos())
+
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+
+    let mut buf = [0u8; 12];
+    let filled = std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut buf))
+        .is_ok();
+    if !filled {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        buf[..8].copy_from_slice(&n.to_le_bytes());
+    }
+    let hex: String = buf.iter().map(|b| format!("{b:02x}")).collect();
+    format!("{millis:x}-{hex}")
 }

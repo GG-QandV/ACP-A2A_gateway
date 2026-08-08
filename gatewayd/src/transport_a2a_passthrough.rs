@@ -21,7 +21,13 @@ pub struct PassthroughState {
 pub fn router(registry: Arc<Registry>) -> Router {
     let state = Arc::new(PassthroughState {
         registry,
-        client: reqwest::Client::new(),
+        // ИСПРАВЛЕНО (аудит P1-7): без таймаута зависший upstream держал
+        // клиентское соединение бесконечно.
+        client: reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(300))
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .build()
+            .expect("reqwest client builds with default TLS backend"),
     });
 
     Router::new()
@@ -64,18 +70,38 @@ async fn proxy_handler(
             .into_response();
     };
 
-    let target_url = format!("{}/{}", url.trim_end_matches('/'), path);
+    // ИСПРАВЛЕНО (аудит P1-8, часть 1): path из wildcard подставлялся в
+    // URL как есть — сегменты ".." выводили запрос за пределы адреса
+    // агента. Теперь нормализуем.
+    let safe_path = path
+        .split('/')
+        .filter(|seg| !seg.is_empty() && *seg != "." && *seg != "..")
+        .collect::<Vec<_>>()
+        .join("/");
+    // ИСПРАВЛЕНО (аудит P1-8, часть 2): query-строка терялась целиком.
+    let query = request.uri().query().map(|q| format!("?{q}")).unwrap_or_default();
+    let target_url = format!("{}/{}{}", url.trim_end_matches('/'), safe_path, query);
     let method = request.method().clone();
 
-    let body_bytes = match axum::body::to_bytes(request.into_body(), usize::MAX).await {
+    // ИСПРАВЛЕНО (аудит P1-4): usize::MAX = OOM одним запросом.
+    const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
+    let body_bytes = match axum::body::to_bytes(request.into_body(), MAX_BODY_BYTES).await {
         Ok(b) => b,
-        Err(e) => return (StatusCode::BAD_GATEWAY, format!("body read error: {e}")).into_response(),
+        Err(e) => {
+            return (StatusCode::PAYLOAD_TOO_LARGE, format!("body read error: {e}")).into_response()
+        }
     };
 
     let mut upstream_req = state.client.request(method, &target_url).body(body_bytes);
 
     if let Some(ct) = headers.get("content-type") {
         upstream_req = upstream_req.header("content-type", ct);
+    }
+    // ИСПРАВЛЕНО (аудит P1-8): без Accept upstream не отдаёт
+    // text/event-stream, и SSE-режим (ради которого здесь bytes_stream)
+    // не работал вовсе.
+    if let Some(accept) = headers.get("accept") {
+        upstream_req = upstream_req.header("accept", accept);
     }
     if let Some(pt) = &push_token {
         upstream_req = upstream_req.bearer_auth(pt);

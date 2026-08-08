@@ -1,7 +1,13 @@
+# ПЕРЕИМЕНОВАН: name = "core" конфликтовал со встроенным crate `core`
+# из extern prelude -> error[E0659]: `core` is ambiguous в gatewayd.
 [package]
-name = "core"
+name = "gateway-core"
 version = "0.1.0"
 edition = "2021"
+
+[lib]
+name = "gateway_core"
+path = "src/lib.rs"
 
 [dependencies]
 protocol = { path = "../protocol" }
