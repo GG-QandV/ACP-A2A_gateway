@@ -568,6 +568,10 @@ mod tests {
         generation: std::sync::atomic::AtomicU64,
         /// Процесс убит и ждёт ленивого перезапуска в ensure_ready().
         dead: std::sync::atomic::AtomicBool,
+        /// Было ли рукопожатие. Протокол-строгий агент обязан требовать
+        /// initialize до session/new — фейк это имитирует.
+        initialized: std::sync::atomic::AtomicBool,
+        initialize_calls: std::sync::atomic::AtomicUsize,
     }
 
     impl EchoAcpAgent {
@@ -589,6 +593,8 @@ mod tests {
             &self,
             _req: acp::InitializeRequest,
         ) -> anyhow::Result<InitializeResponse> {
+            self.initialized.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.initialize_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(InitializeResponse {
                 protocol_version: "1".into(),
                 agent_capabilities: Default::default(),
@@ -598,6 +604,9 @@ mod tests {
         }
 
         async fn new_session(&self, _req: NewSessionRequest) -> anyhow::Result<NewSessionResponse> {
+            if !self.initialized.load(std::sync::atomic::Ordering::SeqCst) {
+                anyhow::bail!("session/new без предшествующего initialize");
+            }
             // Счётчик: каждая новая сессия получает свой id — иначе
             // изоляцию разговоров нечем отличить от её отсутствия.
             let n = self.sessions_created.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -624,6 +633,17 @@ mod tests {
         async fn ensure_ready(&self) -> anyhow::Result<()> {
             if self.dead.swap(false, std::sync::atomic::Ordering::SeqCst) {
                 self.generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // Свежий процесс не инициализирован: рукопожатие входит
+                // в подъём процесса, как в SupervisedStdioAgent.
+                self.initialized.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+            if !self.initialized.load(std::sync::atomic::Ordering::SeqCst) {
+                self.initialize(acp::InitializeRequest {
+                    protocol_version: "1".into(),
+                    client_capabilities: Default::default(),
+                    client_info: None,
+                })
+                .await?;
             }
             Ok(())
         }
@@ -1079,5 +1099,44 @@ mod tests {
 
         adapter.send_task_as(owner, task_in_context("t-3", "ctx-1", "три")).await.unwrap();
         assert_eq!(adapter.active_sessions().await, 1);
+    }
+
+    /// Регрессия на дефект, найденный при разборе live-теста: initialize
+    /// звался только из card(), поэтому клиент, идущий сразу в
+    /// message/send, доводил агента до session/new без рукопожатия.
+    #[tokio::test]
+    async fn handshake_precedes_first_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = adapter_for_test(dir.path());
+        let owner = Owner::from_token("token-alice");
+
+        // card() не вызывался — путь ровно как у message/send.
+        adapter.send_task_as(owner, task_in_context("t-1", "ctx-1", "привет")).await.unwrap();
+
+        assert!(adapter.inner.initialized.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// И, что важнее, после перезапуска свежий процесс тоже получает
+    /// рукопожатие — раньше он не получал его никогда.
+    #[tokio::test]
+    async fn handshake_repeats_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = adapter_for_test(dir.path());
+        let owner = Owner::from_token("token-alice");
+
+        adapter.send_task_as(owner, task_in_context("t-1", "ctx-1", "раз")).await.unwrap();
+        let before = adapter.inner.initialize_calls.load(std::sync::atomic::Ordering::SeqCst);
+
+        adapter.inner.simulate_kill();
+        // Первое обращение сообщает о потере контекста...
+        assert!(adapter
+            .send_task_as(owner, task_in_context("t-2", "ctx-1", "два"))
+            .await
+            .is_err());
+        // ...но рукопожатие с новым процессом уже состоялось.
+        let after = adapter.inner.initialize_calls.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(after > before, "свежий процесс должен получить initialize");
+
+        adapter.send_task_as(owner, task_in_context("t-3", "ctx-1", "три")).await.unwrap();
     }
 }
