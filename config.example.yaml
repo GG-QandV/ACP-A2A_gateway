@@ -46,3 +46,9 @@ agent_call_timeout_secs: 120   # ДОБАВЛЕНО (аудит P2-11): было
 #    POST http://0.0.0.0:8348/agents/claurst-main/rpc
 #    Authorization: Bearer t-dev-local-001
 #    {"jsonrpc":"2.0","id":1,"method":"message/send","params":{"message":{...}}}
+#
+# Разговоры (contextId):
+#   Ответ на message/send содержит contextId. Переслав его в следующем
+#   запросе, клиент продолжает тот же разговор; без него начинается новый.
+#   Разговор закреплён за токеном: чужой contextId отклоняется.
+#   Простаивающие разговоры выселяются через 24 часа.
