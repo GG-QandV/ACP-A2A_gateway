@@ -396,7 +396,7 @@ impl<T: AcpAgent + Send + Sync> A2aAgent for AcpAsA2a<T> {
         let init = self
             .inner
             .initialize(acp::InitializeRequest {
-                protocol_version: "1".into(),
+                protocol_version: acp::DEFAULT_PROTOCOL_VERSION,
                 client_capabilities: Default::default(),
                 client_info: None,
             })
@@ -404,7 +404,8 @@ impl<T: AcpAgent + Send + Sync> A2aAgent for AcpAsA2a<T> {
         Ok(a2a::AgentCard {
             name: init.agent_info.as_ref().map(|i| i.name.clone()).unwrap_or_default(),
             description: None,
-            version: init.protocol_version,
+            // A2A AgentCard.version — строка, ACP protocolVersion — число.
+            version: init.protocol_version.to_string(),
             url: String::new(),
             capabilities: a2a::AgentCardCapabilities { streaming: false, push_notifications: false },
             skills: Vec::new(),
@@ -445,7 +446,15 @@ impl<T: A2aAgent + Send + Sync> AcpAgent for A2aAsAcp<T> {
     async fn initialize(&self, _req: acp::InitializeRequest) -> anyhow::Result<acp::InitializeResponse> {
         let card = self.inner.card().await?;
         Ok(acp::InitializeResponse {
-            protocol_version: card.version,
+            // Обратное преобразование: строка карточки A2A -> число ACP.
+            // Невнятная версия не должна ронять рукопожатие — берём
+            // мажорную часть, при неудаче значение по умолчанию.
+            protocol_version: card
+                .version
+                .split('.')
+                .next()
+                .and_then(|major| major.trim().parse().ok())
+                .unwrap_or(acp::DEFAULT_PROTOCOL_VERSION),
             agent_capabilities: acp::AgentCapabilities {
                 load_session: false,
                 prompt_capabilities: acp::PromptCapabilities { image: true, audio: false, embedded_context: false },
@@ -596,7 +605,7 @@ mod tests {
             self.initialized.store(true, std::sync::atomic::Ordering::SeqCst);
             self.initialize_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(InitializeResponse {
-                protocol_version: "1".into(),
+                protocol_version: acp::DEFAULT_PROTOCOL_VERSION,
                 agent_capabilities: Default::default(),
                 agent_info: None,
                 auth_methods: Vec::new(),
@@ -639,7 +648,7 @@ mod tests {
             }
             if !self.initialized.load(std::sync::atomic::Ordering::SeqCst) {
                 self.initialize(acp::InitializeRequest {
-                    protocol_version: "1".into(),
+                    protocol_version: acp::DEFAULT_PROTOCOL_VERSION,
                     client_capabilities: Default::default(),
                     client_info: None,
                 })
