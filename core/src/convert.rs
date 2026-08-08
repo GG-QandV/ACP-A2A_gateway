@@ -18,8 +18,9 @@ use protocol::a2a::{
 
 use crate::agent::{A2aAgent, AcpAgent};
 use crate::lease::TurnLease;
+use crate::owner::Owner;
 use crate::reply::Reply;
-use crate::task_store::TaskStore;
+use crate::task_store::{OwnedTask, TaskStore};
 
 // =========================================================================
 // 1. Content mapping
@@ -110,28 +111,6 @@ fn stop_reason_to_task_state(sr: StopReason) -> TaskState {
 // =========================================================================
 // 3. AcpAsA2a — A2A-клиент видит ACP-агента.
 // =========================================================================
-
-/// Владелец разговора. Хранится как хеш токена, а не сам токен: для
-/// проверки «тот же клиент?» достаточно равенства, а держать секреты в
-/// памяти дольше необходимого незачем.
-///
-/// `Anonymous` — вызовы через голый трейт `A2aAgent`, без транспортного
-/// контекста. Это отдельная корзина: анонимные вызовы изолированы от
-/// токенных и друг с другом делят контекст только по явному contextId.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Owner {
-    Anonymous,
-    Token(u64),
-}
-
-impl Owner {
-    pub fn from_token(token: &str) -> Self {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        token.hash(&mut hasher);
-        Owner::Token(hasher.finish())
-    }
-}
 
 struct SessionEntry {
     session_id: SessionId,
@@ -273,9 +252,12 @@ impl<T: AcpAgent> AcpAsA2a<T> {
     /// неизвестен — полное решение требует поля владельца в TaskStore
     /// и вынесено в отдельный пункт.
     pub async fn get_task_as(&self, owner: Owner, id: TaskId) -> anyhow::Result<Task> {
-        let task = self.tasks.load(&id).await?;
-        self.assert_owns(&task.context_id, owner).await?;
-        Ok(task)
+        let stored = self.tasks.load_owned(&id).await?;
+        assert_owner_matches(&stored, owner)?;
+        // Второй рубеж: если задача из старого формата (владелец не
+        // записан), но её разговор ещё жив — спрашиваем у реестра сессий.
+        self.assert_owns(&stored.task.context_id, owner).await?;
+        Ok(stored.task)
     }
 
     /// Отмена с проверкой владельца. Отменяется сессия того разговора,
@@ -283,7 +265,9 @@ impl<T: AcpAgent> AcpAsA2a<T> {
     pub async fn cancel_task_as(&self, owner: Owner, id: TaskId) -> anyhow::Result<Task> {
         // ИСПРАВЛЕНО (аудит P2-4): возвращалась пустышка с пустым
         // context_id, а сохранённая задача затиралась ею же.
-        let mut result = self.tasks.load(&id).await?;
+        let stored = self.tasks.load_owned(&id).await?;
+        assert_owner_matches(&stored, owner)?;
+        let mut result = stored.task;
         self.assert_owns(&result.context_id, owner).await?;
 
         let session = self.lookup_session(&result.context_id, owner).await?;
@@ -291,13 +275,15 @@ impl<T: AcpAgent> AcpAsA2a<T> {
 
         result.status.state = TaskState::Canceled;
         result.status.timestamp = now_iso8601();
-        self.tasks.save(&result).await?;
+        self.tasks.save(&result, owner).await?;
         Ok(result)
     }
 
     /// Разговор либо принадлежит этому владельцу, либо уже забыт
-    /// (выселен по TTL) — во втором случае претендовать не на что и
-    /// отказывать не за что.
+    /// (выселен по TTL). Раньше «забыт» означало «пропускаем» — это и
+    /// была дыра P1-2. Теперь основную проверку делает атрибуция в
+    /// хранилище, а эта остаётся вторым рубежом для записей старого
+    /// формата, у которых владелец не записан.
     async fn assert_owns(&self, context: &ContextId, owner: Owner) -> anyhow::Result<()> {
         let sessions = self.sessions.lock().await;
         match sessions.get(context) {
@@ -358,7 +344,7 @@ impl<T: AcpAgent> AcpAsA2a<T> {
                     artifacts,
                     metadata: None,
                 };
-                self.tasks.save(&result).await?;
+                self.tasks.save(&result, owner).await?;
                 Ok(Reply::Complete(result))
             }
             // ИСПРАВЛЕНО (аудит P2-7): unreachable! = паника воркер-таска
@@ -481,6 +467,21 @@ impl<T: A2aAgent + Send + Sync> AcpAgent for A2aAsAcp<T> {
     async fn cancel(&self, session: SessionId) -> anyhow::Result<()> {
         self.inner.cancel_task(TaskId(session.0)).await?;
         Ok(())
+    }
+}
+
+/// ИСПРАВЛЕНО (аудит P1-2): владелец берётся из хранилища, поэтому
+/// проверка переживает выселение сессии по TTL и рестарт шлюза.
+///
+/// Задачи без записанного владельца (созданы до введения конвертов)
+/// не отклоняются по этому рубежу — иначе обновление шлюза сделало бы
+/// уже накопленные задачи недоступными их же владельцам.
+fn assert_owner_matches(stored: &OwnedTask, owner: Owner) -> anyhow::Result<()> {
+    match stored.owner {
+        Some(recorded) if recorded != owner => {
+            anyhow::bail!("задача принадлежит другому клиенту")
+        }
+        _ => Ok(()),
     }
 }
 
@@ -805,5 +806,73 @@ mod tests {
         let canceled = adapter.cancel_task_as(owner, TaskId("t-a".into())).await.unwrap();
         assert_eq!(canceled.context_id.0, "ctx-a");
         assert_eq!(canceled.status.state, TaskState::Canceled);
+    }
+
+    // ---------------------------------------------------------------
+    // Регрессии на аудит P1-2: атрибуция переживает жизнь сессии
+    // ---------------------------------------------------------------
+
+    /// Главная регрессия P1-2: раньше проверка владельца держалась
+    /// только на живом реестре сессий, поэтому после выселения по TTL
+    /// чужая задача снова становилась доступна любому токену.
+    #[tokio::test]
+    async fn foreign_owner_denied_after_session_eviction() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = AcpAsA2a::with_session_ttl(
+            EchoAcpAgent::default(),
+            ".".into(),
+            dir.path(),
+            Duration::from_secs(5),
+            Duration::from_millis(50),
+        );
+
+        let alice = Owner::from_token("token-alice");
+        let mallory = Owner::from_token("token-mallory");
+
+        adapter.send_task_as(alice, task_in_context("t-1", "ctx-secret", "тайна")).await.unwrap();
+
+        // Выселяем разговор: обращение с другим контекстом прогоняет TTL.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        adapter.send_task_as(mallory, task_in_context("t-2", "ctx-other", "своё")).await.unwrap();
+
+        // Сессия alice забыта, но атрибуция задачи осталась в хранилище.
+        assert!(
+            adapter.get_task_as(mallory, TaskId("t-1".into())).await.is_err(),
+            "чужая задача не должна открываться после выселения сессии"
+        );
+        assert!(adapter.get_task_as(alice, TaskId("t-1".into())).await.is_ok());
+    }
+
+    /// Атрибуция переживает рестарт процесса: новый адаптер над тем же
+    /// каталогом хранилища по-прежнему различает владельцев.
+    #[tokio::test]
+    async fn ownership_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let alice = Owner::from_token("token-alice");
+        let mallory = Owner::from_token("token-mallory");
+
+        {
+            let adapter = adapter_for_test(dir.path());
+            adapter.send_task_as(alice, task_in_context("t-1", "ctx-1", "привет")).await.unwrap();
+        }
+
+        // Новый адаптер = пустой реестр сессий, как после рестарта.
+        let restarted = adapter_for_test(dir.path());
+        assert_eq!(restarted.active_sessions().await, 0);
+
+        assert!(restarted.get_task_as(mallory, TaskId("t-1".into())).await.is_err());
+        assert!(restarted.get_task_as(alice, TaskId("t-1".into())).await.is_ok());
+    }
+
+    /// Анонимный вызов не должен вскрывать задачи токенных клиентов.
+    #[tokio::test]
+    async fn anonymous_cannot_read_token_owned_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = adapter_for_test(dir.path());
+        let alice = Owner::from_token("token-alice");
+
+        adapter.send_task_as(alice, task_in_context("t-1", "ctx-1", "привет")).await.unwrap();
+
+        assert!(adapter.get_task(TaskId("t-1".into())).await.is_err());
     }
 }
