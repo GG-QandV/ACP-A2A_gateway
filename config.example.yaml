@@ -1,0 +1,47 @@
+# config.example.yaml — v2: добавлен http_listen для четвёртого направления
+# (A2A-клиент -> ACP-агент, gatewayd/src/transport_http.rs).
+
+listen: "0.0.0.0:8347"        # TCP: ACP-клиент -> {ACP-агент | A2A-агент}
+http_listen: "0.0.0.0:8348"   # HTTP: A2A-клиент -> ACP-агент
+
+tokens:
+  - "t-dev-local-001"
+  - "t-dev-local-002"
+
+agents:
+  claurst-main:
+    transport: stdio
+    command: ["claurst", "acp"]
+    cwd: "/srv/workspaces/main"
+    env:
+      OPENMODEL_API_KEY: "{env:OPENMODEL_API_KEY}"
+
+  opencode-local:
+    transport: stdio
+    command: ["opencode", "acp"]
+    cwd: "/srv/workspaces/opencode"
+
+  ops-agent:
+    transport: http
+    url: "https://ops.internal/a2a"
+    push_token: "{env:OPS_AGENT_PUSH_TOKEN}"
+
+task_store_dir: "/tmp/gateway/tasks"
+turn_lease_timeout_secs: 30
+
+# Использование (после запуска gatewayd config.yaml):
+#
+# 1) ACP-клиент -> claurst-main (ACP, passthrough):
+#    tcp connect 0.0.0.0:8347, первая строка:
+#    {"token":"t-dev-local-001","agent_id":"claurst-main"}
+#
+# 2) ACP-клиент -> ops-agent (A2A, через конвертер):
+#    tcp connect 0.0.0.0:8347, первая строка:
+#    {"token":"t-dev-local-001","agent_id":"ops-agent"}
+#    далее обычный ACP JSON-RPC (initialize/session/new/session/prompt).
+#
+# 3) A2A-клиент -> claurst-main (ACP, через конвертер):
+#    GET  http://0.0.0.0:8348/agents/claurst-main/.well-known/agent.json
+#    POST http://0.0.0.0:8348/agents/claurst-main/rpc
+#    Authorization: Bearer t-dev-local-001
+#    {"jsonrpc":"2.0","id":1,"method":"message/send","params":{"message":{...}}}

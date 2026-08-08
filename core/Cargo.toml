@@ -1,0 +1,18 @@
+[package]
+name = "core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+protocol = { path = "../protocol" }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { version = "0.4", features = ["clock"] }
+reqwest = { version = "0.12", features = ["json"] }
+
+[dev-dependencies]
+tempfile = "3"
