@@ -133,6 +133,11 @@ pub struct AcpAsA2a<T: AcpAgent> {
     lease: TurnLease,
     lease_timeout: Duration,
     default_cwd: String,
+    /// ДОБАВЛЕНО (аудит P2-12): внешний адрес, по которому этого агента
+    /// видно снаружи. Раньше в AgentCard уходил пустой url — карточка
+    /// невалидна по A2A-спеке, а agent.json это точка входа для внешних
+    /// клиентов, то есть первое, что они читают.
+    public_url: String,
     /// ИСПРАВЛЕНО (аудит P1-1): было `Mutex<Option<SessionId>>` — ОДНА
     /// ACP-сессия на всех клиентов агента, то есть любые два A2A-клиента
     /// оказывались в одном разговоре и видели контекст друг друга.
@@ -150,15 +155,25 @@ impl<T: AcpAgent> AcpAsA2a<T> {
         default_cwd: String,
         task_store_dir: impl Into<PathBuf>,
         lease_timeout: Duration,
+        public_url: String,
     ) -> Self {
-        Self::with_session_ttl(inner, default_cwd, task_store_dir, lease_timeout, DEFAULT_SESSION_TTL)
+        Self::with_session_ttl(
+            inner,
+            default_cwd,
+            task_store_dir,
+            lease_timeout,
+            public_url,
+            DEFAULT_SESSION_TTL,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn with_session_ttl(
         inner: T,
         default_cwd: String,
         task_store_dir: impl Into<PathBuf>,
         lease_timeout: Duration,
+        public_url: String,
         session_ttl: Duration,
     ) -> Self {
         Self {
@@ -166,6 +181,7 @@ impl<T: AcpAgent> AcpAsA2a<T> {
             lease: TurnLease::default(),
             lease_timeout,
             default_cwd,
+            public_url,
             sessions: tokio::sync::Mutex::new(HashMap::new()),
             session_ttl,
             tasks: TaskStore::new(task_store_dir),
@@ -406,7 +422,7 @@ impl<T: AcpAgent + Send + Sync> A2aAgent for AcpAsA2a<T> {
             description: None,
             // A2A AgentCard.version — строка, ACP protocolVersion — число.
             version: init.protocol_version.to_string(),
-            url: String::new(),
+            url: self.public_url.clone(),
             capabilities: a2a::AgentCardCapabilities { streaming: false, push_notifications: false },
             skills: Vec::new(),
         })
@@ -539,6 +555,7 @@ impl<T: A2aAgent> A2aAsAcp<T> {
     pub async fn leased_sessions(&self) -> usize {
         self.lease.tracked_sessions().await
     }
+
 }
 
 #[async_trait]
@@ -807,6 +824,7 @@ mod tests {
             ".".into(),
             dir.path(),
             Duration::from_secs(5),
+            "http://localhost:8348/agents/test/rpc".into(),
         );
 
         let reply = adapter.send_task(task_with_text("t-1", "привет")).await.unwrap();
@@ -832,6 +850,7 @@ mod tests {
             ".".into(),
             dir.path(),
             Duration::from_secs(5),
+            "http://localhost:8348/agents/test/rpc".into(),
         );
 
         adapter.send_task(task_with_text("t-2", "привет")).await.unwrap();
@@ -885,7 +904,13 @@ mod tests {
     // ---------------------------------------------------------------
 
     fn adapter_for_test(dir: &std::path::Path) -> AcpAsA2a<EchoAcpAgent> {
-        AcpAsA2a::new(EchoAcpAgent::default(), ".".into(), dir, Duration::from_secs(5))
+        AcpAsA2a::new(
+            EchoAcpAgent::default(),
+            ".".into(),
+            dir,
+            Duration::from_secs(5),
+            "http://localhost:8348/agents/test/rpc".into(),
+        )
     }
 
     /// Главная регрессия: раньше `session` была одна на весь адаптер,
@@ -983,6 +1008,7 @@ mod tests {
             ".".into(),
             dir.path(),
             Duration::from_secs(5),
+            "http://localhost:8348/agents/test/rpc".into(),
             Duration::from_millis(50),
         );
         let owner = Owner::from_token("token-alice");
@@ -1027,6 +1053,7 @@ mod tests {
             ".".into(),
             dir.path(),
             Duration::from_secs(5),
+            "http://localhost:8348/agents/test/rpc".into(),
             Duration::from_millis(50),
         );
 
@@ -1413,5 +1440,19 @@ mod tests {
 
         assert_eq!(adapter.active_sessions().await, 1, "остаётся только свежая сессия");
         assert_eq!(adapter.leased_sessions().await, 0, "лиз просроченной сессии освобождён");
+    }
+
+    /// Регрессия на аудит P2-12: AgentCard.url был пустым, из-за чего
+    /// карточка невалидна по A2A-спеке — а agent.json это первое, что
+    /// читает внешний клиент.
+    #[tokio::test]
+    async fn agent_card_carries_public_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = adapter_for_test(dir.path());
+
+        let card = adapter.card().await.unwrap();
+
+        assert!(!card.url.is_empty(), "url карточки не должен быть пустым");
+        assert!(card.url.starts_with("http"), "url должен быть абсолютным: {}", card.url);
     }
 }

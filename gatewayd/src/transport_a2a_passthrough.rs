@@ -35,6 +35,32 @@ pub fn router(registry: Arc<Registry>) -> Router {
         .with_state(state)
 }
 
+
+/// ИСПРАВЛЕНО (аудит P1-4): было usize::MAX — один запрос мог положить
+/// шлюз по памяти.
+const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
+
+/// Сборка адреса upstream.
+///
+/// Вынесено из обработчика отдельной функцией, потому что направление 2
+/// (A2A passthrough) до сих пор не имело НИ ОДНОГО теста, хотя правки
+/// сюда вносились: лимит тела, таймауты, нормализация пути, сохранение
+/// query. Проверять всё это через живой HTTP дорого, а сборку URL —
+/// главный источник ошибок здесь — можно проверить напрямую.
+///
+/// ИСПРАВЛЕНО (аудит P1-8): path из wildcard подставлялся как есть,
+/// сегменты ".." выводили запрос за пределы адреса агента; query-строка
+/// терялась целиком.
+fn build_target_url(base: &str, path: &str, query: Option<&str>) -> String {
+    let safe_path = path
+        .split('/')
+        .filter(|seg| !seg.is_empty() && *seg != "." && *seg != "..")
+        .collect::<Vec<_>>()
+        .join("/");
+    let query = query.map(|q| format!("?{q}")).unwrap_or_default();
+    format!("{}/{}{}", base.trim_end_matches('/'), safe_path, query)
+}
+
 fn extract_bearer(headers: &HeaderMap) -> Option<String> {
     headers
         .get("authorization")
@@ -70,21 +96,9 @@ async fn proxy_handler(
             .into_response();
     };
 
-    // ИСПРАВЛЕНО (аудит P1-8, часть 1): path из wildcard подставлялся в
-    // URL как есть — сегменты ".." выводили запрос за пределы адреса
-    // агента. Теперь нормализуем.
-    let safe_path = path
-        .split('/')
-        .filter(|seg| !seg.is_empty() && *seg != "." && *seg != "..")
-        .collect::<Vec<_>>()
-        .join("/");
-    // ИСПРАВЛЕНО (аудит P1-8, часть 2): query-строка терялась целиком.
-    let query = request.uri().query().map(|q| format!("?{q}")).unwrap_or_default();
-    let target_url = format!("{}/{}{}", url.trim_end_matches('/'), safe_path, query);
+    let target_url = build_target_url(&url, &path, request.uri().query());
     let method = request.method().clone();
 
-    // ИСПРАВЛЕНО (аудит P1-4): usize::MAX = OOM одним запросом.
-    const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
     let body_bytes = match axum::body::to_bytes(request.into_body(), MAX_BODY_BYTES).await {
         Ok(b) => b,
         Err(e) => {
@@ -127,5 +141,55 @@ async fn proxy_handler(
     match response.body(Body::from_stream(stream)) {
         Ok(r) => r.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("response build error: {e}")).into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn path_and_query_are_forwarded() {
+        assert_eq!(
+            build_target_url("https://ops.internal/a2a", "rpc", Some("id=7&mode=fast")),
+            "https://ops.internal/a2a/rpc?id=7&mode=fast"
+        );
+    }
+
+    /// Регрессия: query раньше терялся целиком, и upstream получал
+    /// запрос без параметров.
+    #[test]
+    fn query_is_not_dropped() {
+        let url = build_target_url("https://ops.internal/a2a", "tasks", Some("limit=10"));
+        assert!(url.ends_with("?limit=10"), "query должен доезжать: {url}");
+    }
+
+    /// Регрессия: сегменты ".." выводили запрос за пределы адреса агента.
+    #[test]
+    fn traversal_segments_are_stripped() {
+        let url = build_target_url("https://ops.internal/a2a", "../../admin/secret", None);
+        assert_eq!(url, "https://ops.internal/a2a/admin/secret");
+        assert!(!url.contains(".."));
+    }
+
+    #[test]
+    fn trailing_and_double_slashes_do_not_break_url() {
+        assert_eq!(
+            build_target_url("https://ops.internal/a2a/", "//rpc//", None),
+            "https://ops.internal/a2a/rpc"
+        );
+    }
+
+    #[test]
+    fn empty_path_targets_base_url() {
+        assert_eq!(build_target_url("https://ops.internal/a2a", "", None), "https://ops.internal/a2a/");
+    }
+
+    /// Лимит тела: 32 MiB, а не usize::MAX — иначе один запрос кладёт
+    /// шлюз по памяти.
+    #[test]
+    fn body_limit_is_bounded() {
+        const { assert!(MAX_BODY_BYTES > 0, "лимит тела должен быть ненулевым"); }
+        const { assert!(MAX_BODY_BYTES <= 64 * 1024 * 1024, "лимит тела не должен быть безграничным"); }
     }
 }

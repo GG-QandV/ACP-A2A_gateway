@@ -26,7 +26,13 @@ agents:
     url: "https://ops.internal/a2a"
     push_token: "{env:OPS_AGENT_PUSH_TOKEN}"
 
+# Внешний адрес шлюза — попадает в AgentCard.url (agent.json).
+# Должен быть тем адресом, по которому шлюз виден клиентам снаружи,
+# а не адресом привязки: за reverse-proxy это домен прокси.
+public_url: "https://gateway.example.com"
+
 task_store_dir: "/tmp/gateway/tasks"
+task_retention_days: 7        # завершённые задачи убираются фоном раз в час
 turn_lease_timeout_secs: 30
 agent_call_timeout_secs: 120   # ДОБАВЛЕНО (аудит P2-11): было захардкожено 60s в stdio_agent.rs
 
@@ -71,3 +77,10 @@ agent_call_timeout_secs: 120   # ДОБАВЛЕНО (аудит P2-11): было
 #   произвольный идентификатор отклоняется. Закрывайте сессии через
 #   session/cancel; незакрытые выселяются через 24 часа, потолок — 256
 #   одновременных сессий на соединение.
+#
+# TLS:
+#   Шлюз слушает по HTTP и не терминирует TLS сам — это сознательно.
+#   Выставлять его напрямую в недоверенную сеть нельзя: токены пойдут
+#   открытым текстом. Ставьте перед ним reverse-proxy (nginx, Caddy,
+#   Traefik) с сертификатами и, при необходимости, rate limiting —
+#   их шлюз тоже не реализует.
