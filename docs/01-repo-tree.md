@@ -43,7 +43,8 @@ gateway/
     │                                   # reqwest, serde_yaml, tracing-subscriber
     └── src/
         ├── main.rs                      # читает config.yaml, строит Registry,
-        │                               # поднимает TCP+HTTP параллельно
+        │                               # поднимает TCP+HTTP параллельно,
+        │                               # фоновая уборка задач (sweep_expired)
         ├── registry.rs                  # Registry: token set + agent map
         │                               # (Transport::Stdio | Transport::Http)
         ├── transport_tcp.rs             # Направления 1 и 3: ACP-клиент как
