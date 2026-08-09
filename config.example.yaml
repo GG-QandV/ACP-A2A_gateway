@@ -1,8 +1,8 @@
-# config.example.yaml — v2: добавлен http_listen для четвёртого направления
-# (A2A-клиент -> ACP-агент, gatewayd/src/transport_http.rs).
+# config.example.yaml — полный пример. Шлюз поднимает два транспорта:
+# TCP (ACP-клиенты, направления 1 и 3) и HTTP (A2A-клиенты, направления 2 и 4).
 
 listen: "0.0.0.0:8347"        # TCP: ACP-клиент -> {ACP-агент | A2A-агент}
-http_listen: "0.0.0.0:8348"   # HTTP: A2A-клиент -> ACP-агент
+http_listen: "0.0.0.0:8348"   # HTTP: A2A-клиент -> {ACP-агент | A2A-агент}
 
 tokens:
   - "t-dev-local-001"
@@ -52,6 +52,12 @@ agent_call_timeout_secs: 120   # ДОБАВЛЕНО (аудит P2-11): было
 #    POST http://0.0.0.0:8348/agents/claurst-main/rpc
 #    Authorization: Bearer t-dev-local-001
 #    {"jsonrpc":"2.0","id":1,"method":"message/send","params":{"message":{...}}}
+#
+# 4) A2A-клиент -> ops-agent (A2A, reverse-proxy без конвертера):
+#    POST http://0.0.0.0:8348/a2a-proxy/ops-agent/rpc
+#    Authorization: Bearer t-dev-local-001
+#    Тело и query-строка уходят upstream как есть (включая SSE-стрим).
+#    Для stdio-агента через /a2a-proxy вернётся 400.
 #
 # Разговоры (contextId):
 #   Ответ на message/send содержит contextId. Переслав его в следующем

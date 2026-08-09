@@ -8,12 +8,12 @@
 
 ## 1. Направления (какой клиент → какой агент)
 
-| # | Входящая сторона | Агент | Транспорт | Порт |
+| # | Входящая сторона | Агент | Транспорт | Порт/путь |
 |---|---|---|---|---|
 | 1 | ACP-клиент | ACP (stdio) | TCP passthrough | `listen` |
-| 2 | ACP-клиент | A2A (HTTP) | TCP, конвертер ACP→A2A | `listen` |
-| 3 | A2A-клиент | ACP (stdio) | TCP, конвертер A2A→ACP | `http_listen` |
-| 4 | A2A-клиент | ACP (stdio) | HTTP, конвертер A2A→ACP | `http_listen` |
+| 2 | A2A-клиент | A2A (HTTP) | HTTP reverse-proxy, без конвертера | `http_listen` → `/a2a-proxy/:id/*path` |
+| 3 | ACP-клиент | A2A (HTTP) | TCP, конвертер ACP→A2A | `listen` |
+| 4 | A2A-клиент | ACP (stdio) | HTTP, конвертер A2A→ACP | `http_listen` → `/agents/:id/rpc` |
 
 - `listen` (по умолч. `0.0.0.0:8347`) — TCP: первая строка — handshake JSON.
 - `http_listen` (по умолч. `0.0.0.0:8348`) — HTTP: Bearer-токен в `Authorization`.
@@ -24,7 +24,7 @@
 rustc --version   # нужно 1.80+ (зависимости: openssl, native-tls)
 cargo build --workspace
 cargo check --workspace --all-targets
-cargo test --workspace          # 36 тестов (после P1-2)
+cargo test --workspace          # 69 тестов (после prod-final, P2-12)
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
@@ -36,6 +36,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 ```yaml
 listen: "0.0.0.0:8347"          # TCP
 http_listen: "0.0.0.0:8348"     # HTTP
+public_url: "https://gateway.example.com"  # внешний адрес → AgentCard.url (P2-12)
 tokens: [ "t-dev-local-001" ]   # действительные токены клиентов
 
 agents:
@@ -54,6 +55,7 @@ agents:
     push_token: "{env:OPS_AGENT_PUSH_TOKEN}"
 
 task_store_dir: "/tmp/gateway/tasks"
+task_retention_days: 7          # сколько дней хранить завершённые задачи (уборка фоном раз в час)
 turn_lease_timeout_secs: 30     # ожидание лизы на одну сессию
 agent_call_timeout_secs: 120    # таймаут одного JSON-RPC к stdio-агенту (аудит P2-11)
 ```
@@ -61,6 +63,14 @@ agent_call_timeout_secs: 120    # таймаут одного JSON-RPC к stdio-
 Особенности конфига (валидируются на старте, см. аудит P1-10):
 - `{env:VAR}` с отсутствующей переменной → **ошибка старта** (не пустая строка).
 - Пустой токен в `tokens` → **ошибка старта**.
+- `public_url` — это адрес, по которому шлюз виден клиентам снаружи (за
+  reverse-proxy — домен прокси), а не адрес привязки. Уходит в
+  `AgentCard.url` (`.well-known/agent.json`), иначе карточка невалидна по
+  A2A-спеке. По умолчанию `http://localhost:8348`.
+- `task_retention_days` (по умолч. 7): завершённые задачи старше этого
+  срока фоновая задача убирает раз в час (`TASK_SWEEP_INTERVAL`), ходя по
+  каталогам на диске. Раньше `TaskStore::delete` не вызывался ниоткуда —
+  файлы копились бесконечно.
 
 ## 4. Как подключать реальных агентов
 
@@ -84,7 +94,7 @@ ACP-режим у агентов включается **подкомандой**
 - claurst env: `CLAURST_DISABLE_MODELS_FETCH=1` (не ходить за списком моделей),
   `CLAURST_SHARE_NO_OPEN=1` (не открывать браузер).
 
-## 5. Протокол: ACP-клиент → гатевей (направления 1 и 2, TCP)
+## 5. Протокол: ACP-клиент → гатевей (направления 1 и 3, TCP)
 
 Первая строка — handshake:
 
@@ -105,7 +115,7 @@ ACP-режим у агентов включается **подкомандой**
 новую сессию в **том же процессе** (проверено: claurst и hermes возвращают разные
 `sessionId` на два подряд `session/new`).
 
-## 6. Протокол: A2A-клиент → гатевей (направления 3 и 4, HTTP)
+## 6. Протокол: A2A-клиент → гатевей (направления 2 и 4, HTTP)
 
 Карточка агента:
 
@@ -114,7 +124,11 @@ GET http://127.0.0.1:8348/agents/<agent_id>/.well-known/agent.json
 Authorization: Bearer <token>
 ```
 
-RPC:
+`AgentCard.url` теперь заполняется из `config.public_url` + `agent_id`
+(аудит P2-12): `https://gateway.example.com/agents/<agent_id>/rpc` — раньше
+был пустым, карточка была невалидна.
+
+RPC (направление 4 — A2A-клиент → ACP-агент):
 
 ```
 POST http://127.0.0.1:8348/agents/<agent_id>/rpc
@@ -140,6 +154,24 @@ Content-Type: application/json
   "artifacts":[{"name":"response","parts":[{"kind":"text","text":"..."}]}]
 }}
 ```
+
+### Направление 2: A2A-клиент → A2A-агент (reverse-proxy)
+
+```
+POST http://127.0.0.1:8348/a2a-proxy/<agent_id>/<path>?<query>
+Authorization: Bearer <token>
+Content-Type: application/json
+Accept: application/json        # или text/event-stream для SSE
+```
+
+- Агент должен быть `transport: http` — иначе `400 agent_id is not an
+  A2A/http agent`.
+- Запрос проксируется как есть, без семантического преобразования, вместе
+  с query-строкой (раньше терялась, P1-8) и SSE-стримом (`text/event-stream`).
+- Путь нормализуется: `..`, `.`, двойные слеши вырезаются (P1-8) — запрос
+  не выходит за пределы адреса агента.
+- Лимит тела 32 MiB (P1-4), таймауты 300с/10с (P1-7).
+- `push_token` агента уходит в `Authorization: Bearer` к upstream.
 
 ### Продолжение разговора (contextId)
 
@@ -177,6 +209,10 @@ Content-Type: application/json
 | 4 | Хеш токена — `std::hash::DefaultHasher`, не криптографический. Для сравнения на равенство достаточно; при модели угроз с подбором — менять на HMAC | ⏳ |
 | 5 | `TurnLease::forget` вызывается при выселении сессии (P1-1) — утечек не найдено | ✅ |
 | 6 | Смерть процесса агента | ✅ закрыто (P2-10): `SupervisedStdioAgent` переспавнивает (backoff 5с), старое поколение сессии → `ContextLost` → JSON-RPC `-32010` / HTTP 409. `is_alive` ловит смерть, но не зависание живого агента — висящий упрётся в `agent_call_timeout_secs` |
+| 7 | Сессии без `session/new` — любой sessionId добавлял запись в HashMap навсегда (утечка) | ✅ закрыто (P2-8): сессия только через `session/new`, `prompt` отклоняет неизвестный sessionId ДО acquire, `cancel` освобождает лиз, TTL-выселение, потолок `MAX_SESSIONS_PER_CONNECTION = 256`. Live: 300 циклов new/prompt/cancel, память стабильна |
+| 8 | `AgentCard.url` пустой — карточка невалидна по A2A-спеке | ✅ закрыто (P2-12): url = `config.public_url` + `/agents/<id>/rpc` |
+| 9 | `TaskStore::delete` не вызывался ниоткуда — файлы задач копились бесконечно | ✅ закрыто (prod-final): `sweep_expired(ttl)` + фоновая уборка раз в час по mtime файла, `.json.tmp` не трогаются |
+| 10 | Направление 2 (A2A reverse-proxy) не имело ни одного теста | ✅ закрыто (prod-final): юнит-тесты `build_target_url` (query, `..`, слеши, лимит тела) + live-прогон (8 проверок: 401/404/query/SSE/400) |
 
 ### Репро #1 (continue-таймаут)
 
@@ -190,9 +226,10 @@ Content-Type: application/json
 
 | Файл | Назначение |
 |---|---|
-| `gatewayd/src/transport_tcp.rs` | TCP: направления 1 и 2, stdio passthrough |
-| `gatewayd/src/transport_http.rs` | HTTP: направления 3 и 4, A2A→ACP, парсинг contextId |
-| `gatewayd/src/main.rs` | Конфиг, Registry, `{env:...}`, валидация |
+| `gatewayd/src/transport_tcp.rs` | TCP: направления 1 (ACP passthrough) и 3 (ACP→A2A) |
+| `gatewayd/src/transport_http.rs` | HTTP: направление 4 (A2A→ACP, `/agents/:id/rpc` + agent.json), парсинг contextId, AgentCard.url |
+| `gatewayd/src/transport_a2a_passthrough.rs` | HTTP: направление 2 (A2A→A2A reverse-proxy, `/a2a-proxy/:id/*path`) |
+| `gatewayd/src/main.rs` | Конфиг, Registry, `{env:...}`, валидация, фоновая уборка задач |
 | `core/src/convert.rs` | `AcpAsA2a` (A2A→ACP) и `A2aAsAcp` (ACP→A2A), сессии, владелец |
 | `core/src/owner.rs` | `Owner` (Token hash / Anonymous) — P1-2 |
 | `core/src/task_store.rs` | `TaskStore` + `StoredTask{owner, task}` — P1-2 |
