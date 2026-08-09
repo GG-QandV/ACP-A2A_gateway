@@ -29,11 +29,33 @@ struct RawConfig {
     /// stdio-агенту. Был захардкожен как 60s в core/src/stdio_agent.rs.
     #[serde(default = "default_agent_call_timeout_secs")]
     agent_call_timeout_secs: u64,
+    /// ДОБАВЛЕНО (аудит P2-12): внешний адрес шлюза. Уходит в
+    /// AgentCard.url, который раньше был пустым — карточка невалидна по
+    /// A2A-спеке, а agent.json это первое, что читает внешний клиент.
+    #[serde(default = "default_public_url")]
+    public_url: String,
+    /// ДОБАВЛЕНО: сколько дней хранить завершённые задачи. Раньше
+    /// TaskStore::delete не вызывался ниоткуда, и файлы копились
+    /// бесконечно.
+    #[serde(default = "default_task_retention_days")]
+    task_retention_days: u64,
 }
 
 fn default_agent_call_timeout_secs() -> u64 {
     120
 }
+
+fn default_public_url() -> String {
+    "http://localhost:8348".to_string()
+}
+
+fn default_task_retention_days() -> u64 {
+    7
+}
+
+/// Как часто прогонять уборку. Час — компромисс: диск не ждёт сутки,
+/// но и обход каталога не становится фоновой нагрузкой.
+const TASK_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
 fn default_http_listen() -> String {
     "0.0.0.0:8348".to_string()
@@ -101,6 +123,28 @@ fn build_registry(raw: &RawConfig) -> anyhow::Result<Registry> {
     Ok(Registry::new(tokens, agents))
 }
 
+
+/// Обходит подкаталоги хранилища (по одному на agent_id) и убирает
+/// просроченные задачи в каждом.
+async fn sweep_all_agents(base_dir: &PathBuf, ttl: std::time::Duration) -> anyhow::Result<usize> {
+    let mut dir = match tokio::fs::read_dir(base_dir).await {
+        Ok(dir) => dir,
+        // До первой задачи каталога нет — это не ошибка.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e.into()),
+    };
+
+    let mut removed = 0usize;
+    while let Some(entry) = dir.next_entry().await? {
+        if !entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let store = gateway_core::TaskStore::new(entry.path());
+        removed += store.sweep_expired(ttl).await?;
+    }
+    Ok(removed)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber_init();
@@ -116,6 +160,10 @@ async fn main() -> anyhow::Result<()> {
     let task_store_dir = raw_config.task_store_dir.clone();
     let lease_timeout = std::time::Duration::from_secs(raw_config.turn_lease_timeout_secs);
     let call_timeout = std::time::Duration::from_secs(raw_config.agent_call_timeout_secs);
+    let public_url = raw_config.public_url.clone();
+    let task_ttl =
+        std::time::Duration::from_secs(raw_config.task_retention_days * 24 * 60 * 60);
+    let sweep_dir = task_store_dir.clone();
 
     let registry = std::sync::Arc::new(build_registry(&raw_config)?);
 
@@ -134,6 +182,7 @@ async fn main() -> anyhow::Result<()> {
             task_store_dir,
             lease_timeout,
             call_timeout,
+            public_url,
         );
         let direction_2 = transport_a2a_passthrough::router(http_registry);
         let app = direction_4.merge(direction_2);
@@ -142,9 +191,24 @@ async fn main() -> anyhow::Result<()> {
         axum::serve(listener, app).await.map_err(anyhow::Error::from)
     });
 
+    // Фоновая уборка задач. Ходит по каталогам агентов на диске, а не
+    // по живым адаптерам: задачи остановленного агента тоже надо
+    // убирать, а его адаптера в памяти уже нет.
+    let sweeper = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(TASK_SWEEP_INTERVAL).await;
+            match sweep_all_agents(&sweep_dir, task_ttl).await {
+                Ok(0) => {}
+                Ok(removed) => tracing::info!(removed, "фоновая уборка задач"),
+                Err(e) => tracing::warn!(error = %e, "уборка задач не удалась"),
+            }
+        }
+    });
+
     tokio::select! {
         res = tcp_server => res??,
         res = http_server => res??,
+        res = sweeper => res?,
     }
 
     Ok(())

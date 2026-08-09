@@ -25,6 +25,8 @@ pub struct HttpState {
     registry: Arc<Registry>,
     task_store_dir: PathBuf,
     lease_timeout: Duration,
+    /// Внешний адрес шлюза для AgentCard.url (аудит P2-12).
+    public_url: String,
     /// ДОБАВЛЕНО (аудит P2-11): таймаут RPC к stdio-агенту из конфига.
     call_timeout: Duration,
     adapters: tokio::sync::Mutex<HashMap<String, Arc<AcpAsA2a<SupervisedStdioAgent>>>>,
@@ -35,11 +37,13 @@ pub fn router(
     task_store_dir: PathBuf,
     lease_timeout: Duration,
     call_timeout: Duration,
+    public_url: String,
 ) -> Router {
     let state = Arc::new(HttpState {
         registry,
         task_store_dir,
         lease_timeout,
+        public_url,
         call_timeout,
         adapters: tokio::sync::Mutex::new(HashMap::new()),
     });
@@ -148,11 +152,19 @@ async fn get_or_spawn_adapter(
         AdapterError::Unavailable { agent_id: agent_id.to_string(), source }
     })?;
 
+    // Адрес именно этого агента, а не шлюза целиком: карточка описывает
+    // конечную точку, по которой клиент будет слать message/send.
+    let agent_url = format!(
+        "{}/agents/{agent_id}/rpc",
+        state.public_url.trim_end_matches('/')
+    );
+
     let adapter = Arc::new(AcpAsA2a::new(
         supervised,
         default_cwd,
         state.task_store_dir.join(agent_id),
         state.lease_timeout,
+        agent_url,
     ));
 
     adapters.insert(agent_id.to_string(), adapter.clone());

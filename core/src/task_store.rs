@@ -5,6 +5,7 @@
 //! рестарт процесса (но не обязательно reboot машины, если base_dir = /tmp).
 
 use std::path::PathBuf;
+use std::time::{Duration, SystemTime};
 
 use protocol::a2a::{Task, TaskId};
 use serde::{Deserialize, Serialize};
@@ -37,6 +38,17 @@ pub struct OwnedTask {
 pub struct TaskStore {
     base_dir: PathBuf,
 }
+
+/// Сколько задача живёт в хранилище после последней записи.
+///
+/// ДОБАВЛЕНО: `delete` существовал, но не вызывался ниоткуда — в коде
+/// это было помечено как «оставлено на Фазу 1.1». В проде такой файл на
+/// задачу копится бесконечно и заполняет диск за недели, поэтому уборка
+/// нужна сразу, а не в следующей фазе.
+///
+/// Неделя, а не часы: клиент имеет право забрать результат через
+/// tasks/get спустя долгое время после завершения задачи.
+pub const DEFAULT_TASK_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 impl TaskStore {
     pub fn new(base_dir: impl Into<PathBuf>) -> Self {
@@ -96,6 +108,48 @@ impl TaskStore {
         fs::remove_file(&path).await.ok();
         Ok(())
     }
+
+    /// Удаляет задачи, не обновлявшиеся дольше ttl. Возвращает число
+    /// удалённых файлов.
+    ///
+    /// Возраст берётся по mtime файла, а не по timestamp внутри задачи:
+    /// mtime обновляется атомарной записью и не зависит от того, что
+    /// агент положил в поле времени (а положить он может что угодно
+    /// или ничего).
+    ///
+    /// Отсутствие каталога — не ошибка: до первой задачи его нет.
+    pub async fn sweep_expired(&self, ttl: Duration) -> anyhow::Result<usize> {
+        let mut dir = match fs::read_dir(&self.base_dir).await {
+            Ok(dir) => dir,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(e.into()),
+        };
+
+        let now = SystemTime::now();
+        let mut removed = 0usize;
+
+        while let Some(entry) = dir.next_entry().await? {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                // .json.tmp — недописанный файл чужой атомарной записи,
+                // трогать его нельзя.
+                continue;
+            }
+
+            let Ok(meta) = entry.metadata().await else { continue };
+            let Ok(modified) = meta.modified() else { continue };
+            let Ok(age) = now.duration_since(modified) else { continue };
+
+            if age > ttl && fs::remove_file(&path).await.is_ok() {
+                removed += 1;
+            }
+        }
+
+        if removed > 0 {
+            tracing::info!(removed, dir = ?self.base_dir, "убраны просроченные задачи");
+        }
+        Ok(removed)
+    }
 }
 
 fn sanitize_task_id(raw: &str) -> String {
@@ -134,6 +188,66 @@ mod tests {
         assert_eq!(loaded.status.state, TaskState::Completed);
     }
 
+
+
+
+    /// НАЙДЕНО тестом: sanitize_task_id вырезает все не-ASCII символы,
+    /// поэтому два разных не-ASCII идентификатора дают ОДНО имя файла и
+    /// затирают друг друга. Сейчас невоспроизводимо снаружи — id
+    /// генерирует сам шлюз и они ASCII, — но фиксируем поведение, чтобы
+    /// оно не стало дырой, если id когда-нибудь начнут принимать от
+    /// клиента.
+    #[test]
+    fn non_ascii_ids_collapse_to_same_name() {
+        assert_eq!(sanitize_task_id("задача"), sanitize_task_id("другая"));
+        assert!(sanitize_task_id("задача").is_empty());
+    }
+
+    #[tokio::test]
+    async fn sweep_removes_only_expired_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TaskStore::new(dir.path());
+        let owner = Owner::from_token("t-1");
+
+        store.save(&sample_task("task-fresh"), owner).await.unwrap();
+        store.save(&sample_task("task-stale"), owner).await.unwrap();
+
+        // Состариваем один файл, сдвигая его mtime в прошлое.
+        let old_path = dir.path().join("task-stale.json");
+        let long_ago = std::time::SystemTime::now() - Duration::from_secs(60 * 60 * 24 * 30);
+        filetime::set_file_mtime(&old_path, filetime::FileTime::from_system_time(long_ago))
+            .unwrap();
+
+        let removed = store.sweep_expired(Duration::from_secs(60 * 60 * 24)).await.unwrap();
+
+        assert_eq!(removed, 1);
+        assert!(store.load(&TaskId("task-fresh".into())).await.is_ok());
+        assert!(store.load(&TaskId("task-stale".into())).await.is_err());
+    }
+
+    /// Недописанные файлы чужой атомарной записи трогать нельзя.
+    #[tokio::test]
+    async fn sweep_ignores_tmp_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TaskStore::new(dir.path());
+
+        let tmp = dir.path().join("half-written.json.tmp");
+        tokio::fs::write(&tmp, b"{}").await.unwrap();
+        let long_ago = std::time::SystemTime::now() - Duration::from_secs(60 * 60 * 24 * 30);
+        filetime::set_file_mtime(&tmp, filetime::FileTime::from_system_time(long_ago)).unwrap();
+
+        let removed = store.sweep_expired(Duration::from_secs(1)).await.unwrap();
+
+        assert_eq!(removed, 0);
+        assert!(tmp.exists(), ".json.tmp не должен убираться");
+    }
+
+    /// До первой задачи каталога нет — это не ошибка.
+    #[tokio::test]
+    async fn sweep_on_missing_dir_is_not_an_error() {
+        let store = TaskStore::new("/tmp/точно-нет-такого-каталога-gateway");
+        assert_eq!(store.sweep_expired(Duration::from_secs(1)).await.unwrap(), 0);
+    }
 
     #[tokio::test]
     async fn owner_is_persisted_and_read_back() {

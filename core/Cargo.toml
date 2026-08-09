@@ -23,3 +23,4 @@ reqwest = { version = "0.12", features = ["json", "stream"] }
 
 [dev-dependencies]
 tempfile = "3"
+filetime = "0.2"  # тестам нужно состарить файл, чтобы проверить уборку
