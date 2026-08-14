@@ -94,7 +94,11 @@ fn build_registry(raw: &RawConfig) -> anyhow::Result<Registry> {
     if raw.tokens.is_empty() || raw.tokens.iter().any(|t| t.trim().is_empty()) {
         anyhow::bail!("config.tokens: список пуст или содержит пустой токен");
     }
-    let tokens: std::collections::HashSet<String> = raw.tokens.iter().cloned().collect();
+    let tokens: std::collections::HashSet<String> = raw
+        .tokens
+        .iter()
+        .map(|t| resolve_env_placeholders(t))
+        .collect::<anyhow::Result<_>>()?;
 
     let mut agents: HashMap<String, AgentEntry> = HashMap::new();
     for (id, entry) in &raw.agents {
