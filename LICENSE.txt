@@ -7,7 +7,7 @@ Licensor:
 GG-QandV
 
 Licensed Work:
-ASP-A2A Gateway, including the source code, build files, documentation, and example configuration distributed in this repository under this License, excluding any Cloud Module, Encryption Module, and any other software distributed by Licensor under separate terms.
+ACP-A2A Gateway, including the source code, build files, documentation, and example configuration distributed in this repository under this License, excluding any Cloud Module, Encryption Module, and any other software distributed by Licensor under separate terms.
 
 Additional Use Grant:
 You may make Production Use of the Licensed Work, including for internal business operations, in customer deployments, as part of professional services, and as a component embedded in your own products or services, provided that your use does not include a Competitive Offering.
