@@ -2,15 +2,15 @@
 name: gateway-client
 description: >-
   Как агенту (claurst, hermes, opencode, любой ACP/A2A-клиент) ходить в
-  ASP-A2A_gateway: адреса, токены, форматы message/send и session/prompt,
+  ACP-A2A_gateway: адреса, токены, форматы message/send и session/prompt,
   продолжение разговора по contextId, изоляция между клиентами, известные
   ограничения. Триггер: "отправить задачу через гатевей", "поговорить с
   агентом X через шлюз", "A2A message/send", "почему continue таймаутит".
 ---
 
-# gateway-client — как агенту пользоваться ASP-A2A_gateway
+# gateway-client — как агенту пользоваться ACP-A2A_gateway
 
-Гатевей (`GG-QandV/ASP-A2A_gateway`) — маршрутизатор между клиентами и
+Гатевей (`GG-QandV/ACP-A2A_gateway`) — маршрутизатор между клиентами и
 ACP-агентами. Два порта, четыре направления. Ты можешь быть и клиентом
 (ходить в агентов через шлюз), и агентом (тебя подключают как stdio-агента).
 

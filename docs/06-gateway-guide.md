@@ -1,6 +1,6 @@
 # Гайд по гатевею: что это, как запустить, как подключать агентов
 
-Репо: `GG-QandV/ASP-A2A_gateway` (Rust workspace: `protocol`, `gateway-core`, `gatewayd`).
+Репо: `GG-QandV/ACP-A2A_gateway` (Rust workspace: `protocol`, `gateway-core`, `gatewayd`).
 
 Гатевей — прослойка между ACP-агентами (claurst, hermes, opencode) и A2A-клиентами
 (внешние сервисы, другие агенты). Поднимает два порта, обслуживает четыре
