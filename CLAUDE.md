@@ -1,7 +1,7 @@
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **ASP-A2A_gateway** (881 symbols, 1801 relationships, 77 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **ACP-A2A_gateway** (977 symbols, 1921 relationships, 85 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > Index stale? Run `node .gitnexus/run.cjs analyze` from the project root — it auto-selects an available runner. No `.gitnexus/run.cjs` yet? `npx gitnexus analyze` (npm 11 crash → `npm i -g gitnexus`; #1939).
 
@@ -25,10 +25,10 @@ This project is indexed by GitNexus as **ASP-A2A_gateway** (881 symbols, 1801 re
 
 | Resource | Use for |
 |----------|---------|
-| `gitnexus://repo/ASP-A2A_gateway/context` | Codebase overview, check index freshness |
-| `gitnexus://repo/ASP-A2A_gateway/clusters` | All functional areas |
-| `gitnexus://repo/ASP-A2A_gateway/processes` | All execution flows |
-| `gitnexus://repo/ASP-A2A_gateway/process/{name}` | Step-by-step execution trace |
+| `gitnexus://repo/ACP-A2A_gateway/context` | Codebase overview, check index freshness |
+| `gitnexus://repo/ACP-A2A_gateway/clusters` | All functional areas |
+| `gitnexus://repo/ACP-A2A_gateway/processes` | All execution flows |
+| `gitnexus://repo/ACP-A2A_gateway/process/{name}` | Step-by-step execution trace |
 
 ## CLI
 
