@@ -36,7 +36,9 @@ pub enum A2aDialect {
 pub enum ProbeError {
     #[error("probe request failed: {0}")]
     Http(String),
-    #[error("agent responded with unrecognized dialect (neither SDK nor Spec JSON-RPC methods matched)")]
+    #[error(
+        "agent responded with unrecognized dialect (neither SDK nor Spec JSON-RPC methods matched)"
+    )]
     Unrecognized,
 }
 
@@ -47,7 +49,9 @@ pub struct DialectCache {
 
 impl DialectCache {
     pub fn new() -> Self {
-        Self { cache: Arc::new(DashMap::new()) }
+        Self {
+            cache: Arc::new(DashMap::new()),
+        }
     }
 
     pub fn get(&self, agent_id: &str) -> Option<A2aDialect> {
@@ -56,6 +60,14 @@ impl DialectCache {
 
     pub fn set(&self, agent_id: &str, dialect: A2aDialect) {
         self.cache.insert(agent_id.to_string(), dialect);
+    }
+
+    /// Инвалидация кэшированного диалекта (D3): вызывается, когда реальный
+    /// (не зондовый) проксируемый запрос вернул MethodNotFound — признак
+    /// того, что закэшированный диалект неверен для этого endpoint.
+    /// Следующий запрос к agent_id выполнит зонд заново.
+    pub fn remove(&self, agent_id: &str) {
+        self.cache.remove(agent_id);
     }
 }
 
@@ -79,7 +91,9 @@ pub async fn probe_dialect(
         "params": { "name": format!("tasks/{probe_task_id}") }
     });
 
-    if let Some(dialect) = try_probe_request(client, base_url, push_token, &sdk_payload, A2aDialect::Sdk).await? {
+    if let Some(dialect) =
+        try_probe_request(client, base_url, push_token, &sdk_payload, A2aDialect::Sdk).await?
+    {
         return Ok(dialect);
     }
 
@@ -90,8 +104,14 @@ pub async fn probe_dialect(
         "params": { "id": probe_task_id }
     });
 
-    if let Some(dialect) =
-        try_probe_request(client, base_url, push_token, &spec_payload, A2aDialect::Spec).await?
+    if let Some(dialect) = try_probe_request(
+        client,
+        base_url,
+        push_token,
+        &spec_payload,
+        A2aDialect::Spec,
+    )
+    .await?
     {
         return Ok(dialect);
     }
@@ -114,8 +134,14 @@ async fn try_probe_request(
         req = req.bearer_auth(token);
     }
 
-    let resp = req.send().await.map_err(|e| ProbeError::Http(e.to_string()))?;
-    let body: Value = resp.json().await.map_err(|e| ProbeError::Http(e.to_string()))?;
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| ProbeError::Http(e.to_string()))?;
+    let body: Value = resp
+        .json()
+        .await
+        .map_err(|e| ProbeError::Http(e.to_string()))?;
 
     Ok(interpret_probe_response(&body).then_some(candidate))
 }
@@ -124,20 +150,26 @@ async fn try_probe_request(
 /// -32601 (стандартный JSON-RPC "method not found") ИЛИ нормализованный
 /// текст с несколькими формулировками, а не одну точную подстроку.
 fn interpret_probe_response(body: &Value) -> bool {
+    !response_indicates_method_not_found(body)
+}
+
+/// Распознаёт MethodNotFound в JSON-RPC-ответе (общая для зонда и для
+/// инвалидации кэша D3). True = сервер не распознал метод — по коду -32601
+/// (стандарт JSON-RPC 2.0) ИЛИ нормализованному тексту ("method not found",
+/// "method_not_found", "unknown method"). False = сервер понял метод.
+pub fn response_indicates_method_not_found(body: &Value) -> bool {
     const JSONRPC_STANDARD_METHOD_NOT_FOUND: i64 = -32601;
 
-    if let Some(error) = body.get("error") {
-        let code = error.get("code").and_then(Value::as_i64).unwrap_or(0);
-        let message = error.get("message").and_then(Value::as_str).unwrap_or("");
-        let normalized = message.to_lowercase();
-        let looks_unrecognized = code == JSONRPC_STANDARD_METHOD_NOT_FOUND
-            || normalized.contains("method not found")
-            || normalized.contains("method_not_found")
-            || normalized.contains("unknown method");
-        return !looks_unrecognized;
-    }
-
-    true
+    let Some(error) = body.get("error") else {
+        return false;
+    };
+    let code = error.get("code").and_then(Value::as_i64).unwrap_or(0);
+    let message = error.get("message").and_then(Value::as_str).unwrap_or("");
+    let normalized = message.to_lowercase();
+    code == JSONRPC_STANDARD_METHOD_NOT_FOUND
+        || normalized.contains("method not found")
+        || normalized.contains("method_not_found")
+        || normalized.contains("unknown method")
 }
 
 #[cfg(test)]
@@ -193,5 +225,49 @@ mod tests {
         cache.set("hermes", A2aDialect::Sdk);
         cache.set("hermes", A2aDialect::Spec);
         assert_eq!(cache.get("hermes"), Some(A2aDialect::Spec));
+    }
+
+    #[test]
+    fn response_indicates_mnf_by_standard_jsonrpc_code() {
+        let body = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "error": { "code": -32601, "message": "Method not found" }
+        });
+        assert!(response_indicates_method_not_found(&body));
+    }
+
+    #[test]
+    fn response_indicates_mnf_by_gateway_marker_text() {
+        let body = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "error": { "code": -32000, "message": "method_not_found: message/send" }
+        });
+        assert!(response_indicates_method_not_found(&body));
+    }
+
+    #[test]
+    fn response_does_not_indicate_mnf_for_task_not_found() {
+        let body = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "error": { "code": -32001, "message": "task not found: task-x" }
+        });
+        assert!(!response_indicates_method_not_found(&body));
+    }
+
+    #[test]
+    fn response_does_not_indicate_mnf_for_success() {
+        let body = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": { "task": { "id": "x" } }
+        });
+        assert!(!response_indicates_method_not_found(&body));
+    }
+
+    #[test]
+    fn dialect_cache_remove_invalidates_entry() {
+        let cache = DialectCache::new();
+        cache.set("hermes", A2aDialect::Sdk);
+        cache.remove("hermes");
+        assert_eq!(cache.get("hermes"), None);
     }
 }

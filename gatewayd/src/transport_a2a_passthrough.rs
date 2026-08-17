@@ -16,7 +16,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::any;
 use axum::Router;
 
-use crate::dialect_probe::{probe_dialect, DialectCache};
+use crate::dialect_probe::{probe_dialect, response_indicates_method_not_found, DialectCache};
 use crate::registry::{Registry, Transport};
 
 pub struct PassthroughState {
@@ -110,7 +110,11 @@ async fn proxy_handler(
     let body_bytes = match axum::body::to_bytes(request.into_body(), MAX_BODY_BYTES).await {
         Ok(b) => b,
         Err(e) => {
-            return (StatusCode::PAYLOAD_TOO_LARGE, format!("body read error: {e}")).into_response()
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("body read error: {e}"),
+            )
+                .into_response()
         }
     };
 
@@ -135,6 +139,64 @@ async fn proxy_handler(
 
     let status = upstream_resp.status();
     let content_type = upstream_resp.headers().get("content-type").cloned();
+    let is_json = content_type
+        .as_ref()
+        .and_then(|v| v.to_str().ok())
+        .map(|ct| ct.contains("application/json"))
+        .unwrap_or(false);
+
+    // D3: инвалидация кэша при MethodNotFound на РЕАЛЬНОМ (не зондовом)
+    // запросе. Reverse-proxy не может переслать уже отправленный клиентом
+    // запрос повторно (тело одноразовое), поэтому вместо one-shot retry
+    // (как в driver-a2a-client) здесь сбрасываем закэшированный диалект —
+    // следующий запрос к этому agent_id выполнит зонд заново и, возможно,
+    // выберет другой диалект. Проверяем только JSON-ответы: SSE-стрим
+    // (streaming) проксируется как есть, без чтения.
+    if is_json {
+        let bytes =
+            match tokio::time::timeout(std::time::Duration::from_secs(30), upstream_resp.bytes())
+                .await
+            {
+                Ok(Ok(b)) => b,
+                Ok(Err(e)) => {
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        format!("upstream body read error: {e}"),
+                    )
+                        .into_response()
+                }
+                Err(_) => {
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        "upstream body read timeout".to_string(),
+                    )
+                        .into_response()
+                }
+            };
+
+        if let Ok(body) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+            if response_indicates_method_not_found(&body) {
+                state.dialect_cache.remove(&agent_id);
+                tracing::warn!(
+                    agent_id = %agent_id,
+                    "a2a dialect cache invalidated: real request got MethodNotFound — re-probe on next request"
+                );
+            }
+        }
+
+        let mut response = Response::builder().status(status.as_u16());
+        if let Some(ct) = content_type {
+            response = response.header("content-type", ct);
+        }
+        return match response.body(Body::from(bytes)) {
+            Ok(r) => r.into_response(),
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("response build error: {e}"),
+            )
+                .into_response(),
+        };
+    }
 
     let stream = upstream_resp.bytes_stream();
     let mut response = Response::builder().status(status.as_u16());
@@ -144,7 +206,11 @@ async fn proxy_handler(
 
     match response.body(Body::from_stream(stream)) {
         Ok(r) => r.into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("response build error: {e}")).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("response build error: {e}"),
+        )
+            .into_response(),
     }
 }
 
@@ -183,19 +249,32 @@ mod tests {
 
     #[test]
     fn empty_path_targets_base_url() {
-        assert_eq!(build_target_url("https://ops.internal/a2a", "", None), "https://ops.internal/a2a/");
+        assert_eq!(
+            build_target_url("https://ops.internal/a2a", "", None),
+            "https://ops.internal/a2a/"
+        );
     }
 
     #[test]
     fn body_limit_is_bounded() {
-        const { assert!(MAX_BODY_BYTES > 0, "лимит тела должен быть ненулевым"); }
-        const { assert!(MAX_BODY_BYTES <= 64 * 1024 * 1024, "лимит тела не должен быть безграничным"); }
+        const {
+            assert!(MAX_BODY_BYTES > 0, "лимит тела должен быть ненулевым");
+        }
+        const {
+            assert!(
+                MAX_BODY_BYTES <= 64 * 1024 * 1024,
+                "лимит тела не должен быть безграничным"
+            );
+        }
     }
 
     #[test]
     fn passthrough_state_carries_dialect_cache_field() {
         let cache = DialectCache::new();
-        cache.set("probe-integration-check", crate::dialect_probe::A2aDialect::Spec);
+        cache.set(
+            "probe-integration-check",
+            crate::dialect_probe::A2aDialect::Spec,
+        );
         assert_eq!(
             cache.get("probe-integration-check"),
             Some(crate::dialect_probe::A2aDialect::Spec)
