@@ -139,14 +139,36 @@ pub struct McpCapabilities {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionCapabilities {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_bool_lenient")]
     pub close: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_bool_lenient")]
     pub delete: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_bool_lenient")]
     pub list: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_bool_lenient")]
     pub resume: bool,
+}
+
+/// ДОБАВЛЕНО (интеграция hermes, T-002): sessionCapabilities парсится
+/// либерально — и bool (claurst), и любой другой JSON-узел (hermes шлёт
+/// объекты: `list: {}`, `resume: {}`). Значение поля нигде не читается,
+/// поэтому чужие формы не должны ронять десериализацию initialize.
+/// Не замена bool на другой тип, а добавление толерантности на входе.
+fn de_bool_lenient<'de, D>(d: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Lenient {
+        B(bool),
+        Any(serde::de::IgnoredAny),
+    }
+
+    Ok(match Deserialize::deserialize(d)? {
+        Lenient::B(b) => b,
+        Lenient::Any(_) => false,
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

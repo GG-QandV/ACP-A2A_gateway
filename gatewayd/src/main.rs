@@ -3,18 +3,13 @@
 //! Направления 1 и 3 (ACP-клиент как входящая сторона) — TCP.
 //! Направления 2 и 4 (A2A-клиент как входящая сторона) — HTTP.
 
-mod registry;
-mod transport_a2a_passthrough;
-mod transport_http;
-mod transport_tcp;
-
 use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::Context;
+use gatewayd::registry::{AgentEntry, Registry, Transport};
+use gatewayd::{transport_a2a_passthrough, transport_http, transport_tcp};
 use serde::Deserialize;
-
-use registry::{AgentEntry, Registry, Transport};
 
 #[derive(Debug, Deserialize)]
 struct RawConfig {
