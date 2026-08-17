@@ -4,6 +4,7 @@
 
 pub mod acp;
 pub mod a2a;
+pub mod a2a_sdk_compat;
 
 pub use acp::*;
 pub use a2a::*;

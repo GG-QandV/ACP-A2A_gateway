@@ -7,6 +7,13 @@ edition = "2021"
 name = "gatewayd"
 path = "src/main.rs"
 
+# Тестовый ACP-агент для E2E-харнеса интеграционных тестов
+# (gatewayd/tests/rest_transport.rs). Собственный бинарь, а не боевой:
+# путь подставляется в Registry через CARGO_BIN_EXE_mock_acp_agent.
+[[bin]]
+name = "mock_acp_agent"
+path = "src/bin/mock_acp_agent.rs"
+
 [dependencies]
 protocol = { path = "../protocol" }
 gateway-core = { path = "../core" }
@@ -20,3 +27,7 @@ tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 axum = "0.7"
 reqwest = { version = "0.12", features = ["json", "stream"] }
+
+[dev-dependencies]
+tempfile = "3"
+tower = { version = "0.4", features = ["util"] }
