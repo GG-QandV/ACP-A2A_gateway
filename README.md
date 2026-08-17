@@ -41,3 +41,16 @@ cp config.example.yaml config.yaml   # поправить токены, аген
 - Фоновая уборка завершённых задач: `task_retention_days` (по умолч. 7), раз в час.
 
 Полный гайд: [`docs/06-gateway-guide.md`](docs/06-gateway-guide.md).
+
+## Стратегия A2A-протокола 2026
+
+Стратегия диалектов A2A для шлюза и адаптера (SDK v1.0 = база, Spec pre-1.0 =
+fallback, ACP = deep fallback, ANP — вне scope). Язык: **EN** ·
+[UA](docs/A2A-protocol-strategy-2026-uk.summary.md) ·
+[RU](docs/A2A-protocol-strategy-2026-ru.summary.md) —
+каждый открывает краткое резюме со ссылкой на полную версию стратегии
+на этом языке.
+
+- **EN:** [A2A-protocol-strategy-2026-en.summary.md](docs/A2A-protocol-strategy-2026-en.summary.md)
+- **UA:** [A2A-protocol-strategy-2026-uk.summary.md](docs/A2A-protocol-strategy-2026-uk.summary.md)
+- **RU:** [A2A-protocol-strategy-2026-ru.summary.md](docs/A2A-protocol-strategy-2026-ru.summary.md)
