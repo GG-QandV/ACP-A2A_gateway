@@ -16,6 +16,7 @@ use gateway_core::{
     A2aAgent, AcpAsA2a, ContextLost, Owner, SpawnConfig, SupervisedStdioAgent,
 };
 use protocol::a2a::{Task, TaskId};
+use protocol::a2a_sdk_compat::{normalize_message, render_task_sdk};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -51,6 +52,16 @@ pub fn router(
     Router::new()
         .route("/agents/:agent_id/.well-known/agent.json", get(agent_card))
         .route("/agents/:agent_id/rpc", post(rpc_handler))
+        // ДОБАВЛЕНО: SDK-формат a2a-rs. a2a-server принимает и
+        // POST /message:send (основной), и POST /message/send (легаси-
+        // алиас, a2a-server/src/rest.rs:24,68) — оба ведём на один
+        // хендлер. В matchit 0.7 `:` в середине сегмента трактуется как
+        // начало параметра, т.е. маршрут "/agents/{id}/message{suffix}"
+        // имеет ДВА параметра — поэтому у него отдельный хендлер с
+        // tuple-экстрактором (suffix игнорируется). Легаси-путь ниже —
+        // один статический сегмент, у него обычный Path<String>.
+        .route("/agents/:agent_id/message:send", post(rest_send_message_handler_sdk))
+        .route("/agents/:agent_id/message/send", post(rest_send_message_handler))
         .with_state(state)
 }
 
@@ -245,6 +256,122 @@ fn rpc_error(id: Value, status: StatusCode, code: i64, message: &str) -> axum::r
     (status, Json(json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } }))).into_response()
 }
 
+// =========================================================================
+// Направление 4 (SDK-клиент): REST POST /agents/:id/message:send
+// =========================================================================
+//
+// Контракт ответа — SendMessageResponse из a2a-rs, НЕ JSON-RPC:
+//   успех:   200  { "task": { ... } }                 (render_task_sdk)
+//   ошибка:  <http-status>  { "error": { "code", "status", "message", "details" } }
+// Форма конверта подтверждена a2a-server/src/rest.rs:470, обёртка task —
+// a2a-server/src/rest.rs:1264 (тест читает send_resp["task"]["id"]).
+// HTTP-статус несёт машинный код ошибки; "status" — gRPC-style имя,
+// "code" — внутренний код приложения (-32010 для ContextLost и т.д.).
+
+/// Основной SDK-путь POST /agents/:id/message:send.
+/// В matchit 0.7 `:` внутри сегмента начинает параметр — маршрут несёт
+/// два ({id}, {suffix}), второй не нужен и отбрасывается.
+async fn rest_send_message_handler_sdk(
+    State(state): State<Arc<HttpState>>,
+    AxumPath((agent_id, _suffix)): AxumPath<(String, String)>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> axum::response::Response {
+    rest_send_message_core(state, &agent_id, &headers, &body).await
+}
+
+/// Легаси-алиас POST /agents/:id/message/send — один параметр, обычный
+/// экстрактор. Тот же путь обработки, что и у message:send.
+async fn rest_send_message_handler(
+    State(state): State<Arc<HttpState>>,
+    AxumPath(agent_id): AxumPath<String>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> axum::response::Response {
+    rest_send_message_core(state, &agent_id, &headers, &body).await
+}
+
+async fn rest_send_message_core(
+    state: Arc<HttpState>,
+    agent_id: &str,
+    headers: &HeaderMap,
+    body: &Value,
+) -> axum::response::Response {
+    let token = match extract_bearer(headers) {
+        Some(t) => t,
+        None => return rest_sdk_error(StatusCode::UNAUTHORIZED, -32000, "missing token"),
+    };
+    if !state.registry.check_token(&token) {
+        return rest_sdk_error(StatusCode::UNAUTHORIZED, -32000, "invalid token");
+    }
+
+    // Валидируем тело ДО подъёма адаптера: битый запрос не должен
+    // спавнить процесс агента ради того, чтобы быть отвергнутым.
+    let task = match build_task_from_send_params_sdk(body) {
+        Ok(t) => t,
+        Err(e) => return rest_sdk_error(StatusCode::BAD_REQUEST, -32602, &e.to_string()),
+    };
+
+    let adapter = match get_or_spawn_adapter(&state, agent_id).await {
+        Ok(a) => a,
+        Err(e) => return rest_sdk_error(e.status(), e.rpc_code(), &e.to_string()),
+    };
+
+    let owner = Owner::from_token(&token);
+
+    match adapter.send_task_as(owner, task).await {
+        // Обёртка {task: ...} обязательна: SDK-клиент разворачивает
+        // SendMessageResponse сам (render_task_sdk её и строит).
+        Ok(gateway_core::Reply::Complete(t)) => Json(render_task_sdk(&t)).into_response(),
+        Ok(gateway_core::Reply::Streaming(_)) => rest_sdk_error(
+            StatusCode::NOT_IMPLEMENTED,
+            -32000,
+            "Фаза 1: streaming не реализован для A2A->ACP направления",
+        ),
+        // Тот же контракт, что и у /rpc: потерянный контекст — 409 +
+        // ABORTED, а не абстрактная внутренняя ошибка.
+        Err(e) if e.downcast_ref::<ContextLost>().is_some() => {
+            rest_sdk_error(StatusCode::CONFLICT, CONTEXT_LOST_CODE, &e.to_string())
+        }
+        Err(e) => rest_sdk_error(StatusCode::INTERNAL_SERVER_ERROR, -32000, &e.to_string()),
+    }
+}
+
+/// REST-конверт ошибки SDK: {"code", "status", "message", "details"}.
+/// Поля "jsonrpc" и "id" отсутствуют намеренно — это не JSON-RPC ответ.
+fn rest_sdk_error(status: StatusCode, code: i64, message: &str) -> axum::response::Response {
+    (
+        status,
+        Json(json!({
+            "error": {
+                "code": code,
+                "status": http_status_to_sdk_name(status),
+                "message": message,
+                "details": [],
+            }
+        })),
+    )
+        .into_response()
+}
+
+/// gRPC-style имя из HTTP-статуса (маппинг как у grpc-status). Каждый
+/// код, который реально отдаёт rest_sdk_error, обязан быть здесь —
+/// регрессию ловит тест http_status_to_sdk_name_covers_all_used_codes.
+/// Публичен, чтобы интеграционный тест проверял именно этот код, а не
+/// свою копию маппинга.
+pub fn http_status_to_sdk_name(status: StatusCode) -> &'static str {
+    match status {
+        StatusCode::BAD_REQUEST => "INVALID_ARGUMENT",
+        StatusCode::UNAUTHORIZED => "UNAUTHENTICATED",
+        StatusCode::NOT_FOUND => "NOT_FOUND",
+        StatusCode::CONFLICT => "ABORTED",
+        StatusCode::SERVICE_UNAVAILABLE => "UNAVAILABLE",
+        StatusCode::NOT_IMPLEMENTED => "UNIMPLEMENTED",
+        StatusCode::OK => "OK",
+        _ => "UNKNOWN",
+    }
+}
+
 async fn dispatch_a2a_method(
     adapter: &Arc<AcpAsA2a<SupervisedStdioAgent>>,
     owner: Owner,
@@ -260,20 +387,64 @@ async fn dispatch_a2a_method(
                 }
             }
         }
+
+        // ДОБАВЛЕНО: SDK-формат a2a-rs (метод SendMessage, camelCase/proto
+        // поля). Ответ рендерится через render_task_sdk — обёртка {task},
+        // TASK_STATE_*, ROLE_*. Семантическая ветка выше не меняется.
+        "SendMessage" => {
+            let task: Task = build_task_from_send_params_sdk(&request.params)?;
+            match adapter.send_task_as(owner, task).await? {
+                gateway_core::Reply::Complete(t) => Ok(render_task_sdk(&t)),
+                gateway_core::Reply::Streaming(_) => {
+                    anyhow::bail!("Фаза 1: streaming не реализован для A2A->ACP направления")
+                }
+            }
+        }
+
         "tasks/get" => {
             let id = request.params.get("id").and_then(Value::as_str)
                 .ok_or_else(|| anyhow::anyhow!("tasks/get: id обязателен"))?;
             let task = adapter.get_task_as(owner, TaskId(id.to_string())).await?;
             Ok(serde_json::to_value(task)?)
         }
+
+        // ДОБАВЛЕНО: SDK-алиас tasks/get. Параметр "name" в SDK JSON-RPC
+        // содержит путь вида "tasks/<id>" — извлекаем id из хвоста, либо,
+        // если клиент прислал плоское "id" (не по спеке SDK, но щадящий
+        // разбор), берём его напрямую.
+        "GetTask" => {
+            let id = extract_sdk_task_id(&request.params)
+                .ok_or_else(|| anyhow::anyhow!("GetTask: id/name обязателен"))?;
+            let task = adapter.get_task_as(owner, TaskId(id)).await?;
+            Ok(render_task_sdk(&task))
+        }
+
         "tasks/cancel" => {
             let id = request.params.get("id").and_then(Value::as_str)
                 .ok_or_else(|| anyhow::anyhow!("tasks/cancel: id обязателен"))?;
             let task = adapter.cancel_task_as(owner, TaskId(id.to_string())).await?;
             Ok(serde_json::to_value(task)?)
         }
+
+        "CancelTask" => {
+            let id = extract_sdk_task_id(&request.params)
+                .ok_or_else(|| anyhow::anyhow!("CancelTask: id/name обязателен"))?;
+            let task = adapter.cancel_task_as(owner, TaskId(id)).await?;
+            Ok(render_task_sdk(&task))
+        }
+
         other => anyhow::bail!("method_not_found: {other}"),
     }
+}
+
+/// SDK GetTask/CancelTask params несут либо {"name": "tasks/<id>"} (по
+/// спеке SDK), либо плоское {"id": "<id>"} (щадящий разбор — некоторые
+/// клиенты шлют так же, как в семантическом формате). Пробуем оба.
+fn extract_sdk_task_id(params: &Value) -> Option<String> {
+    if let Some(name) = params.get("name").and_then(Value::as_str) {
+        return name.rsplit('/').next().map(str::to_string);
+    }
+    params.get("id").and_then(Value::as_str).map(str::to_string)
 }
 
 fn build_task_from_send_params(params: &Value) -> anyhow::Result<Task> {
@@ -291,6 +462,40 @@ fn build_task_from_send_params(params: &Value) -> anyhow::Result<Task> {
     let context_id = params
         .get("message")
         .and_then(|m| m.get("contextId"))
+        .or_else(|| params.get("contextId"))
+        .and_then(Value::as_str)
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("ctx-{}", uuid_stub()));
+
+    Ok(Task {
+        id: TaskId(task_id),
+        context_id: protocol::a2a::ContextId(context_id),
+        status: protocol::a2a::TaskStatus {
+            state: protocol::a2a::TaskState::Submitted,
+            message: Some(message),
+            timestamp: None,
+        },
+        history: None,
+        artifacts: None,
+        metadata: None,
+    })
+}
+
+/// SDK-вариант build_task_from_send_params: использует normalize_message
+/// вместо прямого serde_json::from_value::<Message>, чтобы принять
+/// ROLE_USER/{text} без поля kind. contextId читается из camelCase (SDK)
+/// с фоллбэком на snake_case (на случай смешанных клиентов).
+fn build_task_from_send_params_sdk(params: &Value) -> anyhow::Result<Task> {
+    let message_value = params.get("message")
+        .ok_or_else(|| anyhow::anyhow!("SendMessage: message обязателен"))?;
+    let message = normalize_message(message_value)
+        .map_err(|e| anyhow::anyhow!("SendMessage: {e}"))?;
+
+    let task_id = format!("task-{}", uuid_stub());
+
+    let context_id = params
+        .get("message")
+        .and_then(|m| m.get("contextId").or_else(|| m.get("context_id")))
         .or_else(|| params.get("contextId"))
         .and_then(Value::as_str)
         .map(|s| s.to_string())
