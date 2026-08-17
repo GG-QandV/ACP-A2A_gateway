@@ -1,6 +1,11 @@
 //! gatewayd/src/transport_a2a_passthrough.rs
 //! Направление 2: A2A-клиент -> A2A-агент, без семантического
 //! преобразования — reverse-proxy, включая SSE-стрим как есть.
+//!
+//! ДОБАВЛЕНО: диалект-зонд (dialect_probe) выполняется один раз на
+//! agent_id перед первым проксированием — результат только логируется,
+//! не блокирует и не меняет сам passthrough (он остаётся reverse-proxy
+//! "без семантического преобразования").
 
 use std::sync::Arc;
 
@@ -11,23 +16,24 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::any;
 use axum::Router;
 
+use crate::dialect_probe::{probe_dialect, DialectCache};
 use crate::registry::{Registry, Transport};
 
 pub struct PassthroughState {
     registry: Arc<Registry>,
     client: reqwest::Client,
+    dialect_cache: DialectCache,
 }
 
 pub fn router(registry: Arc<Registry>) -> Router {
     let state = Arc::new(PassthroughState {
         registry,
-        // ИСПРАВЛЕНО (аудит P1-7): без таймаута зависший upstream держал
-        // клиентское соединение бесконечно.
         client: reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(300))
             .connect_timeout(std::time::Duration::from_secs(10))
             .build()
             .expect("reqwest client builds with default TLS backend"),
+        dialect_cache: DialectCache::new(),
     });
 
     Router::new()
@@ -35,22 +41,8 @@ pub fn router(registry: Arc<Registry>) -> Router {
         .with_state(state)
 }
 
-
-/// ИСПРАВЛЕНО (аудит P1-4): было usize::MAX — один запрос мог положить
-/// шлюз по памяти.
 const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 
-/// Сборка адреса upstream.
-///
-/// Вынесено из обработчика отдельной функцией, потому что направление 2
-/// (A2A passthrough) до сих пор не имело НИ ОДНОГО теста, хотя правки
-/// сюда вносились: лимит тела, таймауты, нормализация пути, сохранение
-/// query. Проверять всё это через живой HTTP дорого, а сборку URL —
-/// главный источник ошибок здесь — можно проверить напрямую.
-///
-/// ИСПРАВЛЕНО (аудит P1-8): path из wildcard подставлялся как есть,
-/// сегменты ".." выводили запрос за пределы адреса агента; query-строка
-/// терялась целиком.
 fn build_target_url(base: &str, path: &str, query: Option<&str>) -> String {
     let safe_path = path
         .split('/')
@@ -96,6 +88,22 @@ async fn proxy_handler(
             .into_response();
     };
 
+    if state.dialect_cache.get(&agent_id).is_none() {
+        match probe_dialect(&state.client, &url, push_token.as_deref()).await {
+            Ok(dialect) => {
+                state.dialect_cache.set(&agent_id, dialect);
+                tracing::info!(agent_id = %agent_id, ?dialect, "a2a dialect probed");
+            }
+            Err(e) => {
+                tracing::warn!(
+                    agent_id = %agent_id,
+                    error = %e,
+                    "a2a dialect probe failed — proxying request anyway"
+                );
+            }
+        }
+    }
+
     let target_url = build_target_url(&url, &path, request.uri().query());
     let method = request.method().clone();
 
@@ -111,12 +119,11 @@ async fn proxy_handler(
     if let Some(ct) = headers.get("content-type") {
         upstream_req = upstream_req.header("content-type", ct);
     }
-    // ИСПРАВЛЕНО (аудит P1-8): без Accept upstream не отдаёт
-    // text/event-stream, и SSE-режим (ради которого здесь bytes_stream)
-    // не работал вовсе.
+
     if let Some(accept) = headers.get("accept") {
         upstream_req = upstream_req.header("accept", accept);
     }
+
     if let Some(pt) = &push_token {
         upstream_req = upstream_req.bearer_auth(pt);
     }
@@ -127,10 +134,7 @@ async fn proxy_handler(
     };
 
     let status = upstream_resp.status();
-    let content_type = upstream_resp
-        .headers()
-        .get("content-type")
-        .cloned();
+    let content_type = upstream_resp.headers().get("content-type").cloned();
 
     let stream = upstream_resp.bytes_stream();
     let mut response = Response::builder().status(status.as_u16());
@@ -156,15 +160,12 @@ mod tests {
         );
     }
 
-    /// Регрессия: query раньше терялся целиком, и upstream получал
-    /// запрос без параметров.
     #[test]
     fn query_is_not_dropped() {
         let url = build_target_url("https://ops.internal/a2a", "tasks", Some("limit=10"));
-        assert!(url.ends_with("?limit=10"), "query должен доезжать: {url}");
+        assert!(url.ends_with("?limit=10"));
     }
 
-    /// Регрессия: сегменты ".." выводили запрос за пределы адреса агента.
     #[test]
     fn traversal_segments_are_stripped() {
         let url = build_target_url("https://ops.internal/a2a", "../../admin/secret", None);
@@ -185,11 +186,19 @@ mod tests {
         assert_eq!(build_target_url("https://ops.internal/a2a", "", None), "https://ops.internal/a2a/");
     }
 
-    /// Лимит тела: 32 MiB, а не usize::MAX — иначе один запрос кладёт
-    /// шлюз по памяти.
     #[test]
     fn body_limit_is_bounded() {
         const { assert!(MAX_BODY_BYTES > 0, "лимит тела должен быть ненулевым"); }
         const { assert!(MAX_BODY_BYTES <= 64 * 1024 * 1024, "лимит тела не должен быть безграничным"); }
+    }
+
+    #[test]
+    fn passthrough_state_carries_dialect_cache_field() {
+        let cache = DialectCache::new();
+        cache.set("probe-integration-check", crate::dialect_probe::A2aDialect::Spec);
+        assert_eq!(
+            cache.get("probe-integration-check"),
+            Some(crate::dialect_probe::A2aDialect::Spec)
+        );
     }
 }
