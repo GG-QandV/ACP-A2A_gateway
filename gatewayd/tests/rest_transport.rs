@@ -264,3 +264,64 @@ fn http_status_to_sdk_name_covers_all_used_codes() {
         );
     }
 }
+
+/// Регрессия на continue по contextId: второй message/send в ту же сессию
+/// должен использовать ту же ACP-сессию (SessionId), а не создавать новую.
+/// До фикса ensure_session создавал новую SessionId каждый раз — второй
+/// запрос таймаутил, потому что агент ждал продолжения в старой сессии.
+/// (юнит-покрытие: convert.rs::same_context_reuses_session)
+#[tokio::test]
+async fn second_message_send_same_context_returns_same_session() {
+    let router = test_router_with_stub_agent("agent-continue").await;
+
+    let first = post_message(
+        router.clone(),
+        "/agents/agent-continue/message:send",
+        "ctx-continue-1",
+    )
+    .await;
+    assert_eq!(
+        first.status(),
+        StatusCode::OK,
+        "первый message/send должен пройти успешно"
+    );
+    let first_json = body_json(first).await;
+    assert!(
+        first_json.get("task").is_some(),
+        "ответ должен содержать обёртку task"
+    );
+    let first_context_id = first_json["task"]["contextId"]
+        .as_str()
+        .expect("contextId присутствует");
+    assert_eq!(
+        first_context_id, "ctx-continue-1",
+        "contextId должен совпадать с отправленным"
+    );
+
+    // Второй запрос с тем же contextId — должен использовать ту же сессию,
+    // не таймаутить, вернуть тот же contextId. Если бы сессия создавалась
+    // заново, ответ пришёл бы с новым контекстом (или таймаутом).
+    let second = post_message(
+        router,
+        "/agents/agent-continue/message:send",
+        "ctx-continue-1",
+    )
+    .await;
+    assert_eq!(
+        second.status(),
+        StatusCode::OK,
+        "второй message/send с тем же contextId должен пройти успешно, не таймаутить"
+    );
+    let second_json = body_json(second).await;
+    assert!(
+        second_json.get("task").is_some(),
+        "ответ должен содержать обёртку task"
+    );
+    let second_context_id = second_json["task"]["contextId"]
+        .as_str()
+        .expect("contextId присутствует");
+    assert_eq!(
+        second_context_id, "ctx-continue-1",
+        "contextId должен совпадать (тот же разговор)"
+    );
+}
