@@ -21,7 +21,8 @@ use std::thread;
 use std::time::Duration;
 
 fn main() {
-    let prompt_text = std::env::var("MOCK_AGENT_PROMPT_TEXT").unwrap_or_else(|_| "pong".to_string());
+    let prompt_text =
+        std::env::var("MOCK_AGENT_PROMPT_TEXT").unwrap_or_else(|_| "pong".to_string());
     let exit_after_prompts: u64 = std::env::var("MOCK_AGENT_EXIT_AFTER_PROMPTS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -31,6 +32,10 @@ fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
     let chunk_delay_ms: u64 = std::env::var("MOCK_AGENT_CHUNK_DELAY_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let final_delay_ms: u64 = std::env::var("MOCK_AGENT_FINAL_DELAY_MS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
@@ -54,7 +59,10 @@ fn main() {
         let Some(id) = msg.get("id").cloned() else {
             continue;
         };
-        let method = msg.get("method").and_then(serde_json::Value::as_str).unwrap_or("");
+        let method = msg
+            .get("method")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
 
         let result = match method {
             "initialize" => serde_json::json!({
@@ -108,6 +116,10 @@ fn main() {
                     }
                 }
                 // Отвечаем на промпт, затем, если достигнут лимит — умираем.
+                // Задержка перед финальным ответом — для теста idle_chunk_timeout.
+                if final_delay_ms > 0 {
+                    thread::sleep(Duration::from_millis(final_delay_ms));
+                }
                 let resp = serde_json::json!({
                     "stopReason": "end_turn",
                     "content": [{
@@ -138,7 +150,11 @@ fn main() {
     }
 }
 
-fn write_response(stdout: &std::io::Stdout, id: &serde_json::Value, result: Result<serde_json::Value, serde_json::Value>) {
+fn write_response(
+    stdout: &std::io::Stdout,
+    id: &serde_json::Value,
+    result: Result<serde_json::Value, serde_json::Value>,
+) {
     let body = match result {
         Ok(result) => serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result }),
         Err(error) => serde_json::json!({ "jsonrpc": "2.0", "id": id, "error": error }),

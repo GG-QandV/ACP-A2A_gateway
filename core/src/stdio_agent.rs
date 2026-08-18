@@ -43,12 +43,10 @@ pub struct StdioAcpAgent {
     call_timeout: std::time::Duration,
     /// ДОБАВЛЕНО (Часть 2 роадмапа стриминга): таймаут ДО первого чанка
     /// стрима. Прокидывается из конфига (streaming.first_chunk_timeout_secs)
-    /// через SpawnConfig; применяется в стрим-цикле convert.rs (направление 4).
-    #[allow(dead_code)]
+    /// через SpawnConfig; применяется в стрим-цикле prompt_streaming.
     first_chunk_timeout: std::time::Duration,
     /// ДОБАВЛЕНО (Часть 2 роадмапа стриминга): таймаут МЕЖДУ чанками.
-    /// Аналогично first_chunk_timeout — применяется в стрим-цикле convert.rs.
-    #[allow(dead_code)]
+    /// Аналогично first_chunk_timeout — применяется в стрим-цикле.
     idle_chunk_timeout: std::time::Duration,
 }
 
@@ -370,6 +368,8 @@ impl AcpAgent for StdioAcpAgent {
         // Если первым приходит чанк session/update — агент стримит:
         // возвращаем Reply::Streaming с внешним каналом, в который
         // пересылаются и остаток чанков, и терминальный элемент.
+        // Если за first_chunk_timeout не пришло ни чанка, ни ответа —
+        // агент вообще не начал ход: таймаут (T9).
         tokio::select! {
             resp = &mut resp_rx => {
                 let resp: PromptResponse = match resp {
@@ -391,8 +391,12 @@ impl AcpAgent for StdioAcpAgent {
 
                 // Фоновый таск: пересылает остаток чанков из rx в out, затем
                 // ждёт финальный PromptResponse и шлёт терминальный элемент.
+                // ДОБАВЛЕНО (Часть 2, задача C): idle_chunk_timeout применяется
+                // здесь (первый чанк уже получен выше, поэтому первый wait —
+                // это ожидание ВТОРОГО чанка, таймаут = idle).
                 tokio::spawn({
                     let updates = self.updates.clone();
+                    let idle_chunk_timeout = self.idle_chunk_timeout;
                     async move {
                         let mut last_chunks = 0usize;
                         loop {
@@ -440,6 +444,15 @@ impl AcpAgent for StdioAcpAgent {
                                     }
                                     break;
                                 }
+                                _ = tokio::time::sleep(idle_chunk_timeout) => {
+                                    // ЛОГ-ЛОВУШКА (WARN, по умолчанию включена):
+                                    tracing::warn!(
+                                        session_id = %session_key,
+                                        elapsed = ?idle_chunk_timeout,
+                                        "idle_chunk_timeout сработал — агент не присылал чанков дольше лимита, поток закрыт"
+                                    );
+                                    break;
+                                }
                             }
                         }
                         updates.lock().await.remove(&session_key);
@@ -447,6 +460,16 @@ impl AcpAgent for StdioAcpAgent {
                 });
 
                 Ok(Reply::Streaming(out_rx))
+            }
+            _ = tokio::time::sleep(self.first_chunk_timeout) => {
+                // Т9: агент не начал стримить и не ответил за first_chunk_timeout.
+                // Чистим pending и закрываем сессию, чтобы не висели.
+                self.pending.lock().await.remove(&id);
+                self.updates.lock().await.remove(&session_key);
+                anyhow::bail!(
+                    "agent did not start streaming within {:?}",
+                    self.first_chunk_timeout
+                )
             }
         }
     }
@@ -559,6 +582,14 @@ mod tests {
     }
 
     async fn spawn_mock(extra_env: &[(&str, &str)]) -> StdioAcpAgent {
+        spawn_mock_with_timeouts(extra_env, Duration::from_secs(15), Duration::from_secs(120)).await
+    }
+
+    async fn spawn_mock_with_timeouts(
+        extra_env: &[(&str, &str)],
+        first_chunk_timeout: Duration,
+        idle_chunk_timeout: Duration,
+    ) -> StdioAcpAgent {
         let mut env = HashMap::new();
         for (k, v) in extra_env {
             env.insert(k.to_string(), v.to_string());
@@ -568,8 +599,8 @@ mod tests {
             &None,
             &env,
             Duration::from_secs(30),
-            Duration::from_secs(15),
-            Duration::from_secs(120),
+            first_chunk_timeout,
+            idle_chunk_timeout,
         )
         .await
         .expect("mock агент спавнится")
@@ -621,7 +652,10 @@ mod tests {
             .expect("первый чанк приходит")
             .expect("канал не закрыт");
         let elapsed_first = t0.elapsed();
-        assert!(elapsed_first < Duration::from_millis(400), "первый чанк не должен ждать весь ход: {elapsed_first:?}");
+        assert!(
+            elapsed_first < Duration::from_millis(400),
+            "первый чанк не должен ждать весь ход: {elapsed_first:?}"
+        );
 
         // Последующие — между ними реально проходит ~50мс (не батч в конце).
         let t1 = Instant::now();
@@ -630,7 +664,10 @@ mod tests {
             .expect("второй чанк приходит")
             .expect("канал не закрыт");
         let gap = t1.elapsed();
-        assert!(gap >= Duration::from_millis(30), "чанки должны приходить по одному с задержкой, gap={gap:?}");
+        assert!(
+            gap >= Duration::from_millis(30),
+            "чанки должны приходить по одному с задержкой, gap={gap:?}"
+        );
 
         let _third = tokio::time::timeout(Duration::from_secs(10), rx.recv())
             .await
@@ -639,5 +676,82 @@ mod tests {
 
         assert!(matches!(first, SessionUpdate::AgentMessageChunk { .. }));
         assert!(matches!(second, SessionUpdate::AgentMessageChunk { .. }));
+    }
+
+    /// T9: idle_chunk_timeout закрывает зависший стрим. Мок шлёт 1 чанк,
+    /// затем не отвечает дольше idle (200мс) — стрим должен закрыться по
+    /// таймауту (< 500мс), а не висеть до call_timeout.
+    #[tokio::test]
+    async fn idle_timeout_closes_stalled_stream() {
+        let agent = spawn_mock_with_timeouts(
+            &[
+                ("MOCK_AGENT_STREAM_CHUNKS", "1"),
+                ("MOCK_AGENT_FINAL_DELAY_MS", "2000"),
+            ],
+            Duration::from_secs(15),
+            Duration::from_millis(200),
+        )
+        .await;
+        let session = init_session(&agent).await;
+
+        let reply = agent
+            .prompt_streaming(PromptRequest {
+                session_id: session.clone(),
+                prompt: vec![ContentBlock::Text {
+                    text: "hello".into(),
+                }],
+            })
+            .await
+            .expect("prompt_streaming работает");
+
+        let Reply::Streaming(mut rx) = reply else {
+            panic!("ожидался Reply::Streaming");
+        };
+
+        // Читаем до закрытия канала (idle-таймаут закроет после 1 чанка).
+        let start = Instant::now();
+        let mut chunks = 0usize;
+        while rx.recv().await.is_some() {
+            chunks += 1;
+        }
+        let elapsed = start.elapsed();
+        assert!(chunks >= 1, "первый чанк должен прийти");
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "стрим должен закрыться по idle_chunk_timeout, а не ждать финал 2000мс: {elapsed:?}"
+        );
+    }
+
+    /// T9: first_chunk_timeout срабатывает, если агент вообще не начинает
+    /// стримить и не отвечает. Мок молчит дольше first (100мс) —
+    /// prompt_streaming должен вернуть Err по таймауту, не ждать call_timeout.
+    #[tokio::test]
+    async fn first_chunk_timeout_fires_if_agent_never_starts() {
+        let agent = spawn_mock_with_timeouts(
+            &[("MOCK_AGENT_FINAL_DELAY_MS", "2000")],
+            Duration::from_millis(100),
+            Duration::from_secs(120),
+        )
+        .await;
+        let session = init_session(&agent).await;
+
+        let start = Instant::now();
+        let result = agent
+            .prompt_streaming(PromptRequest {
+                session_id: session.clone(),
+                prompt: vec![ContentBlock::Text {
+                    text: "hello".into(),
+                }],
+            })
+            .await;
+        let elapsed = start.elapsed();
+        assert!(
+            result.is_err(),
+            "агент не начал стримить — должна быть ошибка first_chunk_timeout"
+        );
+        assert!(
+            elapsed < Duration::from_millis(400),
+            "first_chunk_timeout должен сработать раньше финального ответа (2000мс): {elapsed:?}"
+        );
     }
 }

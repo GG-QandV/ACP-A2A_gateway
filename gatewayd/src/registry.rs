@@ -189,4 +189,37 @@ mod tests {
         let err = reg.try_acquire_stream("nonexistent").unwrap_err();
         assert!(err.to_string().contains("nonexistent"));
     }
+
+    /// T7: drop permit'а (RAII, как TurnGuard) освобождает слот — новый
+    /// стрим проходит после того, как предыдущий закрылся.
+    #[test]
+    fn releasing_a_permit_allows_new_stream() {
+        let tokens: HashSet<String> = ["t-valid".to_string()].into_iter().collect();
+        let mut agents = HashMap::new();
+        agents.insert(
+            "a1".to_string(),
+            AgentEntry::new(
+                Transport::Stdio {
+                    command: vec!["echo".into()],
+                    cwd: None,
+                    env: HashMap::new(),
+                },
+                1,
+                std::time::Duration::from_secs(15),
+                std::time::Duration::from_secs(120),
+            ),
+        );
+        let reg = Registry::new(tokens, agents);
+
+        let p1 = reg.try_acquire_stream("a1").expect("первый permit");
+        assert!(
+            reg.try_acquire_stream("a1").is_err(),
+            "лимит 1: второй должен быть отклонён"
+        );
+        drop(p1);
+        assert!(
+            reg.try_acquire_stream("a1").is_ok(),
+            "после drop permit'а слот свободен"
+        );
+    }
 }
