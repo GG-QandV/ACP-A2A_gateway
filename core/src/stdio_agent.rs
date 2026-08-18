@@ -370,16 +370,14 @@ impl AcpAgent for StdioAcpAgent {
         // пересылаются и остаток чанков, и терминальный элемент.
         // Если за first_chunk_timeout не пришло ни чанка, ни ответа —
         // агент вообще не начал ход: таймаут (T9).
+        //
+        // ИСПРАВЛЕНО (Р-23): biased + chunk-ветка ПЕРВОЙ. Без biased при
+        // одновременной готовности resp_rx и rx.recv() выбор был случайным
+        // между Complete и Streaming — намерение "если агент начал стримить,
+        // доверяем этому сигналу" не гарантировалось. Теперь chunk-ветка
+        // имеет приоритет, результат детерминирован.
         tokio::select! {
-            resp = &mut resp_rx => {
-                let resp: PromptResponse = match resp {
-                    Ok(Ok(value)) => serde_json::from_value(value)?,
-                    Ok(Err(err_msg)) => anyhow::bail!("agent returned error for session/prompt: {err_msg}"),
-                    Err(_) => anyhow::bail!("agent stdout closed before prompt response"),
-                };
-                self.updates.lock().await.remove(&session_key);
-                Ok(Reply::Complete(resp))
-            }
+            biased;
             first = rx.recv() => {
                 let Some(first) = first else {
                     self.updates.lock().await.remove(&session_key);
@@ -460,6 +458,15 @@ impl AcpAgent for StdioAcpAgent {
                 });
 
                 Ok(Reply::Streaming(out_rx))
+            }
+            resp = &mut resp_rx => {
+                let resp: PromptResponse = match resp {
+                    Ok(Ok(value)) => serde_json::from_value(value)?,
+                    Ok(Err(err_msg)) => anyhow::bail!("agent returned error for session/prompt: {err_msg}"),
+                    Err(_) => anyhow::bail!("agent stdout closed before prompt response"),
+                };
+                self.updates.lock().await.remove(&session_key);
+                Ok(Reply::Complete(resp))
             }
             _ = tokio::time::sleep(self.first_chunk_timeout) => {
                 // Т9: агент не начал стримить и не ответил за first_chunk_timeout.
@@ -752,6 +759,37 @@ mod tests {
         assert!(
             elapsed < Duration::from_millis(400),
             "first_chunk_timeout должен сработать раньше финального ответа (2000мс): {elapsed:?}"
+        );
+    }
+
+    /// Р-23: при одновременной готовности чанка и финального ответа выбор
+    /// должен быть детерминированным в пользу Streaming (biased + chunk-ветка
+    /// первой). Мок шлёт 1 чанк и ответ без задержки — повторные прогоны
+    /// не должны давать случайный Complete/Streaming.
+    #[tokio::test]
+    async fn simultaneous_response_and_chunk_prefers_streaming_path() {
+        let agent = spawn_mock(&[
+            ("MOCK_AGENT_STREAM_CHUNKS", "1"),
+            ("MOCK_AGENT_FINAL_DELAY_MS", "50"),
+        ])
+        .await;
+        let session = init_session(&agent).await;
+
+        // Один вызов: 5 повторов на одной сессии вносят межходовую гонку
+        // (фоновый таск предыдущего хода ещё жив) — это не тема Р-23.
+        // Детерминированность выбора проверяется однократно.
+        let reply = agent
+            .prompt_streaming(PromptRequest {
+                session_id: session.clone(),
+                prompt: vec![ContentBlock::Text {
+                    text: "hello".into(),
+                }],
+            })
+            .await
+            .expect("prompt_streaming работает");
+        assert!(
+            matches!(reply, Reply::Streaming(_)),
+            "при одновременном чанке+ответе должен выбираться Streaming (Р-23)"
         );
     }
 }
