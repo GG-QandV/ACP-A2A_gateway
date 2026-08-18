@@ -24,11 +24,14 @@ serde_yaml = "0.9"
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "registry", "fmt"] }
 axum = "0.7"
 reqwest = { version = "0.12", features = ["json", "stream"] }
 dashmap = { workspace = true }
 uuid = { workspace = true }
+tokio-stream = "0.1"
+futures-util = "0.3"
+tracing-appender = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
