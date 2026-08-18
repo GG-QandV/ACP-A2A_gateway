@@ -9,14 +9,18 @@ use std::time::Duration;
 
 use axum::extract::{Path as AxumPath, State};
 use axum::http::{HeaderMap, StatusCode};
+use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Json};
 use axum::routing::{get, post};
 use axum::Router;
+use futures_util::StreamExt;
 use gateway_core::{A2aAgent, AcpAsA2a, ContextLost, Owner, SpawnConfig, SupervisedStdioAgent};
 use protocol::a2a::{Task, TaskId};
 use protocol::a2a_sdk_compat::{normalize_message, render_task_sdk};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::convert::Infallible;
+use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use crate::registry::{Registry, Transport};
 
@@ -274,9 +278,12 @@ async fn rpc_handler(
 
     let result = dispatch_a2a_method(&adapter, owner, &request).await;
     match result {
-        Ok(value) => {
+        Ok(DispatchResult::Json(value)) => {
             Json(json!({ "jsonrpc": "2.0", "id": request.id, "result": value })).into_response()
         }
+        // ДОБАВЛЕНО (задача D): стриминговый ответ рендерится как SSE,
+        // а не как JSON-RPC конверт — клиент читает поток A2aEvent.
+        Ok(DispatchResult::Streaming(rx)) => stream_to_sse(rx).into_response(),
         // ДОБАВЛЕНО (аудит P2-10): потеря контекста — не «что-то пошло
         // не так». Клиент должен отличить её от прочих ошибок, чтобы
         // начать разговор заново, а не молча продолжать в пустоту.
@@ -369,11 +376,17 @@ async fn rest_send_message_core(
         // Обёртка {task: ...} обязательна: SDK-клиент разворачивает
         // SendMessageResponse сам (render_task_sdk её и строит).
         Ok(gateway_core::Reply::Complete(t)) => Json(render_task_sdk(&t)).into_response(),
-        Ok(gateway_core::Reply::Streaming(_)) => rest_sdk_error(
-            StatusCode::NOT_IMPLEMENTED,
-            -32000,
-            "Фаза 1: streaming не реализован для A2A->ACP направления",
-        ),
+        // ДОБАВЛЕНО (задача D): вместо заглушки — SSE-поток A2aEvent.
+        // Лог-ловушка при разрыве соединения клиентом — внутри stream_to_sse
+        // невозможна (поток без имени агента), здесь фиксируем только факт
+        // старта стрима.
+        Ok(gateway_core::Reply::Streaming(rx)) => {
+            tracing::info!(
+                agent_id,
+                "SDK REST-клиент перешёл в стриминговый режим (SSE)"
+            );
+            stream_to_sse(rx).into_response()
+        }
         // Тот же контракт, что и у /rpc: потерянный контекст — 409 +
         // ABORTED, а не абстрактная внутренняя ошибка.
         Err(e) if e.downcast_ref::<ContextLost>().is_some() => {
@@ -418,19 +431,45 @@ pub fn http_status_to_sdk_name(status: StatusCode) -> &'static str {
     }
 }
 
+/// ДОБАВЛЕНО (Часть 1 роадмапа стриминга, задача D): рендерит готовый
+/// поток A2aEvent в HTTP SSE-ответ (text/event-stream). Контракт seam
+/// Reply<T,U>: транспорт не знает про ACP SessionUpdate — он получает
+/// уже смаппленные A2aEvent и просто сериализует их в SSE-фреймы.
+/// Каждое событие — отдельный `data: {...}\n\n`.
+fn stream_to_sse(
+    rx: tokio::sync::mpsc::UnboundedReceiver<protocol::a2a::A2aEvent>,
+) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
+    let stream = UnboundedReceiverStream::new(rx).map(|event| {
+        // A2aEvent сериализуется по спеке (серde) — клиент читает тот же
+        // JSON, что и в JSON-RPC result, только по событию за раз.
+        Ok(Event::default()
+            .json_data(event)
+            .expect("A2aEvent сериализуется"))
+    });
+    Sse::new(stream)
+}
+
+/// Результат диспетчера: либо синхронный JSON (Complete), либо поток SSE
+/// (Streaming). rpc_handler рендерит по варианту.
+enum DispatchResult {
+    Json(Value),
+    Streaming(tokio::sync::mpsc::UnboundedReceiver<protocol::a2a::A2aEvent>),
+}
+
 async fn dispatch_a2a_method(
     adapter: &Arc<AcpAsA2a<SupervisedStdioAgent>>,
     owner: Owner,
     request: &JsonRpcRequest,
-) -> anyhow::Result<Value> {
+) -> anyhow::Result<DispatchResult> {
     match request.method.as_str() {
         "message/send" => {
             let task: Task = build_task_from_send_params(&request.params)?;
             match adapter.send_task_as(owner, task).await? {
-                gateway_core::Reply::Complete(t) => Ok(serde_json::to_value(t)?),
-                gateway_core::Reply::Streaming(_) => {
-                    anyhow::bail!("Фаза 1: streaming не реализован для A2A->ACP направления")
+                gateway_core::Reply::Complete(t) => {
+                    Ok(DispatchResult::Json(serde_json::to_value(t)?))
                 }
+                // ДОБАВЛЕНО (задача D): вместо заглушки — SSE-поток.
+                gateway_core::Reply::Streaming(rx) => Ok(DispatchResult::Streaming(rx)),
             }
         }
 
@@ -440,10 +479,9 @@ async fn dispatch_a2a_method(
         "SendMessage" => {
             let task: Task = build_task_from_send_params_sdk(&request.params)?;
             match adapter.send_task_as(owner, task).await? {
-                gateway_core::Reply::Complete(t) => Ok(render_task_sdk(&t)),
-                gateway_core::Reply::Streaming(_) => {
-                    anyhow::bail!("Фаза 1: streaming не реализован для A2A->ACP направления")
-                }
+                gateway_core::Reply::Complete(t) => Ok(DispatchResult::Json(render_task_sdk(&t))),
+                // ДОБАВЛЕНО (задача D): вместо заглушки — SSE-поток.
+                gateway_core::Reply::Streaming(rx) => Ok(DispatchResult::Streaming(rx)),
             }
         }
 
@@ -454,7 +492,7 @@ async fn dispatch_a2a_method(
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow::anyhow!("tasks/get: id обязателен"))?;
             let task = adapter.get_task_as(owner, TaskId(id.to_string())).await?;
-            Ok(serde_json::to_value(task)?)
+            Ok(DispatchResult::Json(serde_json::to_value(task)?))
         }
 
         // ДОБАВЛЕНО: SDK-алиас tasks/get. Параметр "name" в SDK JSON-RPC
@@ -465,7 +503,7 @@ async fn dispatch_a2a_method(
             let id = extract_sdk_task_id(&request.params)
                 .ok_or_else(|| anyhow::anyhow!("GetTask: id/name обязателен"))?;
             let task = adapter.get_task_as(owner, TaskId(id)).await?;
-            Ok(render_task_sdk(&task))
+            Ok(DispatchResult::Json(render_task_sdk(&task)))
         }
 
         "tasks/cancel" => {
@@ -477,14 +515,14 @@ async fn dispatch_a2a_method(
             let task = adapter
                 .cancel_task_as(owner, TaskId(id.to_string()))
                 .await?;
-            Ok(serde_json::to_value(task)?)
+            Ok(DispatchResult::Json(serde_json::to_value(task)?))
         }
 
         "CancelTask" => {
             let id = extract_sdk_task_id(&request.params)
                 .ok_or_else(|| anyhow::anyhow!("CancelTask: id/name обязателен"))?;
             let task = adapter.cancel_task_as(owner, TaskId(id)).await?;
-            Ok(render_task_sdk(&task))
+            Ok(DispatchResult::Json(render_task_sdk(&task)))
         }
 
         other => anyhow::bail!("method_not_found: {other}"),

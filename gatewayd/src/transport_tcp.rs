@@ -235,7 +235,34 @@ async fn handle_http_target(
         };
 
         match response {
-            Ok(result) => write_ok(&mut writer, id, result).await?,
+            Ok(AcpDispatchResult::Json(result)) => write_ok(&mut writer, id, result).await?,
+            // ДОБАВЛЕНО (задача E): поток SessionUpdate пишется в тот же
+            // TCP-сокет построчно — каждая нотификация session/update,
+            // до закрытия канала.
+            Ok(AcpDispatchResult::Streaming(mut rx)) => {
+                let session_id = String::from("unknown");
+                while let Some(update) = rx.recv().await {
+                    let payload = json!({
+                        "jsonrpc": "2.0",
+                        "method": "session/update",
+                        "params": {
+                            "sessionId": session_id,
+                            "update": update,
+                        }
+                    });
+                    let mut bytes = serde_json::to_vec(&payload)?;
+                    bytes.push(b'\n');
+                    if let Err(e) = writer.write_all(&bytes).await {
+                        // ЛОГ-ЛОВУШКА (ERROR, по умолчанию включена):
+                        tracing::error!(
+                            session_id = %session_id,
+                            error = %e,
+                            "не удалось записать session/update в TCP-сокет клиента — соединение будет закрыто"
+                        );
+                        return Err(e.into());
+                    }
+                }
+            }
             Err(e) => write_error(&mut writer, id, -32000, &e.to_string()).await?,
         }
     }
@@ -243,28 +270,38 @@ async fn handle_http_target(
     Ok(())
 }
 
+/// Результат ACP-диспетчера: синхронный JSON (Complete) либо поток
+/// SessionUpdate (Streaming) — построчно пишется в TCP-сокет как
+/// session/update-нотификации.
+enum AcpDispatchResult {
+    Json(Value),
+    Streaming(tokio::sync::mpsc::UnboundedReceiver<protocol::acp::SessionUpdate>),
+}
+
 async fn dispatch_acp_method(
     adapter: &A2aAsAcp<HttpA2aAgent>,
     request: &JsonRpcRequest,
-) -> anyhow::Result<Value> {
+) -> anyhow::Result<AcpDispatchResult> {
     match request.method.as_str() {
         "initialize" => {
             let req: InitializeRequest = serde_json::from_value(request.params.clone())?;
             let resp = adapter.initialize(req).await?;
-            Ok(serde_json::to_value(resp)?)
+            Ok(AcpDispatchResult::Json(serde_json::to_value(resp)?))
         }
         "session/new" => {
             let req: NewSessionRequest = serde_json::from_value(request.params.clone())?;
             let resp = adapter.new_session(req).await?;
-            Ok(serde_json::to_value(resp)?)
+            Ok(AcpDispatchResult::Json(serde_json::to_value(resp)?))
         }
         "session/prompt" => {
             let req: PromptRequest = serde_json::from_value(request.params.clone())?;
             match adapter.prompt(req).await? {
-                gateway_core::Reply::Complete(resp) => Ok(serde_json::to_value(resp)?),
-                gateway_core::Reply::Streaming(_) => {
-                    anyhow::bail!("Фаза 1: стриминг для ACP->A2A направления не реализован")
+                gateway_core::Reply::Complete(resp) => {
+                    Ok(AcpDispatchResult::Json(serde_json::to_value(resp)?))
                 }
+                // ДОБАВЛЕНО (задача E): вместо заглушки — поток SessionUpdate,
+                // который handle_http_target пишет построчно в TCP-сокет.
+                gateway_core::Reply::Streaming(rx) => Ok(AcpDispatchResult::Streaming(rx)),
             }
         }
         "session/cancel" => {
@@ -274,7 +311,7 @@ async fn dispatch_acp_method(
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow::anyhow!("session/cancel: sessionId обязателен"))?;
             adapter.cancel(SessionId(session_id_raw.to_string())).await?;
-            Ok(json!({}))
+            Ok(AcpDispatchResult::Json(json!({})))
         }
         other => anyhow::bail!("method_not_found: {other}"),
     }
