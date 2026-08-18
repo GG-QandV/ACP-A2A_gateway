@@ -45,7 +45,7 @@ struct RawConfig {
 /// Часть 4 роадмапа стриминга: логирование. `level: "off"` полностью
 /// отключает фильтр (аварийный клапан) — стартовое сообщение при этом
 /// печатается в stderr напрямую, до отключения.
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize)]
 struct LoggingConfig {
     #[serde(default = "default_log_level")]
     level: String,
@@ -55,7 +55,17 @@ struct LoggingConfig {
     file: LogFileConfig,
 }
 
-#[derive(Debug, Deserialize, Default)]
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            level: default_log_level(),
+            output: default_log_output(),
+            file: LogFileConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
 struct LogFileConfig {
     #[serde(default = "default_log_path")]
     path: String,
@@ -65,6 +75,17 @@ struct LogFileConfig {
     max_files: usize,
     #[serde(default = "default_max_total_size_mb")]
     max_total_size_mb: u64,
+}
+
+impl Default for LogFileConfig {
+    fn default() -> Self {
+        Self {
+            path: default_log_path(),
+            max_file_size_mb: default_max_file_size_mb(),
+            max_files: default_max_files(),
+            max_total_size_mb: default_max_total_size_mb(),
+        }
+    }
 }
 
 fn default_log_level() -> String {
@@ -133,7 +154,7 @@ enum RawAgentEntry {
 /// ДОБАВЛЕНО (Часть 2 роадмапа стриминга): секция `streaming:` на агента.
 /// Дефолты — безопасный минимум (1 стрим на stdio-агента, таймауты по
 /// умолчанию), чтобы конфиг без секции не паниковал и не менял поведение.
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize)]
 struct StreamingConfig {
     #[serde(default = "default_max_concurrent_streams")]
     max_concurrent_streams: usize,
@@ -141,6 +162,20 @@ struct StreamingConfig {
     first_chunk_timeout_secs: u64,
     #[serde(default = "default_idle_chunk_timeout_secs")]
     idle_chunk_timeout_secs: u64,
+}
+
+impl Default for StreamingConfig {
+    /// Пустая секция / отсутствующая — безопасный минимум. Важно: per-field
+    /// `#[serde(default = "fn")]` при `#[serde(default)]` на поле НЕ
+    /// применяется (serde зовёт `StreamingConfig::default()`), поэтому
+    /// Default реализован вручную с теми же значениями.
+    fn default() -> Self {
+        Self {
+            max_concurrent_streams: default_max_concurrent_streams(),
+            first_chunk_timeout_secs: default_first_chunk_timeout_secs(),
+            idle_chunk_timeout_secs: default_idle_chunk_timeout_secs(),
+        }
+    }
 }
 
 fn default_max_concurrent_streams() -> usize {
@@ -480,5 +515,89 @@ fn parse_level(level: &str) -> tracing::Level {
         "warn" => tracing::Level::WARN,
         "error" => tracing::Level::ERROR,
         _ => tracing::Level::INFO,
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+
+    /// T8: конфиг без секции streaming: использует дефолты
+    /// (max_concurrent_streams=1, first=15, idle=120), не паникует.
+    #[test]
+    fn agent_without_streaming_section_gets_defaults() {
+        let yaml = r#"
+listen: "0.0.0.0:8347"
+tokens: ["t-1"]
+agents:
+  claurst-main:
+    transport: stdio
+    command: ["claurst", "acp"]
+task_store_dir: "/tmp/x"
+turn_lease_timeout_secs: 30
+"#;
+        let raw: RawConfig = serde_yaml::from_str(yaml).expect("YAML парсится");
+        let entry = raw.agents.get("claurst-main").expect("агент есть");
+        let streaming = match entry {
+            RawAgentEntry::Stdio { streaming, .. } => streaming,
+            RawAgentEntry::Http { streaming, .. } => streaming,
+        };
+        assert_eq!(streaming.max_concurrent_streams, 1);
+        assert_eq!(streaming.first_chunk_timeout_secs, 15);
+        assert_eq!(streaming.idle_chunk_timeout_secs, 120);
+    }
+
+    /// T8: max_concurrent_streams == 0 -> ошибка старта (fail-closed),
+    /// по конвенции проекта (пустой токен уже так падает).
+    #[test]
+    fn max_concurrent_streams_zero_fails_startup() {
+        let yaml = r#"
+listen: "0.0.0.0:8347"
+tokens: ["t-1"]
+agents:
+  claurst-main:
+    transport: stdio
+    command: ["claurst", "acp"]
+    streaming: { max_concurrent_streams: 0 }
+task_store_dir: "/tmp/x"
+turn_lease_timeout_secs: 30
+"#;
+        let raw: RawConfig = serde_yaml::from_str(yaml).expect("YAML парсится");
+        let err = match build_registry(&raw) {
+            Ok(_) => panic!("build_registry должен отклонить max_concurrent_streams=0"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("streaming.max_concurrent_streams не может быть 0"),
+            "должна быть явная ошибка валидации, got: {err}"
+        );
+    }
+
+    /// T8: явная секция streaming: переопределяет дефолты.
+    #[test]
+    fn agent_with_explicit_streaming_section_overrides_defaults() {
+        let yaml = r#"
+listen: "0.0.0.0:8347"
+tokens: ["t-1"]
+agents:
+  claurst-main:
+    transport: stdio
+    command: ["claurst", "acp"]
+    streaming:
+      max_concurrent_streams: 4
+      first_chunk_timeout_secs: 5
+      idle_chunk_timeout_secs: 60
+task_store_dir: "/tmp/x"
+turn_lease_timeout_secs: 30
+"#;
+        let raw: RawConfig = serde_yaml::from_str(yaml).expect("YAML парсится");
+        let entry = raw.agents.get("claurst-main").expect("агент есть");
+        let streaming = match entry {
+            RawAgentEntry::Stdio { streaming, .. } => streaming,
+            RawAgentEntry::Http { streaming, .. } => streaming,
+        };
+        assert_eq!(streaming.max_concurrent_streams, 4);
+        assert_eq!(streaming.first_chunk_timeout_secs, 5);
+        assert_eq!(streaming.idle_chunk_timeout_secs, 60);
     }
 }

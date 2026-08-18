@@ -929,8 +929,136 @@ pub(crate) fn unique_suffix() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use protocol::a2a::{ContextId, TaskState};
-    use protocol::acp::{InitializeResponse, NewSessionResponse};
+    use protocol::acp::{InitializeResponse, NewSessionResponse, PlanEntry, ToolCallStatus};
+
+    /// T2 (Часть 3 роадмапа стриминга): каждый вариант SessionUpdate
+    /// маппится в A2aEvent без паники и без молчаливого дропа сигнала.
+    /// session_update_to_a2a_event — чистая функция, тестируется на всех
+    /// 5 вариантах напрямую (по Р-21 задел на будущий парсинг).
+    #[test]
+    fn agent_message_chunk_maps_to_working_status() {
+        let update = SessionUpdate::AgentMessageChunk {
+            message_id: None,
+            content: ContentBlock::Text {
+                text: "привет".into(),
+            },
+        };
+        let event = session_update_to_a2a_event(update, &TaskId("t-1".into()));
+        assert!(
+            matches!(event, Some(a2a::A2aEvent::TaskStatusUpdate { r#final: false, .. })),
+            "AgentMessageChunk должен маппиться в не-терминальный TaskStatusUpdate"
+        );
+    }
+
+    #[test]
+    fn tool_call_maps_to_text_status_not_dropped() {
+        let update = SessionUpdate::ToolCall {
+            tool_call_id: "tc-1".into(),
+            title: "поиск".into(),
+            kind: "read".into(),
+            status: ToolCallStatus::Pending,
+        };
+        let event = session_update_to_a2a_event(update, &TaskId("t-1".into()));
+        assert!(event.is_some(), "ToolCall не должен молча пропадать");
+    }
+
+    #[test]
+    fn tool_call_update_maps_to_text_status() {
+        let update = SessionUpdate::ToolCallUpdate {
+            tool_call_id: "tc-2".into(),
+            status: ToolCallStatus::InProgress,
+            content: None,
+        };
+        let event = session_update_to_a2a_event(update, &TaskId("t-1".into()));
+        assert!(event.is_some(), "ToolCallUpdate не должен молча пропадать");
+    }
+
+    #[test]
+    fn plan_maps_to_text_status_with_all_entries() {
+        let update = SessionUpdate::Plan {
+            entries: vec![
+                PlanEntry {
+                    content: "шаг 1".into(),
+                    priority: "high".into(),
+                    status: "pending".into(),
+                },
+                PlanEntry {
+                    content: "шаг 2".into(),
+                    priority: "low".into(),
+                    status: "pending".into(),
+                },
+            ],
+        };
+        let event = session_update_to_a2a_event(update, &TaskId("t-1".into()));
+        if let Some(a2a::A2aEvent::TaskStatusUpdate { status, .. }) = event {
+            let msg = status.message.expect("message присутствует");
+            let text = msg
+                .parts
+                .iter()
+                .filter_map(|p| match p {
+                    Part::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert!(text.contains("шаг 1") && text.contains("шаг 2"), "план должен содержать оба шага: {text}");
+        } else {
+            panic!("Plan должен маппиться в TaskStatusUpdate");
+        }
+    }
+
+    #[test]
+    fn usage_update_returns_none_by_design() {
+        let update = SessionUpdate::UsageUpdate {
+            used: 100,
+            size: 1000,
+            cost: None,
+        };
+        let event = session_update_to_a2a_event(update, &TaskId("t-1".into()));
+        assert!(event.is_none(), "UsageUpdate сознательно не транслируется клиенту (Р-21)");
+    }
+
+    #[test]
+    fn task_status_update_final_true_returns_empty_vec() {
+        let event = a2a::A2aEvent::TaskStatusUpdate {
+            task_id: TaskId("t-1".into()),
+            status: TaskStatus {
+                state: TaskState::Completed,
+                message: None,
+                timestamp: None,
+            },
+            r#final: true,
+        };
+        assert!(
+            a2a_event_to_session_update(event).is_empty(),
+            "терминальное событие не должно давать SessionUpdate"
+        );
+    }
+
+    #[test]
+    fn task_artifact_update_maps_one_chunk_per_part() {
+        let event = a2a::A2aEvent::TaskArtifactUpdate {
+            task_id: TaskId("t-1".into()),
+            artifact: Artifact {
+                artifact_id: "a-1".into(),
+                name: None,
+                description: None,
+                parts: vec![
+                    Part::Text {
+                        text: "один".into(),
+                    },
+                    Part::Text {
+                        text: "два".into(),
+                    },
+                ],
+                metadata: None,
+            },
+            append: None,
+        };
+        let updates = a2a_event_to_session_update(event);
+        assert_eq!(updates.len(), 2, "2 Part -> 2 отдельных AgentMessageChunk, не склеены");
+    }
+
 
     /// Фейковый ACP-агент: отвечает фиксированным текстом и считает,
     /// сколько ACP-сессий у него запросили.
