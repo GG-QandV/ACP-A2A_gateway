@@ -207,6 +207,16 @@ impl AcpAgent for SupervisedStdioAgent {
         self.healthy().await?.prompt(req).await
     }
 
+    /// ДОБАВЛЕНО (Р-20): делегирует prompt_streaming() живому процессу.
+    /// Без этого дефолтный метод трейта вызвал бы self.prompt() (Complete)
+    /// — стриминг через супервизор не работал бы.
+    async fn prompt_streaming(
+        &self,
+        req: PromptRequest,
+    ) -> anyhow::Result<Reply<PromptResponse, SessionUpdate>> {
+        self.healthy().await?.prompt_streaming(req).await
+    }
+
     async fn cancel(&self, session: SessionId) -> anyhow::Result<()> {
         self.healthy().await?.cancel(session).await
     }

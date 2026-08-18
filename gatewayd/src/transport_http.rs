@@ -283,7 +283,22 @@ async fn rpc_handler(
         }
         // ДОБАВЛЕНО (задача D): стриминговый ответ рендерится как SSE,
         // а не как JSON-RPC конверт — клиент читает поток A2aEvent.
-        Ok(DispatchResult::Streaming(rx)) => stream_to_sse(rx).into_response(),
+        // ДОБАВЛЕНО (Часть 2, задача A): лимит параллельных стримов —
+        // permit живёт до закрытия SSE-потока, fail-closed.
+        Ok(DispatchResult::Streaming(rx)) => {
+            let permit = match state.registry.try_acquire_stream(&agent_id) {
+                Ok(p) => p,
+                Err(e) => {
+                    return rpc_error(
+                        request.id,
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        -32000,
+                        &e.to_string(),
+                    )
+                }
+            };
+            stream_to_sse(rx, permit).into_response()
+        }
         // ДОБАВЛЕНО (аудит P2-10): потеря контекста — не «что-то пошло
         // не так». Клиент должен отличить её от прочих ошибок, чтобы
         // начать разговор заново, а не молча продолжать в пустоту.
@@ -377,15 +392,24 @@ async fn rest_send_message_core(
         // SendMessageResponse сам (render_task_sdk её и строит).
         Ok(gateway_core::Reply::Complete(t)) => Json(render_task_sdk(&t)).into_response(),
         // ДОБАВЛЕНО (задача D): вместо заглушки — SSE-поток A2aEvent.
-        // Лог-ловушка при разрыве соединения клиентом — внутри stream_to_sse
-        // невозможна (поток без имени агента), здесь фиксируем только факт
-        // старта стрима.
+        // ДОБАВЛЕНО (Часть 2, задача A): лимит параллельных стримов —
+        // fail-closed, permit живёт до закрытия потока.
         Ok(gateway_core::Reply::Streaming(rx)) => {
+            let permit = match state.registry.try_acquire_stream(agent_id) {
+                Ok(p) => p,
+                Err(e) => {
+                    return rest_sdk_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        -32000,
+                        &e.to_string(),
+                    )
+                }
+            };
             tracing::info!(
                 agent_id,
                 "SDK REST-клиент перешёл в стриминговый режим (SSE)"
             );
-            stream_to_sse(rx).into_response()
+            stream_to_sse(rx, permit).into_response()
         }
         // Тот же контракт, что и у /rpc: потерянный контекст — 409 +
         // ABORTED, а не абстрактная внутренняя ошибка.
@@ -436,10 +460,18 @@ pub fn http_status_to_sdk_name(status: StatusCode) -> &'static str {
 /// Reply<T,U>: транспорт не знает про ACP SessionUpdate — он получает
 /// уже смаппленные A2aEvent и просто сериализует их в SSE-фреймы.
 /// Каждое событие — отдельный `data: {...}\n\n`.
+///
+/// ДОБАВЛЕНО (Часть 2, задача A): `permit` удерживает слот параллельных
+/// стримов агента до закрытия потока (RAII-паттерн, как у TurnGuard) —
+/// map-замыкание захватывает permit по move, и он дропается вместе со
+/// стримом.
 fn stream_to_sse(
     rx: tokio::sync::mpsc::UnboundedReceiver<protocol::a2a::A2aEvent>,
+    permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
-    let stream = UnboundedReceiverStream::new(rx).map(|event| {
+    let stream = UnboundedReceiverStream::new(rx).map(move |event| {
+        // permit удерживается живым в этом замыкании на весь стрим.
+        let _ = &permit;
         // A2aEvent сериализуется по спеке (серde) — клиент читает тот же
         // JSON, что и в JSON-RPC result, только по событию за раз.
         Ok(Event::default()
