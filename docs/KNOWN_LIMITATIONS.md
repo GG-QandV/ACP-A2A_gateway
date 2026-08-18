@@ -58,11 +58,16 @@
 - **Триггер закрытия**: если реальные агенты покажут устойчивый неверный первый
   резолв — заменить `OnceCell` на структуру с `reset()`.
 
-## Не сделано
+## Остаток: живой E2E — только ручной запуск, не в CI
 
-### Живой E2E (§2.6 п.4 ТЗ) — требует живой инфраструктуры
-- В `agent-connector` реализован `crates/driver-a2a-client/tests/e2e_live.rs`
-  (ignored-по-умолчанию, запуск вручную): spec / auto / sdk / smoke — проверено живьём,
-  4/4 passed против реального шлюза + hermes и против adapterd (SDK-сервер).
-- В `ACP-A2A_gateway` — E2E-харнес в `gatewayd/tests/rest_transport.rs` (коммит `39ea530`).
+Сам E2E реализован и проверен живьём в обоих репо (см. ниже). Единственное
+ограничение — он требует реально запущенных процессов (шлюз + hermes +
+adapterd), поэтому не выполняется в автоматическом CI.
+- **`agent-connector`**: `crates/driver-a2a-client/tests/e2e_live.rs` (ignored-по-умолчанию,
+  запуск вручную): spec / auto / sdk / smoke — проверено живьём, 4/4 passed против реального
+  шлюза + hermes и против adapterd (SDK-сервер). Коммит `3f7061b` + `9d057a5`.
+- **`ACP-A2A_gateway`**: `gatewayd/tests/e2e_live.rs` (коммит `00fe731`, ignored-по-умолчанию):
+  spec (`message/send` → Completed), SDK (`SendMessage` → `TASK_STATE_COMPLETED` в `{task}`),
+  agent-card — проверено живьём, 3/3 passed против реального шлюза + hermes.
+  Плюс внутрипроцессный харнес `gatewayd/tests/rest_transport.rs` (коммит `39ea530`).
 - Требует реально запущенных процессов (шлюз + hermes + adapterd), не выполняется в CI.
