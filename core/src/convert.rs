@@ -361,7 +361,10 @@ impl<T: AcpAgent> AcpAsA2a<T> {
             .ok_or_else(|| anyhow::anyhow!("task.status.message обязателен для send_task в MVP"))?;
         let prompt_req = message_to_prompt(session.clone(), incoming_message);
 
-        match self.inner.prompt(prompt_req).await? {
+        // ДОБАВЛЕНО (Р-20): send_task_as использует prompt_streaming() —
+        // вызывающий транспортный слой (gatewayd, направление 4) готов
+        // обработать Reply::Streaming и рендерить его в SSE.
+        match self.inner.prompt_streaming(prompt_req).await? {
             Reply::Complete(resp) => {
                 let state = stop_reason_to_task_state(resp.stop_reason);
                 // ИСПРАВЛЕНО (аудит P2-1): ответ агента выбрасывался, и
@@ -397,10 +400,156 @@ impl<T: AcpAgent> AcpAsA2a<T> {
             }
             // ИСПРАВЛЕНО (аудит P2-7): unreachable! = паника воркер-таска
             // в сетевом сервисе. Теперь обычная ошибка.
-            Reply::Streaming(_rx) => anyhow::bail!("Фаза 1: стриминг не реализован"),
+            // ДОБАВЛЕНО (Р-20, дифф convert-streaming-mapping.rs): реальный
+            // стрим — SessionUpdate -> A2aEvent транслируется фоновым
+            // таском, пока канал не закроется; терминальное событие
+            // (final: true) отправляется в конце.
+            Reply::Streaming(mut in_rx) => {
+                let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel::<a2a::A2aEvent>();
+                let task_id = task.id.clone();
+
+                tokio::spawn(async move {
+                    let mut chunk_count = 0usize;
+
+                    while let Some(update) = in_rx.recv().await {
+                        chunk_count += 1;
+                        if let Some(event) = session_update_to_a2a_event(update, &task_id) {
+                            if out_tx.send(event).is_err() {
+                                // ЛОГ-ЛОВУШКА (WARN, по умолчанию включена):
+                                tracing::warn!(
+                                    task_id = %task_id.0,
+                                    "получатель A2aEvent отключился до terminal event — задача продолжает выполняться в фоне"
+                                );
+                                return;
+                            }
+                        }
+                    }
+
+                    // ЛОГ-ЛОВУШКА (WARN, по умолчанию включена): 0 чанков —
+                    // не баг сам по себе, но диагностический сигнал.
+                    if chunk_count == 0 {
+                        tracing::warn!(
+                            task_id = %task_id.0,
+                            "stream produced 0 chunks before terminal event"
+                        );
+                    }
+
+                    // Терминальное событие (точка интеграции G<->convert,
+                    // решение (c) из convert-streaming-mapping.rs): terminal
+                    // state всегда Completed, если канал закрылся без ошибки.
+                    // Различие Cancelled/Refusal теряется в потоковом пути —
+                    // сознательный компромисс ради сохранения seam (в
+                    // Complete-пути это различие есть через
+                    // stop_reason_to_task_state).
+                    let _ = out_tx.send(a2a::A2aEvent::TaskStatusUpdate {
+                        task_id: task_id.clone(),
+                        status: TaskStatus {
+                            state: TaskState::Completed,
+                            message: None,
+                            timestamp: now_iso8601(),
+                        },
+                        r#final: true,
+                    });
+                });
+
+                Ok(Reply::Streaming(out_rx))
+            }
         }
     }
 
+}
+
+/// ДОБАВЛЕНО (Р-21, дифф convert-streaming-mapping.rs, senior-уровень):
+/// разбор вариантов SessionUpdate -> A2aEvent. Маппинг всех 5 вариантов
+/// написан, но при текущем фильтре collect_session_update() (только
+/// agent_message_chunk) достижим только AgentMessageChunk — остальные
+/// варианты готовность к следующей итерации парсинга.
+///
+/// РЕШЕНИЯ ПО КАЖДОМУ ВАРИАНТУ:
+/// 1. AgentMessageChunk -> TaskStatusUpdate(state: Working, final: false).
+/// 2. ToolCall/ToolCallUpdate -> TaskStatusUpdate с текстовым описанием
+///    (нет прямого эквивалента в A2A; текстовый след лучше потери сигнала).
+/// 3. Plan -> TaskStatusUpdate с нумерованным текстовым списком.
+/// 4. UsageUpdate -> НЕ эмитится клиенту (нет поля в A2A), только DEBUG-лог.
+fn session_update_to_a2a_event(update: SessionUpdate, task_id: &TaskId) -> Option<a2a::A2aEvent> {
+    match update {
+        SessionUpdate::AgentMessageChunk { content, .. } => {
+            let part = content_block_to_part(content);
+            Some(a2a::A2aEvent::TaskStatusUpdate {
+                task_id: task_id.clone(),
+                status: TaskStatus {
+                    state: TaskState::Working,
+                    message: Some(Message {
+                        role: MessageRole::Agent,
+                        parts: vec![part],
+                        message_id: None,
+                    }),
+                    timestamp: now_iso8601(),
+                },
+                r#final: false,
+            })
+        }
+
+        SessionUpdate::ToolCall { title, status, .. } => Some(a2a::A2aEvent::TaskStatusUpdate {
+            task_id: task_id.clone(),
+            status: TaskStatus {
+                state: TaskState::Working,
+                message: Some(text_status_message(&format!(
+                    "[инструмент: {title}] {status:?}"
+                ))),
+                timestamp: now_iso8601(),
+            },
+            r#final: false,
+        }),
+
+        SessionUpdate::ToolCallUpdate { status, .. } => Some(a2a::A2aEvent::TaskStatusUpdate {
+            task_id: task_id.clone(),
+            status: TaskStatus {
+                state: TaskState::Working,
+                message: Some(text_status_message(&format!("[инструмент] {status:?}"))),
+                timestamp: now_iso8601(),
+            },
+            r#final: false,
+        }),
+
+        SessionUpdate::Plan { entries } => {
+            let text = entries
+                .iter()
+                .enumerate()
+                .map(|(i, e)| format!("{}. [{}] {} ({})", i + 1, e.status, e.content, e.priority))
+                .collect::<Vec<_>>()
+                .join("\n");
+            Some(a2a::A2aEvent::TaskStatusUpdate {
+                task_id: task_id.clone(),
+                status: TaskStatus {
+                    state: TaskState::Working,
+                    message: Some(text_status_message(&text)),
+                    timestamp: now_iso8601(),
+                },
+                r#final: false,
+            })
+        }
+
+        // РЕШЕНИЕ: не имеет эквивалента в A2A-протоколе. Не эмитим событие
+        // клиенту, только наблюдаемость.
+        SessionUpdate::UsageUpdate { used, size, cost } => {
+            tracing::debug!(
+                used,
+                size,
+                cost = ?cost,
+                "SessionUpdate::UsageUpdate не имеет эквивалента в A2A — не транслируется клиенту"
+            );
+            None
+        }
+    }
+}
+
+fn text_status_message(text: &str) -> Message {
+    Message {
+        role: MessageRole::Agent,
+        parts: vec![Part::Text { text: text.to_string() }],
+        message_id: None,
+    }
 }
 
 /// Сутки простоя: разговор живёт между сообщениями клиента, но не вечно.
@@ -624,7 +773,41 @@ impl<T: A2aAgent + Send + Sync> AcpAgent for A2aAsAcp<T> {
                 }
                 Ok(Reply::Complete(PromptResponse { stop_reason, content }))
             }
-            Reply::Streaming(_rx) => anyhow::bail!("Фаза 1: стриминг не реализован"),
+            // ДОБАВЛЕНО (Р-20, дифф convert-streaming-mapping.rs): A2aEvent
+            // -> SessionUpdate транслируется фоновым таском, пока не придёт
+            // терминальное событие (final: true) — оно закрывает поток.
+            Reply::Streaming(mut in_rx) => {
+                let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel::<SessionUpdate>();
+
+                tokio::spawn(async move {
+                    let mut chunk_count = 0usize;
+                    while let Some(event) = in_rx.recv().await {
+                        let is_final = matches!(
+                            &event,
+                            a2a::A2aEvent::TaskStatusUpdate { r#final: true, .. }
+                        );
+                        for update in a2a_event_to_session_update(event) {
+                            chunk_count += 1;
+                            if out_tx.send(update).is_err() {
+                                tracing::warn!(
+                                    "получатель SessionUpdate отключился до terminal event (направление 3)"
+                                );
+                                return;
+                            }
+                        }
+                        if is_final {
+                            break; // терминал закрывает поток
+                        }
+                    }
+                    if chunk_count == 0 {
+                        tracing::warn!(
+                            "stream produced 0 chunks before terminal event (направление 3)"
+                        );
+                    }
+                });
+
+                Ok(Reply::Streaming(out_rx))
+            }
         }
     }
 
@@ -637,6 +820,60 @@ impl<T: A2aAgent + Send + Sync> AcpAgent for A2aAsAcp<T> {
         self.drop_session(&session).await;
 
         result.map(|_| ())
+    }
+}
+
+/// ДОБАВЛЕНО (Р-20, дифф convert-streaming-mapping.rs): разбор вариантов
+/// A2aEvent -> SessionUpdate для направления 3 (A2A-агент -> ACP-клиент).
+///
+/// РЕШЕНИЯ:
+/// 1. TaskStatusUpdate { final: false } — если message содержит текст,
+///    эмитится AgentMessageChunk по одному на Part; пустой статус — DEBUG.
+/// 2. TaskStatusUpdate { final: true } — терминальное событие, НЕ мапится
+///    в SessionUpdate (обрабатывается отдельно как сигнал закрытия).
+/// 3. TaskArtifactUpdate — AgentMessageChunk по одному на Part.
+/// 4. Message(_) — AgentMessageChunk по одному на Part.
+fn a2a_event_to_session_update(event: a2a::A2aEvent) -> Vec<SessionUpdate> {
+    match event {
+        a2a::A2aEvent::TaskStatusUpdate { status, r#final, .. } => {
+            if r#final {
+                // Терминальное событие обрабатывается отдельно вызывающим
+                // кодом — здесь не эмитим ничего.
+                return Vec::new();
+            }
+            match status.message {
+                Some(message) if !message.parts.is_empty() => message
+                    .parts
+                    .into_iter()
+                    .map(|part| SessionUpdate::AgentMessageChunk {
+                        message_id: message.message_id.clone(),
+                        content: part_to_content_block(part),
+                    })
+                    .collect(),
+                _ => {
+                    tracing::debug!(state = ?status.state, "TaskStatusUpdate без текста — не транслируется в ACP");
+                    Vec::new()
+                }
+            }
+        }
+
+        a2a::A2aEvent::TaskArtifactUpdate { artifact, .. } => artifact
+            .parts
+            .into_iter()
+            .map(|part| SessionUpdate::AgentMessageChunk {
+                message_id: None,
+                content: part_to_content_block(part),
+            })
+            .collect(),
+
+        a2a::A2aEvent::Message(message) => message
+            .parts
+            .into_iter()
+            .map(|part| SessionUpdate::AgentMessageChunk {
+                message_id: message.message_id.clone(),
+                content: part_to_content_block(part),
+            })
+            .collect(),
     }
 }
 

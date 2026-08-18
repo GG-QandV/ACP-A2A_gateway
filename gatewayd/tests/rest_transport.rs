@@ -27,8 +27,9 @@ use serde_json::{json, Value};
 use tower::ServiceExt;
 
 fn mock_bin() -> String {
-    std::env::var("CARGO_BIN_EXE_mock_acp_agent")
-        .expect("CARGO_BIN_EXE_mock_acp_agent должен быть задан: cargo test собирает [[bin]] пакета")
+    std::env::var("CARGO_BIN_EXE_mock_acp_agent").expect(
+        "CARGO_BIN_EXE_mock_acp_agent должен быть задан: cargo test собирает [[bin]] пакета",
+    )
 }
 
 /// Собирает роутер с Registry, в котором agent_id ведёт на процесс
@@ -40,13 +41,16 @@ fn build_router(agent_id: &str, env: HashMap<String, String>) -> axum::Router {
     let mut agents = HashMap::new();
     agents.insert(
         agent_id.to_string(),
-        AgentEntry {
-            transport: Transport::Stdio {
+        AgentEntry::new(
+            Transport::Stdio {
                 command: vec![mock_bin()],
                 cwd: None,
                 env,
             },
-        },
+            4,
+            Duration::from_secs(15),
+            Duration::from_secs(120),
+        ),
     );
     let registry = std::sync::Arc::new(Registry::new(tokens, agents));
 
@@ -80,11 +84,7 @@ async fn test_router_with_context_lost_agent(agent_id: &str) -> axum::Router {
 /// POST сообщения на message:send с валидным токеном и заданным
 /// contextId. contextId фиксируется явно: без него build_task выдумывает
 /// новый на каждый запрос, и продолжение разговора не проверить.
-async fn post_message(
-    router: axum::Router,
-    path: &str,
-    context_id: &str,
-) -> Response {
+async fn post_message(router: axum::Router, path: &str, context_id: &str) -> Response {
     router
         .oneshot(
             Request::builder()
@@ -110,7 +110,9 @@ async fn post_message(
 }
 
 async fn body_json(response: Response) -> Value {
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
     serde_json::from_slice(&body).unwrap()
 }
 
@@ -159,7 +161,10 @@ async fn rest_response_keeps_task_wrapper_matching_sdk_send_message_response() {
          разворачивание в v1 было ошибочным предположением"
     );
     assert!(json["task"].get("id").is_some());
-    assert!(json["task"]["status"]["state"].as_str().unwrap().starts_with("TASK_STATE_"));
+    assert!(json["task"]["status"]["state"]
+        .as_str()
+        .unwrap()
+        .starts_with("TASK_STATE_"));
     // Мок отвечает end_turn — задача завершена, а не зависла в submitted.
     assert_eq!(json["task"]["status"]["state"], "TASK_STATE_COMPLETED");
 }
@@ -186,14 +191,23 @@ async fn rest_error_envelope_has_all_four_sdk_fields() {
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     let json = body_json(response).await;
 
-    assert!(json.get("jsonrpc").is_none(), "REST-ошибка не несёт jsonrpc-конверт");
+    assert!(
+        json.get("jsonrpc").is_none(),
+        "REST-ошибка не несёт jsonrpc-конверт"
+    );
     assert!(json.get("id").is_none(), "REST-ошибка не несёт JSON-RPC id");
 
     let error = &json["error"];
     assert!(error["code"].is_i64(), "поле code обязательно");
-    assert!(error["status"].is_string(), "поле status обязательно (SDK REST-конверт, 4 поля)");
+    assert!(
+        error["status"].is_string(),
+        "поле status обязательно (SDK REST-конверт, 4 поля)"
+    );
     assert!(error["message"].is_string(), "поле message обязательно");
-    assert!(error.get("details").is_some(), "поле details должно присутствовать (может быть null)");
+    assert!(
+        error.get("details").is_some(),
+        "поле details должно присутствовать (может быть null)"
+    );
     // 401 -> UNAUTHENTICATED по gRPC-маппингу.
     assert_eq!(error["status"], "UNAUTHENTICATED");
 }
@@ -207,7 +221,11 @@ async fn rest_context_lost_matches_rpc_behavior_with_four_field_envelope() {
 
     // Разговор заводится и завершается успешно (поколение 1).
     let first = post_message(router.clone(), "/agents/agent-y/message:send", "ctx-lost").await;
-    assert_eq!(first.status(), StatusCode::OK, "первый запрос обязан пройти");
+    assert_eq!(
+        first.status(),
+        StatusCode::OK,
+        "первый запрос обязан пройти"
+    );
     drop(first);
 
     // Пережидаем respawn backoff супервизора (5s), чтобы второй запрос

@@ -52,6 +52,12 @@ pub struct SpawnConfig {
     /// Версия ACP, заявляемая шлюзом при рукопожатии. Число, как в
     /// протоколе — раньше была строка, и шлюз слал агенту "1".
     pub protocol_version: protocol::acp::ProtocolVersion,
+    /// ДОБАВЛЕНО (Часть 2 роадмапа стриминга): таймаут ДО первого чанка
+    /// стрима (эквивалент call_timeout для уже начавшегося потока).
+    pub first_chunk_timeout: Duration,
+    /// ДОБАВЛЕНО (Часть 2 роадмапа стриминга): таймаут МЕЖДУ чанками
+    /// уже начатого стрима — не блокирует долгий, но живой поток.
+    pub idle_chunk_timeout: Duration,
 }
 
 impl SpawnConfig {
@@ -123,6 +129,8 @@ impl SupervisedStdioAgent {
             &config.cwd,
             &config.env,
             config.call_timeout,
+            config.first_chunk_timeout,
+            config.idle_chunk_timeout,
         )
         .await?;
 
