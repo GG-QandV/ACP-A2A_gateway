@@ -1,11 +1,11 @@
 //! core/src/agent.rs — trait'ы под реальные Request/Response типы протоколов.
 
 use async_trait::async_trait;
+use protocol::a2a::{A2aEvent, AgentCard, Task, TaskId};
 use protocol::acp::{
-    InitializeRequest, InitializeResponse, NewSessionRequest, NewSessionResponse,
-    PromptRequest, PromptResponse, SessionId, SessionUpdate,
+    InitializeRequest, InitializeResponse, NewSessionRequest, NewSessionResponse, PromptRequest,
+    PromptResponse, SessionId, SessionUpdate,
 };
-use protocol::a2a::{AgentCard, Task, TaskId, A2aEvent};
 
 use crate::reply::Reply;
 
@@ -18,6 +18,18 @@ pub trait AcpAgent: Send + Sync {
         &self,
         req: PromptRequest,
     ) -> anyhow::Result<Reply<PromptResponse, SessionUpdate>>;
+
+    /// ДОБАВЛЕНО (Р-20, Часть 1 роадмапа стриминга): потоковый вариант
+    /// prompt(). Дефолт = обычный prompt() (обратная совместимость: любой
+    /// код, зовущий prompt_streaming() на агенте без реализации стриминга,
+    /// получает старое поведение Reply::Complete). Агент, умеющий стримить,
+    /// переопределяет метод и возвращает Reply::Streaming(rx).
+    async fn prompt_streaming(
+        &self,
+        req: PromptRequest,
+    ) -> anyhow::Result<Reply<PromptResponse, SessionUpdate>> {
+        self.prompt(req).await
+    }
 
     /// ACP-канон: session/cancel — notification, без ответа. Поэтому
     /// сигнатура возвращает (), а не структуру с результатом.

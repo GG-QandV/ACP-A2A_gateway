@@ -12,9 +12,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Json};
 use axum::routing::{get, post};
 use axum::Router;
-use gateway_core::{
-    A2aAgent, AcpAsA2a, ContextLost, Owner, SpawnConfig, SupervisedStdioAgent,
-};
+use gateway_core::{A2aAgent, AcpAsA2a, ContextLost, Owner, SpawnConfig, SupervisedStdioAgent};
 use protocol::a2a::{Task, TaskId};
 use protocol::a2a_sdk_compat::{normalize_message, render_task_sdk};
 use serde::Deserialize;
@@ -60,8 +58,14 @@ pub fn router(
         // имеет ДВА параметра — поэтому у него отдельный хендлер с
         // tuple-экстрактором (suffix игнорируется). Легаси-путь ниже —
         // один статический сегмент, у него обычный Path<String>.
-        .route("/agents/:agent_id/message:send", post(rest_send_message_handler_sdk))
-        .route("/agents/:agent_id/message/send", post(rest_send_message_handler))
+        .route(
+            "/agents/:agent_id/message:send",
+            post(rest_send_message_handler_sdk),
+        )
+        .route(
+            "/agents/:agent_id/message/send",
+            post(rest_send_message_handler),
+        )
         .with_state(state)
 }
 
@@ -154,13 +158,20 @@ async fn get_or_spawn_adapter(
         env,
         call_timeout: state.call_timeout,
         protocol_version: SpawnConfig::DEFAULT_PROTOCOL_VERSION,
+        // ДОБАВЛЕНО (Часть 2 роадмапа стриминга): раздельные таймауты
+        // стрима агента берутся из конфига (streaming. секция).
+        first_chunk_timeout: entry.first_chunk_timeout,
+        idle_chunk_timeout: entry.idle_chunk_timeout,
     })
     .await
     .map_err(|source| {
         // Логируем причину целиком: клиенту уходит короткий текст,
         // оператору нужен полный контекст отказа.
         tracing::error!(agent_id, error = ?source, "не удалось поднять агента");
-        AdapterError::Unavailable { agent_id: agent_id.to_string(), source }
+        AdapterError::Unavailable {
+            agent_id: agent_id.to_string(),
+            source,
+        }
     })?;
 
     // Адрес именно этого агента, а не шлюза целиком: карточка описывает
@@ -189,16 +200,30 @@ async fn agent_card(
 ) -> impl IntoResponse {
     let token = match extract_bearer(&headers) {
         Some(t) => t,
-        None => return (StatusCode::UNAUTHORIZED, Json(json!({"error": "missing token"}))).into_response(),
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error": "missing token"})),
+            )
+                .into_response()
+        }
     };
     if !state.registry.check_token(&token) {
-        return (StatusCode::UNAUTHORIZED, Json(json!({"error": "invalid token"}))).into_response();
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "invalid token"})),
+        )
+            .into_response();
     }
 
     match get_or_spawn_adapter(&state, &agent_id).await {
         Ok(adapter) => match adapter.card().await {
             Ok(card) => Json(card).into_response(),
-            Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": e.to_string()}))).into_response(),
+            Err(e) => (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response(),
         },
         Err(e) => (e.status(), Json(json!({"error": e.to_string()}))).into_response(),
     }
@@ -220,10 +245,22 @@ async fn rpc_handler(
 ) -> impl IntoResponse {
     let token = match extract_bearer(&headers) {
         Some(t) => t,
-        None => return rpc_error(request.id, StatusCode::UNAUTHORIZED, -32000, "missing token"),
+        None => {
+            return rpc_error(
+                request.id,
+                StatusCode::UNAUTHORIZED,
+                -32000,
+                "missing token",
+            )
+        }
     };
     if !state.registry.check_token(&token) {
-        return rpc_error(request.id, StatusCode::UNAUTHORIZED, -32000, "invalid token");
+        return rpc_error(
+            request.id,
+            StatusCode::UNAUTHORIZED,
+            -32000,
+            "invalid token",
+        );
     }
 
     let adapter = match get_or_spawn_adapter(&state, &agent_id).await {
@@ -237,13 +274,18 @@ async fn rpc_handler(
 
     let result = dispatch_a2a_method(&adapter, owner, &request).await;
     match result {
-        Ok(value) => Json(json!({ "jsonrpc": "2.0", "id": request.id, "result": value })).into_response(),
+        Ok(value) => {
+            Json(json!({ "jsonrpc": "2.0", "id": request.id, "result": value })).into_response()
+        }
         // ДОБАВЛЕНО (аудит P2-10): потеря контекста — не «что-то пошло
         // не так». Клиент должен отличить её от прочих ошибок, чтобы
         // начать разговор заново, а не молча продолжать в пустоту.
-        Err(e) if e.downcast_ref::<ContextLost>().is_some() => {
-            rpc_error(request.id, StatusCode::CONFLICT, CONTEXT_LOST_CODE, &e.to_string())
-        }
+        Err(e) if e.downcast_ref::<ContextLost>().is_some() => rpc_error(
+            request.id,
+            StatusCode::CONFLICT,
+            CONTEXT_LOST_CODE,
+            &e.to_string(),
+        ),
         Err(e) => rpc_error(request.id, StatusCode::OK, -32000, &e.to_string()),
     }
 }
@@ -253,7 +295,11 @@ async fn rpc_handler(
 const CONTEXT_LOST_CODE: i64 = -32010;
 
 fn rpc_error(id: Value, status: StatusCode, code: i64, message: &str) -> axum::response::Response {
-    (status, Json(json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } }))).into_response()
+    (
+        status,
+        Json(json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })),
+    )
+        .into_response()
 }
 
 // =========================================================================
@@ -402,7 +448,10 @@ async fn dispatch_a2a_method(
         }
 
         "tasks/get" => {
-            let id = request.params.get("id").and_then(Value::as_str)
+            let id = request
+                .params
+                .get("id")
+                .and_then(Value::as_str)
                 .ok_or_else(|| anyhow::anyhow!("tasks/get: id обязателен"))?;
             let task = adapter.get_task_as(owner, TaskId(id.to_string())).await?;
             Ok(serde_json::to_value(task)?)
@@ -420,9 +469,14 @@ async fn dispatch_a2a_method(
         }
 
         "tasks/cancel" => {
-            let id = request.params.get("id").and_then(Value::as_str)
+            let id = request
+                .params
+                .get("id")
+                .and_then(Value::as_str)
                 .ok_or_else(|| anyhow::anyhow!("tasks/cancel: id обязателен"))?;
-            let task = adapter.cancel_task_as(owner, TaskId(id.to_string())).await?;
+            let task = adapter
+                .cancel_task_as(owner, TaskId(id.to_string()))
+                .await?;
             Ok(serde_json::to_value(task)?)
         }
 
@@ -448,7 +502,8 @@ fn extract_sdk_task_id(params: &Value) -> Option<String> {
 }
 
 fn build_task_from_send_params(params: &Value) -> anyhow::Result<Task> {
-    let message_value = params.get("message")
+    let message_value = params
+        .get("message")
         .ok_or_else(|| anyhow::anyhow!("message/send: message обязателен"))?;
     let message: protocol::a2a::Message = serde_json::from_value(message_value.clone())?;
 
@@ -486,10 +541,11 @@ fn build_task_from_send_params(params: &Value) -> anyhow::Result<Task> {
 /// ROLE_USER/{text} без поля kind. contextId читается из camelCase (SDK)
 /// с фоллбэком на snake_case (на случай смешанных клиентов).
 fn build_task_from_send_params_sdk(params: &Value) -> anyhow::Result<Task> {
-    let message_value = params.get("message")
+    let message_value = params
+        .get("message")
         .ok_or_else(|| anyhow::anyhow!("SendMessage: message обязателен"))?;
-    let message = normalize_message(message_value)
-        .map_err(|e| anyhow::anyhow!("SendMessage: {e}"))?;
+    let message =
+        normalize_message(message_value).map_err(|e| anyhow::anyhow!("SendMessage: {e}"))?;
 
     let task_id = format!("task-{}", uuid_stub());
 
