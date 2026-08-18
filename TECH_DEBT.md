@@ -21,7 +21,22 @@
 - **Fix**: реализовать `tasks/resubscribe` ↔ `session/update` маппинг.
 - **Статус**: **в разработке** — роадмап `docs/streaming-roadmap-checklist.md`, план `docs/stream-rollout-plan.md`, инструкция `docs/правки 3+аддс/стримминг/delegation-instructions-junior-middle.md`. Baseline зафиксирован тегом `pre-streaming-baseline` (Gate 0, 2026-08-18).
 
+### 2026-08-18: T4 — TCP-стрим (направление 3) не покрыт интеграционным тестом
+- **Что**: `streaming_tcp.rs` (T4) не реализован: `HttpA2aAgent::send_task` (`core/src/http_agent.rs`) всегда возвращает `Reply::Complete` (`blocking: true`) — SSE-клиент направления 3 не подключён. TCP-код шлюза готов к `Reply::Streaming` (задача E, `AcpDispatchResult::Streaming`), но источник не даёт стрим.
+- **Почему**: HttpA2aAgent с SSE-клиентом — вне объёма делегирования (задачи A-G), отдельная задача.
+- **Impact**: low — стриминг работает для happy path направлений 2/4 (SSE-клиенты); TCP-клиент получает полный ответ в конце хода.
+- **Fix**: добавить SSE-клиент в `HttpA2aAgent::send_task` (возвращать `Reply::Streaming` при `text/event-stream`), затем T4.
+
+### 2026-08-18: tasks/resubscribe не реализован (Фаза 2.1)
+- **Что**: клиент, отвалившийся посреди стрима, не может переподключиться к уже идущей задаче — канал эфемерный, закрывается сразу после отключения.
+- **Почему**: оставлено на Фазу 2.1 — требует персистентного буфера событий с seq-номерами в TaskStore, другая структура хранения (Р-22, `decisions-p20-streaming-implemented.md`).
+- **Impact**: medium — стриминг работает для happy path, но не переживает разрыв соединения.
+- **Fix**: `broadcast::channel` или event-log в TaskStore с `after_seq`, по образцу `driver_http_sse.rs` в agent-connector. Совместно с фиксом «continue по contextId таймаутит».
+
 ## Закрыто
+
+### 2026-08-18: стриминг в конвертерах — Фаза 2.0 (коммиты af9c9d9, 1ee5574, 36745ac, 1e2de5d)
+- **Закрыто**: `Reply::Streaming` реализован через `prompt_streaming()` (Р-20/Р-21). Транспорт: SSE (HTTP, направление 4) + построчный TCP (направление 3, но источник не стримит — см. открытый T4). Лимит `max_concurrent_streams` (Semaphore per-agent, try_acquire_stream в HTTP+TCP, fail-closed). Раздельные first/idle_chunk_timeout в стрим-цикле. Логирование с ротацией (tracing-appender). Тесты T1/T2/T3/T5/T7/T8/T9 + negative control. 118 тестов, clippy -D warnings чисто. `tasks/resubscribe` — Фаза 2.1 (см. открытое).
 
 ### 2026-08-09: сессии без session/new копились в HashMap (P2-8)
 - **Закрыто**: сессия только через `session/new`, `prompt` отклоняет неизвестный sessionId до acquire, `cancel` освобождает лиз, TTL-выселение, потолок `MAX_SESSIONS_PER_CONNECTION = 256`.
