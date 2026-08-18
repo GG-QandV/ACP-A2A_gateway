@@ -96,7 +96,19 @@ async fn handle_connection(
             handle_stdio_passthrough(reader, write_half, &command, &cwd, &env).await
         }
         Transport::Http { url, push_token } => {
-            handle_http_target(reader, write_half, url, push_token, task_store_dir, lease_timeout).await
+            handle_http_target(
+                reader,
+                write_half,
+                HttpTargetParams {
+                    url,
+                    push_token,
+                    _task_store_dir: task_store_dir,
+                    lease_timeout,
+                    registry,
+                    agent_id: handshake.agent_id,
+                },
+            )
+            .await
         }
     }
 }
@@ -197,14 +209,31 @@ struct JsonRpcErrBody {
     message: String,
 }
 
-async fn handle_http_target(
-    mut reader: BufReader<tokio::net::tcp::ReadHalf<'_>>,
-    mut writer: tokio::net::tcp::WriteHalf<'_>,
+/// Параметры TCP-обработчика A2A-агента (задача E): registry и agent_id
+/// нужны для лимита параллельных стримов (try_acquire_stream) — отдельной
+/// структурой, чтобы не раздувать сигнатуру до 8 аргументов.
+struct HttpTargetParams {
     url: String,
     push_token: Option<String>,
     _task_store_dir: PathBuf,
     lease_timeout: Duration,
+    registry: Arc<Registry>,
+    agent_id: String,
+}
+
+async fn handle_http_target(
+    mut reader: BufReader<tokio::net::tcp::ReadHalf<'_>>,
+    mut writer: tokio::net::tcp::WriteHalf<'_>,
+    params: HttpTargetParams,
 ) -> anyhow::Result<()> {
+    let HttpTargetParams {
+        url,
+        push_token,
+        _task_store_dir,
+        lease_timeout,
+        registry,
+        agent_id,
+    } = params;
     let http_agent = HttpA2aAgent::new(url, push_token);
     let adapter = A2aAsAcp::new(http_agent, lease_timeout);
 
@@ -239,7 +268,17 @@ async fn handle_http_target(
             // ДОБАВЛЕНО (задача E): поток SessionUpdate пишется в тот же
             // TCP-сокет построчно — каждая нотификация session/update,
             // до закрытия канала.
+            // ДОБАВЛЕНО (Часть 2, задача A): лимит параллельных стримов —
+            // permit живёт в scope до конца записи потока (RAII).
             Ok(AcpDispatchResult::Streaming(mut rx)) => {
+                let _permit = match registry.try_acquire_stream(&agent_id) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!(agent_id, error = %e, "TCP-стрим отклонён fail-closed");
+                        write_error(&mut writer, id, -32000, &e.to_string()).await?;
+                        continue;
+                    }
+                };
                 let session_id = String::from("unknown");
                 while let Some(update) = rx.recv().await {
                     let payload = json!({

@@ -17,10 +17,20 @@
 //!                                   помечается потерянным.
 
 use std::io::{BufRead, Write};
+use std::thread;
+use std::time::Duration;
 
 fn main() {
     let prompt_text = std::env::var("MOCK_AGENT_PROMPT_TEXT").unwrap_or_else(|_| "pong".to_string());
     let exit_after_prompts: u64 = std::env::var("MOCK_AGENT_EXIT_AFTER_PROMPTS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let stream_chunks: u64 = std::env::var("MOCK_AGENT_STREAM_CHUNKS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let chunk_delay_ms: u64 = std::env::var("MOCK_AGENT_CHUNK_DELAY_MS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
@@ -59,6 +69,44 @@ fn main() {
             }
             "session/prompt" => {
                 prompts_served += 1;
+                // ДОБАВЛЕНО (тесты стриминга): перед финальным ответом
+                // уходят чанки agent_message_chunk, каждый со своей
+                // задержкой — чтобы тест ловил их по одному, не батчем.
+                if stream_chunks > 0 {
+                    let session_id = msg
+                        .pointer("/params/sessionId")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("sess-1")
+                        .to_string();
+                    for i in 0..stream_chunks {
+                        if chunk_delay_ms > 0 {
+                            thread::sleep(Duration::from_millis(chunk_delay_ms));
+                        }
+                        let chunk = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "method": "session/update",
+                            "params": {
+                                "sessionId": session_id,
+                                "update": {
+                                    "sessionUpdate": "agent_message_chunk",
+                                    "messageId": format!("m-{i}"),
+                                    "content": {
+                                        "type": "text",
+                                        "text": format!("chunk-{i}"),
+                                    }
+                                }
+                            }
+                        });
+                        let mut line = match serde_json::to_vec(&chunk) {
+                            Ok(v) => v,
+                            Err(_) => return,
+                        };
+                        line.push(b'\n');
+                        let mut out = stdout.lock();
+                        let _ = out.write_all(&line);
+                        let _ = out.flush();
+                    }
+                }
                 // Отвечаем на промпт, затем, если достигнут лимит — умираем.
                 let resp = serde_json::json!({
                     "stopReason": "end_turn",

@@ -340,7 +340,7 @@ impl AcpAgent for StdioAcpAgent {
         // Хвост предыдущего хода не должен попасть в текущий ответ.
         self.updates.lock().await.remove(&session_key);
 
-        let (tx, rx) = mpsc::unbounded_channel::<SessionUpdate>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<SessionUpdate>();
         self.updates
             .lock()
             .await
@@ -348,9 +348,9 @@ impl AcpAgent for StdioAcpAgent {
 
         // Отправляем session/prompt сами (без блокирующего call): канал
         // должен начать отдавать чанки клиенту немедленно. Регистрируем
-        // pending-запись и ждём финальный ответ в фоне.
+        // pending-запись.
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        let (resp_tx, resp_rx) = oneshot::channel();
+        let (resp_tx, mut resp_rx) = oneshot::channel();
         self.pending.lock().await.insert(id, resp_tx);
 
         let request =
@@ -364,40 +364,91 @@ impl AcpAgent for StdioAcpAgent {
             })?;
         }
 
-        // Фоновый таск: дождаться финального PromptResponse, домапплить его
-        // в терминальный чанк, закрыть канал. Ошибка агента ПОСЛЕ ухода
-        // чанков не теряется молча: канал закрывается без terminal, и
-        // диспетчер ловит это по ERROR-ловушке в convert.rs.
-        tokio::spawn({
-            let updates = self.updates.clone();
-            async move {
-                let resp: Result<PromptResponse, String> = match resp_rx.await {
-                    Ok(Ok(value)) => serde_json::from_value(value)
-                        .map_err(|e| format!("bad PromptResponse: {e}")),
-                    Ok(Err(err_msg)) => Err(err_msg),
-                    Err(_) => Err("agent stdout closed before prompt response".to_string()),
+        // Ключевой выбор (Р-20): если первым приходит финальный PromptResponse
+        // (агент не стримил — 0 чанков в канале) — возвращаем Reply::Complete,
+        // сохраняя старое поведение для всех, кто ждёт не потоковый ответ.
+        // Если первым приходит чанк session/update — агент стримит:
+        // возвращаем Reply::Streaming с внешним каналом, в который
+        // пересылаются и остаток чанков, и терминальный элемент.
+        tokio::select! {
+            resp = &mut resp_rx => {
+                let resp: PromptResponse = match resp {
+                    Ok(Ok(value)) => serde_json::from_value(value)?,
+                    Ok(Err(err_msg)) => anyhow::bail!("agent returned error for session/prompt: {err_msg}"),
+                    Err(_) => anyhow::bail!("agent stdout closed before prompt response"),
                 };
-                match resp {
-                    Ok(resp) => {
-                        let terminal = SessionUpdate::AgentMessageChunk {
-                            message_id: None,
-                            content: prompt_to_content_block(&resp),
-                        };
-                        let _ = tx.send(terminal);
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            session_id = %session_key,
-                            error = %e,
-                            "session/prompt завершился ошибкой после ухода чанков — канал закрыт без terminal"
-                        );
-                    }
-                }
-                updates.lock().await.remove(&session_key);
+                self.updates.lock().await.remove(&session_key);
+                Ok(Reply::Complete(resp))
             }
-        });
+            first = rx.recv() => {
+                let Some(first) = first else {
+                    self.updates.lock().await.remove(&session_key);
+                    anyhow::bail!("stream channel closed before any event");
+                };
+                // Агент стримит: внешний канал, первый чанк уже пришёл.
+                let (out_tx, out_rx) = mpsc::unbounded_channel::<SessionUpdate>();
+                let _ = out_tx.send(first);
 
-        Ok(Reply::Streaming(rx))
+                // Фоновый таск: пересылает остаток чанков из rx в out, затем
+                // ждёт финальный PromptResponse и шлёт терминальный элемент.
+                tokio::spawn({
+                    let updates = self.updates.clone();
+                    async move {
+                        let mut last_chunks = 0usize;
+                        loop {
+                            tokio::select! {
+                                chunk = rx.recv() => {
+                                    match chunk {
+                                        Some(c) => {
+                                            last_chunks += 1;
+                                            if out_tx.send(c).is_err() {
+                                                break; // получатель отключился
+                                            }
+                                        }
+                                        None => break, // канал закрыт без terminal
+                                    }
+                                }
+                                resp = &mut resp_rx => {
+                                    let terminal = match resp {
+                                        Ok(Ok(value)) => serde_json::from_value::<PromptResponse>(value)
+                                            .map_err(|e| format!("bad PromptResponse: {e}"))
+                                            .map(|r| SessionUpdate::AgentMessageChunk {
+                                                message_id: None,
+                                                content: prompt_to_content_block(&r),
+                                            }),
+                                        Ok(Err(err_msg)) => Err(err_msg),
+                                        Err(_) => Err("agent stdout closed before prompt response".to_string()),
+                                    };
+                                    match terminal {
+                                        Ok(terminal) => {
+                                            if last_chunks == 0 {
+                                                tracing::warn!(
+                                                    session_id = %session_key,
+                                                    chunk_count = last_chunks,
+                                                    "stream produced 0 chunks before terminal event"
+                                                );
+                                            }
+                                            let _ = out_tx.send(terminal);
+                                        }
+                                        Err(e) => {
+                                            tracing::error!(
+                                                session_id = %session_key,
+                                                error = %e,
+                                                "session/prompt завершился ошибкой после ухода чанков — канал закрыт без terminal"
+                                            );
+                                        }
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                        updates.lock().await.remove(&session_key);
+                    }
+                });
+
+                Ok(Reply::Streaming(out_rx))
+            }
+        }
     }
 
     async fn cancel(&self, session: SessionId) -> anyhow::Result<()> {
@@ -479,4 +530,114 @@ fn prompt_to_content_block(resp: &PromptResponse) -> protocol::acp::ContentBlock
         .collect::<Vec<_>>()
         .join("\n");
     protocol::acp::ContentBlock::Text { text }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use protocol::acp::{ContentBlock, NewSessionRequest, PromptRequest, SessionId};
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+
+    /// Возвращает путь к тестовому mock-acp-агенту (бинарь gatewayd).
+    /// Юнит-тесты core не получают CARGO_BIN_EXE_* (он задаётся только
+    /// integration-тестам крейта с [[bin]]), поэтому используем явный env
+    /// MOCK_AGENT_BIN либо фолбэк на target/debug/mock_acp_agent workspace.
+    fn mock_bin() -> String {
+        if let Ok(path) = std::env::var("MOCK_AGENT_BIN") {
+            return path;
+        }
+        let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
+        let workspace = std::path::Path::new(&manifest)
+            .ancestors()
+            .nth(1)
+            .expect("workspace root");
+        workspace
+            .join("target/debug/mock_acp_agent")
+            .to_string_lossy()
+            .to_string()
+    }
+
+    async fn spawn_mock(extra_env: &[(&str, &str)]) -> StdioAcpAgent {
+        let mut env = HashMap::new();
+        for (k, v) in extra_env {
+            env.insert(k.to_string(), v.to_string());
+        }
+        StdioAcpAgent::spawn(
+            &[mock_bin()],
+            &None,
+            &env,
+            Duration::from_secs(30),
+            Duration::from_secs(15),
+            Duration::from_secs(120),
+        )
+        .await
+        .expect("mock агент спавнится")
+    }
+
+    async fn init_session(agent: &StdioAcpAgent) -> SessionId {
+        agent
+            .new_session(NewSessionRequest {
+                cwd: ".".to_string(),
+                mcp_servers: vec![],
+                additional_directories: vec![],
+            })
+            .await
+            .expect("session/new работает")
+            .session_id
+    }
+
+    /// T1: чанки приходят по одному, не батчем в конце.
+    /// Мок-агент шлёт 3 session/update с задержкой 50мс между ними;
+    /// через prompt_streaming() каждый чанк ловится rx.recv() с реальным
+    /// временным интервалом, а не скопом после завершения хода.
+    #[tokio::test]
+    async fn stream_emits_chunks_incrementally() {
+        let agent = spawn_mock(&[
+            ("MOCK_AGENT_STREAM_CHUNKS", "3"),
+            ("MOCK_AGENT_CHUNK_DELAY_MS", "50"),
+        ])
+        .await;
+        let session = init_session(&agent).await;
+
+        let reply = agent
+            .prompt_streaming(PromptRequest {
+                session_id: session.clone(),
+                prompt: vec![ContentBlock::Text {
+                    text: "hello".into(),
+                }],
+            })
+            .await
+            .expect("prompt_streaming работает");
+
+        let Reply::Streaming(mut rx) = reply else {
+            panic!("ожидался Reply::Streaming, получили Complete");
+        };
+
+        // Первый чанк — ждём с достаточным запасом (первый идёт сразу).
+        let t0 = Instant::now();
+        let first = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("первый чанк приходит")
+            .expect("канал не закрыт");
+        let elapsed_first = t0.elapsed();
+        assert!(elapsed_first < Duration::from_millis(400), "первый чанк не должен ждать весь ход: {elapsed_first:?}");
+
+        // Последующие — между ними реально проходит ~50мс (не батч в конце).
+        let t1 = Instant::now();
+        let second = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("второй чанк приходит")
+            .expect("канал не закрыт");
+        let gap = t1.elapsed();
+        assert!(gap >= Duration::from_millis(30), "чанки должны приходить по одному с задержкой, gap={gap:?}");
+
+        let _third = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("третий чанк приходит")
+            .expect("канал не закрыт");
+
+        assert!(matches!(first, SessionUpdate::AgentMessageChunk { .. }));
+        assert!(matches!(second, SessionUpdate::AgentMessageChunk { .. }));
+    }
 }
