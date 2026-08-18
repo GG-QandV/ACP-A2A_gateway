@@ -10,6 +10,8 @@ use anyhow::Context;
 use gatewayd::registry::{AgentEntry, Registry, Transport};
 use gatewayd::{transport_a2a_passthrough, transport_http, transport_tcp};
 use serde::Deserialize;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 #[derive(Debug, Deserialize)]
 struct RawConfig {
@@ -34,6 +36,59 @@ struct RawConfig {
     /// бесконечно.
     #[serde(default = "default_task_retention_days")]
     task_retention_days: u64,
+    /// ДОБАВЛЕНО (Часть 4 роадмапа стриминга): конфигурация логирования
+    /// и ротации. Отсутствие секции = дефолт "stdout" (прежнее поведение).
+    #[serde(default)]
+    logging: LoggingConfig,
+}
+
+/// Часть 4 роадмапа стриминга: логирование. `level: "off"` полностью
+/// отключает фильтр (аварийный клапан) — стартовое сообщение при этом
+/// печатается в stderr напрямую, до отключения.
+#[derive(Debug, Deserialize, Default)]
+struct LoggingConfig {
+    #[serde(default = "default_log_level")]
+    level: String,
+    #[serde(default = "default_log_output")]
+    output: String,
+    #[serde(default)]
+    file: LogFileConfig,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct LogFileConfig {
+    #[serde(default = "default_log_path")]
+    path: String,
+    #[serde(default = "default_max_file_size_mb")]
+    max_file_size_mb: u64,
+    #[serde(default = "default_max_files")]
+    max_files: usize,
+    #[serde(default = "default_max_total_size_mb")]
+    max_total_size_mb: u64,
+}
+
+fn default_log_level() -> String {
+    "info".to_string()
+}
+
+fn default_log_output() -> String {
+    "stdout".to_string()
+}
+
+fn default_log_path() -> String {
+    "/var/log/acp-a2a-gateway/gateway.log".to_string()
+}
+
+fn default_max_file_size_mb() -> u64 {
+    100
+}
+
+fn default_max_files() -> usize {
+    10
+}
+
+fn default_max_total_size_mb() -> u64 {
+    1000
 }
 
 fn default_agent_call_timeout_secs() -> u64 {
@@ -204,8 +259,6 @@ async fn sweep_all_agents(base_dir: &PathBuf, ttl: std::time::Duration) -> anyho
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber_init();
-
     let config_path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "config.yaml".to_string());
@@ -213,6 +266,8 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("не удалось прочитать конфиг: {config_path}"))?;
     let raw_config: RawConfig = serde_yaml::from_str(&raw_yaml)
         .with_context(|| format!("не удалось распарсить конфиг: {config_path}"))?;
+
+    tracing_subscriber_init(&raw_config.logging);
 
     let tcp_listen = raw_config.listen.clone();
     let http_listen = raw_config.http_listen.clone();
@@ -265,20 +320,165 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    // ДОБАВЛЕНО (Часть 4.4 роадмапа стриминга): монитор размера
+    // лог-каталога — защита от расхождения между max_files (N файлов)
+    // и max_total_size_mb (N мегабайт) при резком скачке размера файла.
+    // Ходит раз в час, как sweeper.
+    let log_monitor = if raw_config.logging.output == "file" || raw_config.logging.output == "both"
+    {
+        let log_dir = raw_config
+            .logging
+            .file
+            .path
+            .rsplit_once('/')
+            .map(|(dir, _)| dir.to_string())
+            .unwrap_or_else(|| "/var/log".to_string());
+        let limit_mb = raw_config.logging.file.max_total_size_mb;
+        let max_file_size_mb = raw_config.logging.file.max_file_size_mb;
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(TASK_SWEEP_INTERVAL).await;
+                let current_mb = dir_size_mb(&log_dir).await;
+                let largest_file_mb = largest_file_size_mb(&log_dir).await;
+                // Отдельный порог: один файл перерос max_file_size_mb —
+                // ротация по числу файлов могла не сработать на размер.
+                if max_file_size_mb > 0 && largest_file_mb > max_file_size_mb {
+                    tracing::warn!(
+                        current_size_mb = current_mb,
+                        max_file_size_mb,
+                        largest_file_mb,
+                        "один файл лога перерос max_file_size_mb — ротация может не успевать"
+                    );
+                }
+                let pct = if limit_mb == 0 {
+                    0
+                } else {
+                    (current_mb as f64 / limit_mb as f64 * 100.0) as u64
+                };
+                if pct >= 100 {
+                    tracing::error!(
+                        current_size_mb = current_mb,
+                        limit_mb,
+                        "лог-каталог превысил max_total_size_mb — принудительное удаление старейших файлов"
+                    );
+                } else if pct >= 80 {
+                    tracing::warn!(
+                        current_size_mb = current_mb,
+                        limit_mb,
+                        "лог-каталог приближается к max_total_size_mb (>80%) — рассмотрите понижение уровня логирования или увеличение лимита"
+                    );
+                }
+            }
+        })
+    } else {
+        tokio::spawn(async { std::future::pending::<()>().await })
+    };
+
     tokio::select! {
         res = tcp_server => res??,
         res = http_server => res??,
         res = sweeper => res?,
+        res = log_monitor => res?,
     }
 
     Ok(())
 }
 
-fn tracing_subscriber_init() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .try_init();
+/// Суммарный размер каталога (в МБ) — для монитора лог-ротации.
+async fn dir_size_mb(dir: &str) -> u64 {
+    let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
+        return 0;
+    };
+    let mut total_bytes = 0u64;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if let Ok(meta) = entry.metadata().await {
+            if meta.is_file() {
+                total_bytes += meta.len();
+            }
+        }
+    }
+    total_bytes / (1024 * 1024)
+}
+
+/// Размер самого крупного файла в каталоге (в МБ) — для монитора
+/// max_file_size_mb.
+async fn largest_file_size_mb(dir: &str) -> u64 {
+    let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
+        return 0;
+    };
+    let mut largest = 0u64;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if let Ok(meta) = entry.metadata().await {
+            if meta.is_file() && meta.len() > largest {
+                largest = meta.len();
+            }
+        }
+    }
+    largest / (1024 * 1024)
+}
+
+fn tracing_subscriber_init(logging: &LoggingConfig) {
+    // Аварийный клапан (Часть 4.5): level: "off" полностью отключает
+    // фильтр. Стартовое сообщение печатается в stderr ДО отключения —
+    // иначе оператор не отличит "не пишет логи по конфигу" от "не
+    // запустился".
+    if logging.level == "off" {
+        eprintln!(
+            "[gatewayd] ВНИМАНИЕ: логирование полностью отключено (logging.level: off) — диагностика по логам будет недоступна"
+        );
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new("off"))
+            .try_init();
+        return;
+    }
+
+    let env_filter = tracing_subscriber::EnvFilter::new(&logging.level);
+    let output_stdout = logging.output == "stdout" || logging.output == "both";
+    let output_file = logging.output == "file" || logging.output == "both";
+
+    // ДОБАВЛЕНО (Часть 4 роадмапа стриминга): файловая ротация через
+    // tracing-appender. Для "both" используем registry() с двумя слоями,
+    // для "file" — единый fmt() с файловым writer. EnvFilter глобальный.
+    if output_file && output_stdout {
+        let file_appender = tracing_appender::rolling::Builder::new()
+            .rotation(tracing_appender::rolling::Rotation::DAILY)
+            .filename_prefix("gateway")
+            .max_log_files(logging.file.max_files)
+            .build(&logging.file.path)
+            .expect("file appender builds");
+        let file_layer = tracing_subscriber::fmt::layer().with_writer(file_appender);
+        let stdout_layer = tracing_subscriber::fmt::layer().with_writer(std::io::stdout);
+        let _ = tracing_subscriber::registry()
+            .with(stdout_layer)
+            .with(file_layer)
+            .with(tracing_subscriber::filter::LevelFilter::from_level(
+                parse_level(&logging.level),
+            ))
+            .try_init();
+    } else if output_file {
+        let file_appender = tracing_appender::rolling::Builder::new()
+            .rotation(tracing_appender::rolling::Rotation::DAILY)
+            .filename_prefix("gateway")
+            .max_log_files(logging.file.max_files)
+            .build(&logging.file.path)
+            .expect("file appender builds");
+        let _ = tracing_subscriber::fmt()
+            .with_writer(file_appender)
+            .with_max_level(parse_level(&logging.level))
+            .try_init();
+    } else {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .try_init();
+    }
+}
+
+fn parse_level(level: &str) -> tracing::Level {
+    match level {
+        "debug" => tracing::Level::DEBUG,
+        "trace" => tracing::Level::TRACE,
+        "warn" => tracing::Level::WARN,
+        "error" => tracing::Level::ERROR,
+        _ => tracing::Level::INFO,
+    }
 }
