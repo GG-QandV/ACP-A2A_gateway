@@ -19,6 +19,7 @@
 - **Почему**: оставлено на Фазу 2.
 - **Impact**: medium
 - **Fix**: реализовать `tasks/resubscribe` ↔ `session/update` маппинг.
+- **Статус**: **в разработке** — роадмап `docs/streaming-roadmap-checklist.md`, план `docs/stream-rollout-plan.md`, инструкция `docs/правки 3+аддс/стримминг/delegation-instructions-junior-middle.md`. Baseline зафиксирован тегом `pre-streaming-baseline` (Gate 0, 2026-08-18).
 
 ## Закрыто
 

@@ -11,26 +11,28 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use protocol::acp::{
-    InitializeRequest, InitializeResponse, NewSessionRequest, NewSessionResponse,
-    PromptRequest, PromptResponse, SessionId, SessionUpdate,
+    InitializeRequest, InitializeResponse, NewSessionRequest, NewSessionResponse, PromptRequest,
+    PromptResponse, SessionId, SessionUpdate,
 };
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::agent::AcpAgent;
 use crate::reply::Reply;
 
 type PendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>;
-/// ДОБАВЛЕНО (аудит P2-1): накопитель AgentMessageChunk по sessionId.
-/// Раньше reader-таск отбрасывал все нотификации агента (`continue`),
-/// то есть весь текст ответа терялся.
-type UpdatesMap = Arc<Mutex<HashMap<String, Vec<protocol::acp::ContentBlock>>>>;
+/// ДОБАВЛЕНО (Часть 1 роадмапа стриминга, задача G): накопитель чанков
+/// заменён на канал. Раньше AgentMessageChunk копился в Vec и отдавался
+/// целиком в Reply::Complete после завершения хода — клиент не видел
+/// промежуточных чанков. Теперь каждый session/update уходит в
+/// mpsc-канал сразу, а prompt() возвращает Reply::Streaming(rx).
+type UpdatesMap = Arc<Mutex<HashMap<String, mpsc::UnboundedSender<SessionUpdate>>>>;
 
 pub struct StdioAcpAgent {
     child: Mutex<Child>,
-    /// Arc, потому что писать в stdin теперь должен и reader-таск:
+    /// Arc, потому что писать в stdin должен теперь и reader-таск:
     /// на запросы агента к клиенту обязан приходить ответ.
     stdin: Arc<Mutex<tokio::process::ChildStdin>>,
     next_id: AtomicU64,
@@ -39,6 +41,15 @@ pub struct StdioAcpAgent {
     /// ДОБАВЛЕНО (аудит P2-11): было захардкожено `from_secs(60)`,
     /// что противоречило настраиваемому turn_lease_timeout_secs.
     call_timeout: std::time::Duration,
+    /// ДОБАВЛЕНО (Часть 2 роадмапа стриминга): таймаут ДО первого чанка
+    /// стрима. Прокидывается из конфига (streaming.first_chunk_timeout_secs)
+    /// через SpawnConfig; применяется в стрим-цикле convert.rs (направление 4).
+    #[allow(dead_code)]
+    first_chunk_timeout: std::time::Duration,
+    /// ДОБАВЛЕНО (Часть 2 роадмапа стриминга): таймаут МЕЖДУ чанками.
+    /// Аналогично first_chunk_timeout — применяется в стрим-цикле convert.rs.
+    #[allow(dead_code)]
+    idle_chunk_timeout: std::time::Duration,
 }
 
 impl StdioAcpAgent {
@@ -47,6 +58,8 @@ impl StdioAcpAgent {
         cwd: &Option<String>,
         env: &HashMap<String, String>,
         call_timeout: std::time::Duration,
+        first_chunk_timeout: std::time::Duration,
+        idle_chunk_timeout: std::time::Duration,
     ) -> anyhow::Result<Self> {
         let (program, args) = command
             .split_first()
@@ -66,8 +79,14 @@ impl StdioAcpAgent {
         cmd.kill_on_drop(true);
 
         let mut child = cmd.spawn()?;
-        let stdin = child.stdin.take().ok_or_else(|| anyhow::anyhow!("no stdin"))?;
-        let stdout = child.stdout.take().ok_or_else(|| anyhow::anyhow!("no stdout"))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("no stdin"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("no stdout"))?;
 
         let stdin = Arc::new(Mutex::new(stdin));
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
@@ -86,6 +105,8 @@ impl StdioAcpAgent {
             pending,
             updates,
             call_timeout,
+            first_chunk_timeout,
+            idle_chunk_timeout,
         })
     }
 
@@ -130,7 +151,10 @@ impl StdioAcpAgent {
         // pending навсегда — утечка на каждый истёкший запрос.
         let Ok(received) = waited else {
             self.pending.lock().await.remove(&id);
-            anyhow::bail!("agent did not respond to {method} within {:?}", self.call_timeout);
+            anyhow::bail!(
+                "agent did not respond to {method} within {:?}",
+                self.call_timeout
+            );
         };
 
         let result = received
@@ -209,7 +233,11 @@ fn spawn_reader_task(
             let sender = pending.lock().await.remove(&id);
             if let Some(tx) = sender {
                 let outcome = if let Some(err) = parsed.get("error") {
-                    Err(err.get("message").and_then(Value::as_str).unwrap_or("unknown error").to_string())
+                    Err(err
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown error")
+                        .to_string())
                 } else {
                     Ok(parsed.get("result").cloned().unwrap_or(Value::Null))
                 };
@@ -224,7 +252,6 @@ fn spawn_reader_task(
     });
 }
 
-
 /// Ответ на запрос агента к клиенту. Клиентские возможности (запрос
 /// разрешений, доступ к файлам, терминал) шлюзом не реализованы —
 /// сообщаем об этом честно, вместо того чтобы молчать и подвешивать
@@ -235,7 +262,10 @@ async fn reply_method_not_found(
     id: Value,
     request: &Value,
 ) {
-    let method = request.get("method").and_then(Value::as_str).unwrap_or("<unknown>");
+    let method = request
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or("<unknown>");
     tracing::warn!(%method, "агент запросил у клиента метод, который шлюз не поддерживает");
 
     let response = json!({
@@ -247,7 +277,9 @@ async fn reply_method_not_found(
         }
     });
 
-    let Ok(mut line) = serde_json::to_vec(&response) else { return };
+    let Ok(mut line) = serde_json::to_vec(&response) else {
+        return;
+    };
     line.push(b'\n');
     let _ = stdin.lock().await.write_all(&line).await;
 }
@@ -270,17 +302,107 @@ impl AcpAgent for StdioAcpAgent {
         // Хвост предыдущего хода не должен попасть в текущий ответ.
         self.updates.lock().await.remove(&session_key);
 
+        // ДОБАВЛЕНО (Часть 1 роадмапа стриминга, задача G): канал, в
+        // который reader-таск шлёт session/update-чанки сразу. Нестриминговый
+        // prompt() читает его ПОСЛЕ завершения хода и собирает контент —
+        // сохраняя старое поведение Reply::Complete (Р-20: дефолт не меняется).
+        let (tx, mut rx) = mpsc::unbounded_channel::<SessionUpdate>();
+        self.updates.lock().await.insert(session_key.clone(), tx);
+
         let mut resp: PromptResponse = self.call("session/prompt", req).await?;
 
-        let collected = self.updates.lock().await.remove(&session_key).unwrap_or_default();
+        // Собрать все чанки, ушедшие в канал за время хода.
+        let mut collected: Vec<protocol::acp::ContentBlock> = Vec::new();
+        while let Ok(update) = rx.try_recv() {
+            if let SessionUpdate::AgentMessageChunk { content, .. } = update {
+                collected.push(content);
+            }
+        }
+        self.updates.lock().await.remove(&session_key);
+
         if resp.content.is_empty() {
             resp.content = collected;
         }
         Ok(Reply::Complete(resp))
     }
 
+    /// ДОБАВЛЕНО (Р-20, Часть 1 роадмапа стриминга): потоковый prompt().
+    /// Возвращает Reply::Streaming(rx) СРАЗУ после записи session/prompt в
+    /// stdin — канал отдаёт чанки по мере генерации (collect_session_update
+    /// шлёт их в tx сразу). Финальный PromptResponse домаппливается фоновым
+    /// таском в терминальный AgentMessageChunk, после чего tx дропается и
+    /// канал закрывается.
+    async fn prompt_streaming(
+        &self,
+        req: PromptRequest,
+    ) -> anyhow::Result<Reply<PromptResponse, SessionUpdate>> {
+        let session_key = req.session_id.0.clone();
+        // Хвост предыдущего хода не должен попасть в текущий ответ.
+        self.updates.lock().await.remove(&session_key);
+
+        let (tx, rx) = mpsc::unbounded_channel::<SessionUpdate>();
+        self.updates
+            .lock()
+            .await
+            .insert(session_key.clone(), tx.clone());
+
+        // Отправляем session/prompt сами (без блокирующего call): канал
+        // должен начать отдавать чанки клиенту немедленно. Регистрируем
+        // pending-запись и ждём финальный ответ в фоне.
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.pending.lock().await.insert(id, resp_tx);
+
+        let request =
+            json!({ "jsonrpc": "2.0", "id": id, "method": "session/prompt", "params": req });
+        let mut line = serde_json::to_vec(&request)?;
+        line.push(b'\n');
+        {
+            let mut stdin = self.stdin.lock().await;
+            stdin.write_all(&line).await.map_err(|e| {
+                anyhow::anyhow!("write to agent stdin failed (process likely dead): {e}")
+            })?;
+        }
+
+        // Фоновый таск: дождаться финального PromptResponse, домапплить его
+        // в терминальный чанк, закрыть канал. Ошибка агента ПОСЛЕ ухода
+        // чанков не теряется молча: канал закрывается без terminal, и
+        // диспетчер ловит это по ERROR-ловушке в convert.rs.
+        tokio::spawn({
+            let updates = self.updates.clone();
+            async move {
+                let resp: Result<PromptResponse, String> = match resp_rx.await {
+                    Ok(Ok(value)) => serde_json::from_value(value)
+                        .map_err(|e| format!("bad PromptResponse: {e}")),
+                    Ok(Err(err_msg)) => Err(err_msg),
+                    Err(_) => Err("agent stdout closed before prompt response".to_string()),
+                };
+                match resp {
+                    Ok(resp) => {
+                        let terminal = SessionUpdate::AgentMessageChunk {
+                            message_id: None,
+                            content: prompt_to_content_block(&resp),
+                        };
+                        let _ = tx.send(terminal);
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            session_id = %session_key,
+                            error = %e,
+                            "session/prompt завершился ошибкой после ухода чанков — канал закрыт без terminal"
+                        );
+                    }
+                }
+                updates.lock().await.remove(&session_key);
+            }
+        });
+
+        Ok(Reply::Streaming(rx))
+    }
+
     async fn cancel(&self, session: SessionId) -> anyhow::Result<()> {
-        self.notify("session/cancel", json!({ "sessionId": session.0 })).await
+        self.notify("session/cancel", json!({ "sessionId": session.0 }))
+            .await
     }
 
     async fn is_alive(&self) -> bool {
@@ -292,24 +414,69 @@ impl AcpAgent for StdioAcpAgent {
 // маскировал утечку процессов. Его роль выполняет kill_on_drop(true),
 // выставленный в spawn().
 
-/// Извлекает контентный чанк из session/update и складывает в накопитель.
-/// Служебные апдейты (tool_call, plan, usage) и мысли агента в ответ
-/// не попадают — это не текст ответа модели.
+/// ДОБАВЛЕНО (Часть 1 роадмапа стриминга, задача G): извлекает
+/// session/update из JSON-RPC нотификации агента и шлёт в mpsc-канал
+/// сессии сразу, без накопления.
+///
+/// Р-21 (decisions.md): парсится ТОЛЬКО `agent_message_chunk` — основной
+/// канал текстового ответа. ToolCall/ToolCallUpdate/Plan/UsageUpdate НЕ
+/// парсятся в Фазе 2.0: требуют сверки с точной JSON-схемой ACP по
+/// каждому варианту отдельно, риск непропорционален ценности. Маппинг
+/// этих 4 вариантов в convert.rs::session_update_to_a2a_event() написан,
+/// но недостижим при текущем фильтре — сознательно (готовность к
+/// следующей итерации).
 async fn collect_session_update(parsed: &Value, updates: &UpdatesMap) {
     if parsed.get("method").and_then(Value::as_str) != Some("session/update") {
         return;
     }
-    let Some(params) = parsed.get("params") else { return };
-    let Some(session_id) = params.get("sessionId").and_then(Value::as_str) else { return };
-    let Some(update) = params.get("update") else { return };
+    let Some(params) = parsed.get("params") else {
+        return;
+    };
+    let Some(session_id) = params.get("sessionId").and_then(Value::as_str) else {
+        return;
+    };
+    let Some(update) = params.get("update") else {
+        return;
+    };
 
     if update.get("sessionUpdate").and_then(Value::as_str) != Some("agent_message_chunk") {
         return;
     }
-    let Some(content) = update.get("content") else { return };
+    let Some(content) = update.get("content") else {
+        return;
+    };
     let Ok(block) = serde_json::from_value::<protocol::acp::ContentBlock>(content.clone()) else {
         return;
     };
 
-    updates.lock().await.entry(session_id.to_string()).or_default().push(block);
+    let session_update = SessionUpdate::AgentMessageChunk {
+        message_id: update
+            .get("messageId")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        content: block,
+    };
+
+    let tx = updates.lock().await.get(session_id).cloned();
+    if let Some(tx) = tx {
+        let _ = tx.send(session_update);
+    }
+}
+
+/// Финальный PromptResponse → терминальный SessionUpdate (текстовый чанк
+/// с полным контентом ответа). Вызывается в prompt() после завершения хода.
+fn prompt_to_content_block(resp: &PromptResponse) -> protocol::acp::ContentBlock {
+    // Сливаем весь контент ответа в один текстовый блок: у ACP-агента
+    // финальный ответ может состоять из нескольких ContentBlock, но
+    // терминальный элемент стрима должен нести полный текст.
+    let text = resp
+        .content
+        .iter()
+        .filter_map(|b| match b {
+            protocol::acp::ContentBlock::Text { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    protocol::acp::ContentBlock::Text { text }
 }

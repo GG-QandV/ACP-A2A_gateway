@@ -64,18 +64,50 @@ enum RawAgentEntry {
         cwd: Option<String>,
         #[serde(default)]
         env: HashMap<String, String>,
+        #[serde(default)]
+        streaming: StreamingConfig,
     },
     Http {
         url: String,
         push_token: Option<String>,
+        #[serde(default)]
+        streaming: StreamingConfig,
     },
+}
+
+/// ДОБАВЛЕНО (Часть 2 роадмапа стриминга): секция `streaming:` на агента.
+/// Дефолты — безопасный минимум (1 стрим на stdio-агента, таймауты по
+/// умолчанию), чтобы конфиг без секции не паниковал и не менял поведение.
+#[derive(Debug, Deserialize, Default)]
+struct StreamingConfig {
+    #[serde(default = "default_max_concurrent_streams")]
+    max_concurrent_streams: usize,
+    #[serde(default = "default_first_chunk_timeout_secs")]
+    first_chunk_timeout_secs: u64,
+    #[serde(default = "default_idle_chunk_timeout_secs")]
+    idle_chunk_timeout_secs: u64,
+}
+
+fn default_max_concurrent_streams() -> usize {
+    1
+}
+
+fn default_first_chunk_timeout_secs() -> u64 {
+    15
+}
+
+fn default_idle_chunk_timeout_secs() -> u64 {
+    120
 }
 
 /// ИСПРАВЛЕНО (аудит P1-10): было unwrap_or_default() — отсутствующая
 /// переменная молча становилась пустым ключом/токеном, и шлюз стартовал
 /// с нерабочей авторизацией. Теперь это ошибка конфигурации на старте.
 fn resolve_env_placeholders(value: &str) -> anyhow::Result<String> {
-    match value.strip_prefix("{env:").and_then(|s| s.strip_suffix('}')) {
+    match value
+        .strip_prefix("{env:")
+        .and_then(|s| s.strip_suffix('}'))
+    {
         Some(var_name) => std::env::var(var_name).with_context(|| {
             format!("переменная окружения {var_name} не задана (конфиг: {value})")
         }),
@@ -97,8 +129,21 @@ fn build_registry(raw: &RawConfig) -> anyhow::Result<Registry> {
 
     let mut agents: HashMap<String, AgentEntry> = HashMap::new();
     for (id, entry) in &raw.agents {
+        let streaming = match entry {
+            RawAgentEntry::Stdio { streaming, .. } | RawAgentEntry::Http { streaming, .. } => {
+                streaming
+            }
+        };
+        if streaming.max_concurrent_streams == 0 {
+            anyhow::bail!(
+                "agent {id}: streaming.max_concurrent_streams не может быть 0 — используйте отдельный флаг disable_streaming: true, если стрим не нужен"
+            );
+        }
+
         let transport = match entry {
-            RawAgentEntry::Stdio { command, cwd, env } => {
+            RawAgentEntry::Stdio {
+                command, cwd, env, ..
+            } => {
                 if command.is_empty() {
                     anyhow::bail!("agent {id}: command пустой");
                 }
@@ -106,9 +151,15 @@ fn build_registry(raw: &RawConfig) -> anyhow::Result<Registry> {
                 for (k, v) in env {
                     resolved.insert(k.clone(), resolve_env_placeholders(v)?);
                 }
-                Transport::Stdio { command: command.clone(), cwd: cwd.clone(), env: resolved }
+                Transport::Stdio {
+                    command: command.clone(),
+                    cwd: cwd.clone(),
+                    env: resolved,
+                }
             }
-            RawAgentEntry::Http { url, push_token } => Transport::Http {
+            RawAgentEntry::Http {
+                url, push_token, ..
+            } => Transport::Http {
                 url: url.clone(),
                 push_token: match push_token {
                     Some(t) => Some(resolve_env_placeholders(t)?),
@@ -116,12 +167,19 @@ fn build_registry(raw: &RawConfig) -> anyhow::Result<Registry> {
                 },
             },
         };
-        agents.insert(id.clone(), AgentEntry { transport });
+        agents.insert(
+            id.clone(),
+            AgentEntry::new(
+                transport,
+                streaming.max_concurrent_streams,
+                std::time::Duration::from_secs(streaming.first_chunk_timeout_secs),
+                std::time::Duration::from_secs(streaming.idle_chunk_timeout_secs),
+            ),
+        );
     }
 
     Ok(Registry::new(tokens, agents))
 }
-
 
 /// Обходит подкаталоги хранилища (по одному на agent_id) и убирает
 /// просроченные задачи в каждом.
@@ -148,7 +206,9 @@ async fn sweep_all_agents(base_dir: &PathBuf, ttl: std::time::Duration) -> anyho
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber_init();
 
-    let config_path = std::env::args().nth(1).unwrap_or_else(|| "config.yaml".to_string());
+    let config_path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "config.yaml".to_string());
     let raw_yaml = std::fs::read_to_string(&config_path)
         .with_context(|| format!("не удалось прочитать конфиг: {config_path}"))?;
     let raw_config: RawConfig = serde_yaml::from_str(&raw_yaml)
@@ -160,8 +220,7 @@ async fn main() -> anyhow::Result<()> {
     let lease_timeout = std::time::Duration::from_secs(raw_config.turn_lease_timeout_secs);
     let call_timeout = std::time::Duration::from_secs(raw_config.agent_call_timeout_secs);
     let public_url = raw_config.public_url.clone();
-    let task_ttl =
-        std::time::Duration::from_secs(raw_config.task_retention_days * 24 * 60 * 60);
+    let task_ttl = std::time::Duration::from_secs(raw_config.task_retention_days * 24 * 60 * 60);
     let sweep_dir = task_store_dir.clone();
 
     let registry = std::sync::Arc::new(build_registry(&raw_config)?);
@@ -187,7 +246,9 @@ async fn main() -> anyhow::Result<()> {
         let app = direction_4.merge(direction_2);
 
         let listener = tokio::net::TcpListener::bind(&http_listen).await?;
-        axum::serve(listener, app).await.map_err(anyhow::Error::from)
+        axum::serve(listener, app)
+            .await
+            .map_err(anyhow::Error::from)
     });
 
     // Фоновая уборка задач. Ходит по каталогам агентов на диске, а не
