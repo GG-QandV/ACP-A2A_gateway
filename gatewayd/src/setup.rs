@@ -214,20 +214,18 @@ struct AgentSpec {
 // --- prompt helpers ---------------------------------------------------------
 
 fn prompt(input: &mut impl BufRead, label: &str, default: &str) -> String {
-    loop {
-        print!("{} [{}]: ", label, default);
-        std::io::stdout().flush().ok();
-        let mut line = String::new();
-        if input.read_line(&mut line).ok().filter(|n| *n > 0).is_none() {
-            eprintln!("aborted (no input)");
-            std::process::exit(1);
-        }
-        let v = line.trim().to_string();
-        if v.is_empty() {
-            return default.to_string();
-        }
-        return v;
+    print!("{} [{}]: ", label, default);
+    std::io::stdout().flush().ok();
+    let mut line = String::new();
+    if input.read_line(&mut line).ok().filter(|n| *n > 0).is_none() {
+        eprintln!("aborted (no input)");
+        std::process::exit(1);
     }
+    let v = line.trim().to_string();
+    if v.is_empty() {
+        return default.to_string();
+    }
+    v
 }
 
 fn ask_str(input: &mut impl BufRead, label: &str, default: &str) -> String {
