@@ -15,7 +15,9 @@ use gatewayd::registry::{AgentEntry, Registry, Transport};
 use gatewayd::{transport_a2a_passthrough, transport_http, transport_tcp};
 use serde::Deserialize;
 use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::reload;
 use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::EnvFilter;
 
 mod cli;
 mod setup;
@@ -79,6 +81,11 @@ struct LoggingConfig {
     level: String,
     #[serde(default = "default_log_output")]
     output: String,
+    /// ДОБАВЛЕНО (Часть 4.6): время жизни временно расширенного уровня.
+    /// POST /debug/level c level: debug|trace держит его максимум
+    /// столько минут, затем автоматический откат к "info". 0 = без отката.
+    #[serde(default = "default_debug_ttl_minutes")]
+    debug_ttl_minutes: u64,
     #[serde(default)]
     file: LogFileConfig,
 }
@@ -88,6 +95,7 @@ impl Default for LoggingConfig {
         Self {
             level: default_log_level(),
             output: default_log_output(),
+            debug_ttl_minutes: default_debug_ttl_minutes(),
             file: LogFileConfig::default(),
         }
     }
@@ -103,6 +111,10 @@ struct LogFileConfig {
     max_files: usize,
     #[serde(default = "default_max_total_size_mb")]
     max_total_size_mb: u64,
+    /// ДОБАВЛЕНО (Часть 4.4): сжимать ротированные файлы gzip (файл ->
+    /// файл.gz), когда монитор чистки срабатывает из-за max_total_size_mb.
+    #[serde(default = "default_compress_rotated")]
+    compress_rotated: bool,
 }
 
 impl Default for LogFileConfig {
@@ -112,6 +124,7 @@ impl Default for LogFileConfig {
             max_file_size_mb: default_max_file_size_mb(),
             max_files: default_max_files(),
             max_total_size_mb: default_max_total_size_mb(),
+            compress_rotated: default_compress_rotated(),
         }
     }
 }
@@ -122,6 +135,14 @@ fn default_log_level() -> String {
 
 fn default_log_output() -> String {
     "stdout".to_string()
+}
+
+fn default_debug_ttl_minutes() -> u64 {
+    60
+}
+
+fn default_compress_rotated() -> bool {
+    true
 }
 
 fn default_log_path() -> String {
@@ -407,7 +428,7 @@ async fn main() -> anyhow::Result<()> {
     let raw_config: RawConfig = serde_yaml::from_str(&raw_yaml)
         .with_context(|| format!("не удалось распарсить конфиг: {config_path}"))?;
 
-    tracing_subscriber_init(&raw_config.logging);
+    let reload_handle = tracing_subscriber_init(&raw_config.logging);
 
     // ДОБАВЛЕНО (Фаза 1 буферного конфига): поднять durable-БД до запуска
     // транспортов — стримы, стартовавшие сразу, должны иметь куда писать.
@@ -534,7 +555,23 @@ async fn main() -> anyhow::Result<()> {
             event_log,
         );
         let direction_2 = transport_a2a_passthrough::router(http_registry);
-        let app = direction_4.merge(direction_2);
+        let mut app = direction_4.merge(direction_2);
+        // Часть 4.6: смена уровня логирования «на лету» через /debug/level.
+        // Роутер отдельный (не в transport_http::router — сигнатура последнего
+        // зафиксирована интеграционными тестами), мержим в общий app.
+        if let Some(handle) = reload_handle {
+            let debug_tokens: std::collections::HashSet<String> = raw_config
+                .tokens
+                .iter()
+                .map(|t| resolve_env_placeholders(t))
+                .collect::<anyhow::Result<_>>()
+                .expect("токены уже валидированы в build_registry");
+            app = app.merge(debug_router(
+                handle,
+                debug_tokens,
+                raw_config.logging.debug_ttl_minutes,
+            ));
+        }
 
         let listener = tokio::net::TcpListener::bind(&http_listen).await?;
         axum::serve(listener, app)
@@ -571,6 +608,7 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or_else(|| "/var/log".to_string());
         let limit_mb = raw_config.logging.file.max_total_size_mb;
         let max_file_size_mb = raw_config.logging.file.max_file_size_mb;
+        let compress_rotated = raw_config.logging.file.compress_rotated;
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(TASK_SWEEP_INTERVAL).await;
@@ -597,6 +635,11 @@ async fn main() -> anyhow::Result<()> {
                         limit_mb,
                         "лог-каталог превысил max_total_size_mb — принудительное удаление старейших файлов"
                     );
+                    // Часть 4.4: не только предупредить, а реально урезать.
+                    // gzip-сжатие ротированных (если включено), затем удаление
+                    // старейших, пока суммарный размер не вернётся к лимиту.
+                    let removed = prune_log_dir(&log_dir, limit_mb, compress_rotated).await;
+                    tracing::warn!(removed, "лог-каталог урезан до max_total_size_mb");
                 } else if pct >= 80 {
                     tracing::warn!(
                         current_size_mb = current_mb,
@@ -654,7 +697,113 @@ async fn largest_file_size_mb(dir: &str) -> u64 {
     largest / (1024 * 1024)
 }
 
-fn tracing_subscriber_init(logging: &LoggingConfig) {
+/// Список файлов каталога с mtime и размером — для чистки лог-каталога.
+async fn collect_log_files(
+    dir: &str,
+) -> Vec<(std::path::PathBuf, std::time::SystemTime, u64)> {
+    let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
+        return Vec::new();
+    };
+    let mut files = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if let Ok(meta) = entry.metadata().await {
+            if meta.is_file() {
+                if let Ok(mtime) = meta.modified() {
+                    files.push((entry.path(), mtime, meta.len()));
+                }
+            }
+        }
+    }
+    files
+}
+
+/// gzip-сжатие файла на месте: файл -> файл.gz, оригинал удаляется.
+async fn gzip_file(path: &std::path::Path) -> bool {
+    use std::io::Write;
+
+    let Ok(data) = tokio::fs::read(path).await else {
+        return false;
+    };
+    let gz_path = path.with_extension("log.gz");
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(6));
+    if encoder.write_all(&data).is_err() {
+        return false;
+    }
+    let Ok(gz) = encoder.finish() else {
+        return false;
+    };
+    if tokio::fs::write(&gz_path, gz).await.is_err() {
+        return false;
+    }
+    tokio::fs::remove_file(path).await.is_ok()
+}
+
+/// Часть 4.4: реальная чистка лог-каталога при превышении
+/// max_total_size_mb. Сначала gzip-сжимает ротированные (не активные)
+/// файлы, затем удаляет старейшие, пока суммарный размер не опустится
+/// ниже лимита. Активный (самый свежий) файл не трогается. Возвращает
+/// число обработанных файлов.
+async fn prune_log_dir(dir: &str, limit_mb: u64, compress: bool) -> usize {
+    if limit_mb == 0 {
+        return 0;
+    }
+    let limit_bytes = limit_mb * 1024 * 1024;
+    let mut handled = 0usize;
+
+    let mut files = collect_log_files(dir).await;
+    if files.is_empty() {
+        return 0;
+    }
+    files.sort_by_key(|(_, mtime, _)| *mtime);
+    let active = files.last().map(|(path, _, _)| path.clone());
+
+    // 1) gzip-компрессия старых ротированных файлов.
+    if compress {
+        for (path, _, _) in &files {
+            if Some(path) == active.as_ref() {
+                continue;
+            }
+            if path.extension().map(|e| e.to_str()) == Some(Some("gz")) {
+                continue;
+            }
+            if gzip_file(path).await {
+                handled += 1;
+            }
+        }
+    }
+
+    // 2) Удаление старейших, пока суммарный размер выше лимита.
+    loop {
+        let files = collect_log_files(dir).await;
+        if files.len() <= 1 {
+            break;
+        }
+        let total: u64 = files.iter().map(|(_, _, size)| *size).sum();
+        if total <= limit_bytes {
+            break;
+        }
+        let mut sorted = files.clone();
+        sorted.sort_by_key(|(_, mtime, _)| *mtime);
+        let oldest = sorted.first().cloned();
+        match oldest {
+            Some((path, _, _)) if Some(&path) != active.as_ref() => {
+                if tokio::fs::remove_file(&path).await.is_ok() {
+                    handled += 1;
+                } else {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    handled
+}
+
+/// Часть 4.6: reload-фильтр. Возвращает handle для смены уровня «на
+/// лету» через POST /debug/level; None — когда level: "off" (клапан).
+fn tracing_subscriber_init(
+    logging: &LoggingConfig,
+) -> Option<reload::Handle<EnvFilter, tracing_subscriber::Registry>> {
     // Аварийный клапан (Часть 4.5): level: "off" полностью отключает
     // фильтр. Стартовое сообщение печатается в stderr ДО отключения —
     // иначе оператор не отличит "не пишет логи по конфигу" от "не
@@ -664,33 +813,30 @@ fn tracing_subscriber_init(logging: &LoggingConfig) {
             "[gatewayd] ВНИМАНИЕ: логирование полностью отключено (logging.level: off) — диагностика по логам будет недоступна"
         );
         let _ = tracing_subscriber::fmt()
-            .with_env_filter(tracing_subscriber::EnvFilter::new("off"))
+            .with_env_filter(EnvFilter::new("off"))
             .try_init();
-        return;
+        return None;
     }
 
-    let env_filter = tracing_subscriber::EnvFilter::new(&logging.level);
+    // Единая цепочка registry() + reload-слой, чтобы фильтр был меняемым.
+    // Обёртка reload::Layer не пишет сама — рядом кладём fmt-слой(и) под
+    // output: stdout|file|both, как было. Ветки раздельные, потому что
+    // каждый .with() меняет тип Layered — переприсваивание не скомпилилось бы.
+    let (filter, handle) = reload::Layer::new(EnvFilter::new(&logging.level));
     let output_stdout = logging.output == "stdout" || logging.output == "both";
     let output_file = logging.output == "file" || logging.output == "both";
 
-    // ДОБАВЛЕНО (Часть 4 роадмапа стриминга): файловая ротация через
-    // tracing-appender. Для "both" используем registry() с двумя слоями,
-    // для "file" — единый fmt() с файловым writer. EnvFilter глобальный.
-    if output_file && output_stdout {
+    let base = tracing_subscriber::registry().with(filter);
+    if output_stdout && output_file {
         let file_appender = tracing_appender::rolling::Builder::new()
             .rotation(tracing_appender::rolling::Rotation::DAILY)
             .filename_prefix("gateway")
             .max_log_files(logging.file.max_files)
             .build(&logging.file.path)
             .expect("file appender builds");
-        let file_layer = tracing_subscriber::fmt::layer().with_writer(file_appender);
-        let stdout_layer = tracing_subscriber::fmt::layer().with_writer(std::io::stdout);
-        let _ = tracing_subscriber::registry()
-            .with(stdout_layer)
-            .with(file_layer)
-            .with(tracing_subscriber::filter::LevelFilter::from_level(
-                parse_level(&logging.level),
-            ))
+        let _ = base
+            .with(tracing_subscriber::fmt::layer().with_writer(std::io::stdout))
+            .with(tracing_subscriber::fmt::layer().with_writer(file_appender))
             .try_init();
     } else if output_file {
         let file_appender = tracing_appender::rolling::Builder::new()
@@ -699,25 +845,125 @@ fn tracing_subscriber_init(logging: &LoggingConfig) {
             .max_log_files(logging.file.max_files)
             .build(&logging.file.path)
             .expect("file appender builds");
-        let _ = tracing_subscriber::fmt()
-            .with_writer(file_appender)
-            .with_max_level(parse_level(&logging.level))
+        let _ = base
+            .with(tracing_subscriber::fmt::layer().with_writer(file_appender))
             .try_init();
     } else {
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(env_filter)
+        let _ = base
+            .with(tracing_subscriber::fmt::layer().with_writer(std::io::stdout))
             .try_init();
     }
+    Some(handle)
 }
 
-fn parse_level(level: &str) -> tracing::Level {
-    match level {
-        "debug" => tracing::Level::DEBUG,
-        "trace" => tracing::Level::TRACE,
-        "warn" => tracing::Level::WARN,
-        "error" => tracing::Level::ERROR,
-        _ => tracing::Level::INFO,
+/// Состояние debug-эндпоинта смены уровня логирования (Часть 4.6).
+#[derive(Clone)]
+struct DebugLevelState {
+    handle: reload::Handle<EnvFilter, tracing_subscriber::Registry>,
+    tokens: std::sync::Arc<std::collections::HashSet<String>>,
+    ttl_minutes: u64,
+    current: std::sync::Arc<tokio::sync::RwLock<String>>,
+}
+
+/// Часть 4.6: эндпоинт /debug/level — смена уровня логирования «на лету».
+///   GET  /debug/level            -> текущий уровень
+///   POST /debug/level            -> body {"level":"debug"} + Bearer-токен
+/// Уровни debug|trace включают автокат к "info" через debug_ttl_minutes.
+fn debug_router(
+    handle: reload::Handle<EnvFilter, tracing_subscriber::Registry>,
+    tokens: std::collections::HashSet<String>,
+    ttl_minutes: u64,
+) -> axum::Router {
+    use axum::routing::get;
+
+    let state = DebugLevelState {
+        handle,
+        tokens: std::sync::Arc::new(tokens),
+        ttl_minutes,
+        current: std::sync::Arc::new(tokio::sync::RwLock::new("info".to_string())),
+    };
+    axum::Router::new()
+        .route("/debug/level", get(get_debug_level).post(set_debug_level))
+        .with_state(state)
+}
+
+async fn get_debug_level(
+    axum::extract::State(state): axum::extract::State<DebugLevelState>,
+) -> String {
+    state.current.read().await.clone()
+}
+
+async fn set_debug_level(
+    axum::extract::State(state): axum::extract::State<DebugLevelState>,
+    headers: axum::http::HeaderMap,
+    body: String,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let token = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("");
+    if !state.tokens.contains(token) {
+        return (StatusCode::UNAUTHORIZED, "missing or invalid token").into_response();
     }
+
+    let level: String = serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| {
+            v.get("level")
+                .and_then(|l| l.as_str())
+                .map(|s| s.to_lowercase())
+        })
+        .unwrap_or_default();
+    const VALID_LEVELS: [&str; 5] = ["error", "warn", "info", "debug", "trace"];
+    if !VALID_LEVELS.contains(&level.as_str()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("invalid level: {level} (expected one of {VALID_LEVELS:?})"),
+        )
+            .into_response();
+    }
+
+    let previous = state.current.read().await.clone();
+    if state
+        .handle
+        .modify(|f| *f = EnvFilter::new(&level))
+        .is_err()
+    {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "reload failed").into_response();
+    }
+    *state.current.write().await = level.clone();
+
+    if level == "debug" || level == "trace" {
+        tracing::warn!(
+            new_level = %level,
+            ttl_minutes = state.ttl_minutes,
+            "логирование временно расширено — автоматический откат к info через debug_ttl_minutes"
+        );
+        if state.ttl_minutes > 0 {
+            let handle = state.handle.clone();
+            let current = state.current.clone();
+            let ttl_minutes = state.ttl_minutes;
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(ttl_minutes * 60)).await;
+                if handle.modify(|f| *f = EnvFilter::new("info")).is_ok() {
+                    *current.write().await = "info".to_string();
+                }
+                tracing::warn!("debug_ttl_minutes истёк — уровень логирования возвращён к info");
+            });
+        }
+    } else {
+        tracing::warn!(new_level = %level, previous = %previous, "уровень логирования изменён через /debug/level");
+    }
+
+    (
+        StatusCode::OK,
+        serde_json::json!({ "level": level, "previous": previous }).to_string(),
+    )
+        .into_response()
 }
 
 #[cfg(test)]

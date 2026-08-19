@@ -548,8 +548,8 @@ struct StreamItem {
 /// 2. публикует (seq, event) в per-task hub для live-продолжения
 ///    resubscriber'ов (ДО клиента — подписчик не пропустит событие);
 /// 3. отдаёт событие клиенту текущего соединения.
-/// Клиент отвалился — relay живёт дальше: агент не канселится, события
-/// продолжают писаться в durable-буфер и hub, resubscribe нагонит.
+///    Клиент отвалился — relay живёт дальше: агент не канселится, события
+///    продолжают писаться в durable-буфер и hub, resubscribe нагонит.
 fn spawn_stream_relay(
     rx: tokio::sync::mpsc::UnboundedReceiver<protocol::a2a::A2aEvent>,
     event_log: Option<Arc<EventLog>>,
@@ -657,8 +657,8 @@ fn event_task_id(event: &protocol::a2a::A2aEvent) -> Option<String> {
 ///    события с seq > последнего отданного (дедуп: история и live могут
 ///    пересекаться на границе). broadcast переполнился (Lagged) — повторно
 ///    читаем durable-историю с последнего seq (catch-up) и продолжаем live.
-/// Закрытие канала агента (стрим завершён) — hub.close, подписчик
-/// получает Closed и поток завершается.
+///    Закрытие канала агента (стрим завершён) — hub.close, подписчик
+///    получает Closed и поток завершается.
 async fn resubscribe_stream(
     log: Arc<EventLog>,
     hub: Arc<StreamHub>,
@@ -705,9 +705,7 @@ async fn resubscribe_stream(
                 st.live = st.hub.subscribe(&st.task_id).await;
                 // hub.subscribe == None: для задачи нет активного стрима
                 // (релей не стартовал или закрылся) — live-хвоста не будет.
-                if st.live.is_none() {
-                    return None;
-                }
+                st.live.as_ref()?;
             }
             // 3) События live с дедупом по seq (граница история/live может
             //    пересекаться) и catch-up при Lagged.

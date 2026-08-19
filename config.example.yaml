@@ -31,6 +31,28 @@ agents:
 # а не адресом привязки: за reverse-proxy это домен прокси.
 public_url: "https://gateway.example.com"
 
+# Часть 4 роадмапа стриминга: логирование и ротация.
+#   level:  info | debug | trace | warn | error | off  (off = аварийный клапан,
+#           полностью отключает фильтр; диагностика по логам будет недоступна)
+#   output: stdout | file | both
+#   debug_ttl_minutes: время жизни временно расширенного уровня (debug|trace)
+#           через POST /debug/level — по истечении автокат к "info".
+#           Проверка токена: тот же Authorization: Bearer <token>, что у RPC.
+#   file:   пути и ротация (актуально для output: file|both).
+#           max_total_size_mb — потолок каталога; монитор раз в час реально
+#           сжимает gzip и удаляет старейшие файлы при превышении.
+#           compress_rotated: true — сжимать ротированные файлы при чистке.
+logging:
+  level: "info"
+  output: "stdout"
+  debug_ttl_minutes: 60
+  file:
+    path: "/var/log/acp-a2a-gateway/gateway.log"
+    max_file_size_mb: 100
+    max_files: 10
+    max_total_size_mb: 1000
+    compress_rotated: true
+
 task_store_dir: "/tmp/gateway/tasks"
 task_retention_days: 7        # завершённые задачи убираются фоном раз в час
 turn_lease_timeout_secs: 30
