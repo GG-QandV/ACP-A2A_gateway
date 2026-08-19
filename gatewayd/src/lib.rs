@@ -4,7 +4,12 @@
 //! Registry без запуска полного процесса: lib не зависит от main() и
 //! от чтения конфига, поэтому тест-харнес подключает свой Registry.
 
+pub mod approvals;
+pub mod config;
 pub mod dialect_probe;
+pub mod event_log;
+pub mod health;
+pub mod journal;
 pub mod registry;
 pub mod transport_a2a_passthrough;
 pub mod transport_http;

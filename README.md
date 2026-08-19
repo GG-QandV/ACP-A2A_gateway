@@ -40,7 +40,16 @@ cp config.example.yaml config.yaml   # поправить токены, аген
 - `public_url` — внешний адрес шлюза, уходит в `AgentCard.url` (`agent.json`).
 - Фоновая уборка завершённых задач: `task_retention_days` (по умолч. 7), раз в час.
 
-Полный гайд: [`docs/06-gateway-guide.md`](docs/06-gateway-guide.md).
+## CLI-команды (Rust-модуль, без внешнего sqlite3)
+
+- `gatewayd --journal [--limit N] [--level info|warn|error] [--category NAME] [--since 10m|6h|1d|2w|1mo] [--db PATH]`
+  — просмотр durable-журнала (health-алерты, обрывы стримов, апрувы) ASCII-таблицей.
+- `gatewayd --approvals` — статусы агентов (pending/approved/rejected) + fingerprint.
+- `gatewayd --approve <name>` / `gatewayd --reject <name>` — человеческий апрув агентов
+  (секция `approvals:` в конфиге; неодобренный агент не обслуживается и попадает в журнал).
+- `gatewayd --setup` — интерактивный мастер генерации конфига.
+
+Полный гайд: [`docs/06-gateway-guide.md`](docs/06-gateway-guide.md) (RU) · [`docs/06-gateway-guide-en.md`](docs/06-gateway-guide-en.md) (EN) · [`docs/06-gateway-guide-uk.md`](docs/06-gateway-guide-uk.md) (UK).
 
 ## Стратегия A2A-протокола 2026
 

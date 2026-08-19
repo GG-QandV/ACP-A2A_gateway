@@ -32,6 +32,9 @@ uuid = { workspace = true }
 tokio-stream = "0.1"
 futures-util = "0.3"
 tracing-appender = "0.2"
+# Фаза 1 буферного конфига: durable event_log/task_store. bundled — своя
+# статическая sqlite3, не зависит от системной библиотеки (устойчивость).
+rusqlite = { version = "0.31", features = ["bundled"] }
 
 [dev-dependencies]
 tempfile = "3"

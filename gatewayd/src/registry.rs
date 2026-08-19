@@ -35,6 +35,14 @@ pub struct AgentEntry {
     pub idle_chunk_timeout: std::time::Duration,
 }
 
+/// ДОБАВЛЕНО (Фаза 5): одна строка сводки занятых слотов стримов.
+#[derive(Debug, Clone)]
+pub struct StreamUsage {
+    pub agent_id: String,
+    pub active: usize,
+    pub limit: usize,
+}
+
 impl AgentEntry {
     pub fn new(
         transport: Transport,
@@ -76,6 +84,22 @@ impl Registry {
 
     pub fn lookup(&self, agent_id: &str) -> Option<&AgentEntry> {
         self.agents.get(agent_id)
+    }
+
+    /// ДОБАВЛЕНО (Фаза 5, health-мониторинг): сводка занятых слотов
+    /// стримов по всем агентам — для периодического health-чека.
+    pub fn stream_usage(&self) -> Vec<StreamUsage> {
+        let mut usage: Vec<StreamUsage> = self
+            .agents
+            .iter()
+            .map(|(id, entry)| StreamUsage {
+                agent_id: id.clone(),
+                active: entry.stream_limit - entry.stream_permits.available_permits(),
+                limit: entry.stream_limit,
+            })
+            .collect();
+        usage.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
+        usage
     }
 
     /// Пытается занять слот стрима на агента (fail-closed). Возвращает
