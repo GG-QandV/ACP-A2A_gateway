@@ -20,9 +20,64 @@ use protocol::a2a_sdk_compat::{normalize_message, render_task_sdk};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::convert::Infallible;
+use tokio::sync::broadcast;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
+use crate::event_log::{EventLog, EventRecord};
 use crate::registry::{Registry, Transport};
+
+/// ДОБАВЛЕНО (Фаза 3.2, T4/resubscribe live): per-task broadcast-hub.
+/// live-события стрима публикуются сюда с seq (см. spawn_stream_relay);
+/// resubscribe после replay истории подписывается на этот канал и
+/// продолжает приём вживую. Запись в hub — всегда ДО live-отправки
+/// resubscriber'у, поэтому при Lacad/catch-up источник истины остаётся
+/// durable event_log (события в broadcast — только кэш последних).
+#[derive(Default)]
+pub struct StreamHub {
+    senders: tokio::sync::Mutex<HashMap<String, broadcast::Sender<(u64, protocol::a2a::A2aEvent)>>>,
+}
+
+impl StreamHub {
+    /// Подписка на live-события задачи. None = для задачи нет активного
+    /// стрима (релей ещё не стартовал или уже закрылся) — resubscribe
+    /// отдаёт только историю из durable event_log.
+    pub async fn subscribe(
+        &self,
+        task_id: &str,
+    ) -> Option<broadcast::Receiver<(u64, protocol::a2a::A2aEvent)>> {
+        self.senders
+            .lock()
+            .await
+            .get(task_id)
+            .map(broadcast::Sender::subscribe)
+    }
+
+    /// Публикация live-события. Создаёт канал для задачи при первом
+    /// событии (релей владеет жизненным циклом: close на завершении).
+    pub async fn publish(&self, task_id: &str, seq: u64, event: protocol::a2a::A2aEvent) {
+        let mut guard = self.senders.lock().await;
+        let tx = match guard.get(task_id) {
+            Some(tx) => tx.clone(),
+            None => {
+                let (tx, _rx) = broadcast::channel(HUB_CAPACITY);
+                guard.insert(task_id.to_string(), tx.clone());
+                tx
+            }
+        };
+        // Клиент мог отвалиться — не сбой, а норма: broadcast дропает.
+        let _ = tx.send((seq, event));
+    }
+
+    /// Релей закрывает канал задачи на своём завершении — resubscriber'ы
+    /// получают Closed и понимают, что live-хвоста больше не будет.
+    pub async fn close(&self, task_id: &str) {
+        self.senders.lock().await.remove(task_id);
+    }
+}
+
+/// Ёмкость broadcast-буфера на задачу. Не должен ломать стрим при
+/// переполнении: Lacad-пропуск закрывается повторным чтением event_log.
+const HUB_CAPACITY: usize = 1024;
 
 pub struct HttpState {
     registry: Arc<Registry>,
@@ -33,6 +88,13 @@ pub struct HttpState {
     /// ДОБАВЛЕНО (аудит P2-11): таймаут RPC к stdio-агенту из конфига.
     call_timeout: Duration,
     adapters: tokio::sync::Mutex<HashMap<String, Arc<AcpAsA2a<SupervisedStdioAgent>>>>,
+    /// ДОБАВЛЕНО (Фаза 2/3 буферного конфига): durable-буфер событий
+    /// стрима. None = секция event_log выключена в конфиге — стримы идут
+    /// как раньше (эфемерный канал, без seq на wire).
+    event_log: Option<Arc<EventLog>>,
+    /// ДОБАВЛЕНО (Фаза 3.2): per-task broadcast-hub для live-продолжения
+    /// tasks/resubscribe после replay истории.
+    stream_hub: Arc<StreamHub>,
 }
 
 pub fn router(
@@ -41,6 +103,7 @@ pub fn router(
     lease_timeout: Duration,
     call_timeout: Duration,
     public_url: String,
+    event_log: Option<Arc<EventLog>>,
 ) -> Router {
     let state = Arc::new(HttpState {
         registry,
@@ -49,6 +112,8 @@ pub fn router(
         public_url,
         call_timeout,
         adapters: tokio::sync::Mutex::new(HashMap::new()),
+        event_log,
+        stream_hub: Arc::new(StreamHub::default()),
     });
 
     Router::new()
@@ -276,11 +341,22 @@ async fn rpc_handler(
     // клиента, иначе адаптер не может отличить одного клиента от другого.
     let owner = Owner::from_token(&token);
 
-    let result = dispatch_a2a_method(&adapter, owner, &request).await;
+    let result = dispatch_a2a_method(
+        &adapter,
+        owner,
+        &request,
+        state.event_log.clone(),
+        state.stream_hub.clone(),
+    )
+    .await;
     match result {
         Ok(DispatchResult::Json(value)) => {
             Json(json!({ "jsonrpc": "2.0", "id": request.id, "result": value })).into_response()
         }
+        // ДОБАВЛЕНО (Фаза 3): tasks/resubscribe рендерится как SSE-поток
+        // (история + live) — клиент видит те же id:, что и в живом стриме,
+        // и может продолжить после последнего полученного.
+        Ok(DispatchResult::Resubscribe(stream)) => Sse::new(stream).into_response(),
         // ДОБАВЛЕНО (задача D): стриминговый ответ рендерится как SSE,
         // а не как JSON-RPC конверт — клиент читает поток A2aEvent.
         // ДОБАВЛЕНО (Часть 2, задача A): лимит параллельных стримов —
@@ -297,7 +373,8 @@ async fn rpc_handler(
                     )
                 }
             };
-            stream_to_sse(rx, permit).into_response()
+            let relay = spawn_stream_relay(rx, state.event_log.clone(), state.stream_hub.clone());
+            stream_to_sse(relay, permit).into_response()
         }
         // ДОБАВЛЕНО (аудит P2-10): потеря контекста — не «что-то пошло
         // не так». Клиент должен отличить её от прочих ошибок, чтобы
@@ -409,7 +486,8 @@ async fn rest_send_message_core(
                 agent_id,
                 "SDK REST-клиент перешёл в стриминговый режим (SSE)"
             );
-            stream_to_sse(rx, permit).into_response()
+            let relay = spawn_stream_relay(rx, state.event_log.clone(), state.stream_hub.clone());
+            stream_to_sse(relay, permit).into_response()
         }
         // Тот же контракт, что и у /rpc: потерянный контекст — 409 +
         // ABORTED, а не абстрактная внутренняя ошибка.
@@ -455,6 +533,76 @@ pub fn http_status_to_sdk_name(status: StatusCode) -> &'static str {
     }
 }
 
+/// Один элемент потока после relay: seq (Some = событие персистено в
+/// event_log и может быть продолжено через resubscribe) и само событие.
+struct StreamItem {
+    seq: Option<u64>,
+    event: protocol::a2a::A2aEvent,
+}
+
+/// ДОБАВЛЕНО (Фаза 3.2, T4/resubscribe): relay-таск, отделяющий жизнь
+/// стрима от жизни клиентского соединения. Читает A2aEvent из канала
+/// агента ДО их отправки клиенту:
+/// 1. персистит событие с task_id в event_log (источник истины для
+///    resubscribe), в случае сбоя — не ломает стрим, шлёт без seq;
+/// 2. публикует (seq, event) в per-task hub для live-продолжения
+///    resubscriber'ов (ДО клиента — подписчик не пропустит событие);
+/// 3. отдаёт событие клиенту текущего соединения.
+/// Клиент отвалился — relay живёт дальше: агент не канселится, события
+/// продолжают писаться в durable-буфер и hub, resubscribe нагонит.
+fn spawn_stream_relay(
+    rx: tokio::sync::mpsc::UnboundedReceiver<protocol::a2a::A2aEvent>,
+    event_log: Option<Arc<EventLog>>,
+    hub: Arc<StreamHub>,
+) -> tokio::sync::mpsc::UnboundedReceiver<StreamItem> {
+    let (client_tx, client_rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let mut rx = rx;
+        let mut known_task: Option<String> = None;
+        while let Some(event) = rx.recv().await {
+            let tid = event_task_id(&event);
+            if let Some(t) = tid.as_deref() {
+                known_task = Some(t.to_string());
+            }
+            let persisted = match (event_log.as_ref(), tid) {
+                (Some(log), Some(task_id)) => {
+                    match serde_json::to_string(&event) {
+                        Ok(json) => match log.append(&task_id, &json).await {
+                            Ok(seq) => {
+                                // В hub — ДО клиента: resubscriber, подписавшийся
+                                // на задачу, не должен пропустить это событие.
+                                hub.publish(&task_id, seq, event.clone()).await;
+                                Some(seq)
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    task_id = %task_id,
+                                    error = %e,
+                                    "event_log: не удалось персистить — шлю без seq"
+                                );
+                                None
+                            }
+                        },
+                        Err(e) => {
+                            tracing::warn!(error = %e, "event_log: сериализация события");
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            };
+            // Клиент мог отвалиться — игнорируем send-ошибку, relay продолжает.
+            let _ = client_tx.send(StreamItem { seq: persisted, event });
+        }
+        // Канал агента закрылся (стрим завершён) — resubscriber'ы получают
+        // Closed из hub и понимают, что live-хвоста больше не будет.
+        if let Some(task_id) = known_task {
+            hub.close(&task_id).await;
+        }
+    });
+    client_rx
+}
+
 /// ДОБАВЛЕНО (Часть 1 роадмапа стриминга, задача D): рендерит готовый
 /// поток A2aEvent в HTTP SSE-ответ (text/event-stream). Контракт seam
 /// Reply<T,U>: транспорт не знает про ACP SessionUpdate — он получает
@@ -465,33 +613,194 @@ pub fn http_status_to_sdk_name(status: StatusCode) -> &'static str {
 /// стримов агента до закрытия потока (RAII-паттерн, как у TurnGuard) —
 /// map-замыкание захватывает permit по move, и он дропается вместе со
 /// стримом.
+///
+/// ДОБАВЛЕНО (Фаза 3.2): источник — relay-таск (spawn_stream_relay), а не
+/// канал агента напрямую. seq из персистенции уходит клиенту в SSE
+/// `id:`-поле: клиент запоминает последний обработанный id и при
+/// reconnect шлёт его как after_seq. События без seq (не персистены) идут
+/// без id.
 fn stream_to_sse(
-    rx: tokio::sync::mpsc::UnboundedReceiver<protocol::a2a::A2aEvent>,
+    rx: tokio::sync::mpsc::UnboundedReceiver<StreamItem>,
     permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
-    let stream = UnboundedReceiverStream::new(rx).map(move |event| {
+    let stream = UnboundedReceiverStream::new(rx).map(move |item| {
         // permit удерживается живым в этом замыкании на весь стрим.
         let _ = &permit;
-        // A2aEvent сериализуется по спеке (серde) — клиент читает тот же
-        // JSON, что и в JSON-RPC result, только по событию за раз.
-        Ok(Event::default()
-            .json_data(event)
-            .expect("A2aEvent сериализуется"))
+        let mut ev = Event::default()
+            .json_data(item.event)
+            .expect("A2aEvent сериализуется");
+        if let Some(seq) = item.seq {
+            ev = ev.id(seq.to_string());
+        }
+        Ok(ev)
     });
     Sse::new(stream)
 }
 
+/// task_id из A2aEvent для персистенции в event_log. Message не несёт
+/// task_id — такие события не буферизуются.
+fn event_task_id(event: &protocol::a2a::A2aEvent) -> Option<String> {
+    match event {
+        protocol::a2a::A2aEvent::TaskStatusUpdate { task_id, .. }
+        | protocol::a2a::A2aEvent::TaskArtifactUpdate { task_id, .. } => {
+            Some(task_id.0.clone())
+        }
+        protocol::a2a::A2aEvent::Message(_) => None,
+    }
+}
+
+/// ДОБАВЛЕНО (Фаза 3.2, T4/resubscribe live): SSE-поток продолжения
+/// стрима. Две фазы:
+/// 1. История — события с seq > after_seq из durable event_log (replay).
+/// 2. Live — после исчерпания истории подписка на per-task hub
+///    (spawn_stream_relay публикует сюда каждое событие). Отдаём только
+///    события с seq > последнего отданного (дедуп: история и live могут
+///    пересекаться на границе). broadcast переполнился (Lagged) — повторно
+///    читаем durable-историю с последнего seq (catch-up) и продолжаем live.
+/// Закрытие канала агента (стрим завершён) — hub.close, подписчик
+/// получает Closed и поток завершается.
+async fn resubscribe_stream(
+    log: Arc<EventLog>,
+    hub: Arc<StreamHub>,
+    task_id: String,
+    after_seq: u64,
+) -> anyhow::Result<futures_util::stream::BoxStream<'static, Result<Event, Infallible>>> {
+    // Состояние unfold-машины. Фазы:
+    //  queue непуст  -> отдаём историю (из durable event_log, seq > after_seq);
+    //  queue пуст    -> переключаемся на live-подписку hub (не трогаем её,
+    //                   пока история не исчерпана);
+    //  live закрыт   -> стрим завершён, поток закрываем.
+    struct State {
+        queue: std::collections::VecDeque<EventRecord>,
+        live: Option<broadcast::Receiver<(u64, protocol::a2a::A2aEvent)>>,
+        last_seq: u64,
+        hub: Arc<StreamHub>,
+        log: Arc<EventLog>,
+        task_id: String,
+    }
+
+    // История читается ДО построения стрима — первый элемент отдаётся без
+    // латентной подписки, и live-фаза не стартует раньше наличия истории.
+    let history: Vec<EventRecord> = log.events_after(&task_id, after_seq, 10_000).await?;
+    let last_seq = history.last().map(|r| r.seq).unwrap_or(after_seq);
+
+    let state = State {
+        queue: history.into_iter().collect(),
+        live: None,
+        last_seq,
+        hub,
+        log,
+        task_id,
+    };
+
+    let stream = futures_util::stream::unfold(state, |mut st| async move {
+        loop {
+            // 1) История: пока есть записи, отдаём их (источник истины).
+            if let Some(rec) = st.queue.pop_front() {
+                st.last_seq = rec.seq;
+                return Some((Ok(event_from_record(&rec)), st));
+            }
+            // 2) Live: история исчерпана — подписываемся на hub один раз.
+            if st.live.is_none() {
+                st.live = st.hub.subscribe(&st.task_id).await;
+                // hub.subscribe == None: для задачи нет активного стрима
+                // (релей не стартовал или закрылся) — live-хвоста не будет.
+                if st.live.is_none() {
+                    return None;
+                }
+            }
+            // 3) События live с дедупом по seq (граница история/live может
+            //    пересекаться) и catch-up при Lagged.
+            let rx = st.live.as_mut().expect("live подписка есть");
+            match rx.recv().await {
+                Ok((seq, event)) if seq > st.last_seq => {
+                    st.last_seq = seq;
+                    return Some((
+                        Ok(Event::default()
+                            .json_data(event)
+                            .expect("A2aEvent сериализуется")
+                            .id(seq.to_string())),
+                        st,
+                    ));
+                }
+                // Дубликат на границе история/live — пропускаем.
+                Ok(_) => {}
+                // broadcast переполнен — catch-up через durable историю:
+                // читаем всё, что потеряли, и продолжаем live.
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::info!(
+                        task_id = %st.task_id,
+                        lagged = n,
+                        "resubscribe: broadcast переполнен — catch-up из event_log"
+                    );
+                    match st.log.events_after(&st.task_id, st.last_seq, 10_000).await {
+                        Ok(caught) => {
+                            st.queue = caught.into_iter().collect();
+                            st.live = None;
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                task_id = %st.task_id,
+                                error = %e,
+                                "resubscribe: catch-up чтение event_log"
+                            );
+                            return None;
+                        }
+                    }
+                }
+                // Стрим завершён (релей закрыл канал задачи) — конец потока.
+                Err(broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    });
+    Ok(stream.boxed())
+}
+
+/// Сериализует EventRecord из durable event_log в SSE-фрейм с id=seq.
+/// Битое событие не роняет поток — идёт явный маркер ошибки.
+fn event_from_record(rec: &EventRecord) -> Event {
+    match serde_json::from_str::<protocol::a2a::A2aEvent>(&rec.event_json) {
+        Ok(ev) => Event::default()
+            .json_data(ev)
+            .expect("A2aEvent сериализуется")
+            .id(rec.seq.to_string()),
+        Err(e) => {
+            tracing::warn!(
+                task_id = %rec.task_id,
+                seq = rec.seq,
+                error = %e,
+                "resubscribe: битое событие в event_log"
+            );
+            Event::default()
+                .json_data(json!({ "error": "corrupt event in event_log" }))
+                .expect("json сериализуется")
+                .id(rec.seq.to_string())
+        }
+    }
+}
+
 /// Результат диспетчера: либо синхронный JSON (Complete), либо поток SSE
-/// (Streaming). rpc_handler рендерит по варианту.
+/// (Streaming), либо replay+live из event_log/hub (Resubscribe).
 enum DispatchResult {
     Json(Value),
     Streaming(tokio::sync::mpsc::UnboundedReceiver<protocol::a2a::A2aEvent>),
+    /// ДОБАВЛЕНО (Фаза 3): готовый SSE-поток для tasks/resubscribe —
+    /// сначала история из durable event_log (seq > after_seq), затем
+    /// live-продолжение из per-task hub (Фаза 3.2).
+    Resubscribe(
+        futures_util::stream::BoxStream<
+            'static,
+            Result<Event, Infallible>,
+        >,
+    ),
 }
 
 async fn dispatch_a2a_method(
     adapter: &Arc<AcpAsA2a<SupervisedStdioAgent>>,
     owner: Owner,
     request: &JsonRpcRequest,
+    event_log: Option<Arc<EventLog>>,
+    stream_hub: Arc<StreamHub>,
 ) -> anyhow::Result<DispatchResult> {
     match request.method.as_str() {
         "message/send" => {
@@ -548,6 +857,56 @@ async fn dispatch_a2a_method(
                 .cancel_task_as(owner, TaskId(id.to_string()))
                 .await?;
             Ok(DispatchResult::Json(serde_json::to_value(task)?))
+        }
+
+        // ДОБАВЛЕНО (Фаза 3 буферного конфига, T4/resubscribe): продолжение
+        // стрима после разрыва соединения. Клиент передаёт последний
+        // обработанный seq (after_seq). Сначала сервер отдаёт историю из
+        // durable event_log (события с seq > after_seq, по возрастанию),
+        // затем — ДОБАВЛЕНО (Фаза 3.2) — live-продолжение из per-task hub:
+        // если стрим задачи ещё жив, новые события приходят вживую сразу
+        // после replay. Если event_log выключен в конфиге — ошибка:
+        // восстановить не из чего, лучше честный отказ, чем тихая пустота.
+        "tasks/resubscribe" => {
+            let log = event_log.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("tasks/resubscribe: event_log не включён в конфиге")
+            })?;
+            let id = request
+                .params
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("tasks/resubscribe: id обязателен"))?;
+            let after_seq = request
+                .params
+                .get("after_seq")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let stream = resubscribe_stream(
+                log.clone(),
+                stream_hub.clone(),
+                id.to_string(),
+                after_seq,
+            )
+            .await?;
+            Ok(DispatchResult::Resubscribe(stream))
+        }
+
+        // ДОБАВЛЕНО (Фаза 3): клиент перед reconnect может спросить
+        // последний маркер задачи. Ответ — { "seq": N, "task_id": "..." }.
+        "tasks/get-last-seq" => {
+            let log = event_log.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("tasks/get-last-seq: event_log не включён в конфиге")
+            })?;
+            let id = request
+                .params
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("tasks/get-last-seq: id обязателен"))?;
+            let seq = log.last_seq(id).await?;
+            Ok(DispatchResult::Json(json!({
+                "task_id": id,
+                "seq": seq,
+            })))
         }
 
         "CancelTask" => {

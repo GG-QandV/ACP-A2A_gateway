@@ -1,5 +1,8 @@
 # Гайд по гатевею: что это, как запустить, как подключать агентов
 
+> **English version**: [docs/06-gateway-guide-en.md](06-gateway-guide-en.md) ·
+> **Українська версія**: [docs/06-gateway-guide-uk.md](06-gateway-guide-uk.md)
+
 Репо: `GG-QandV/ACP-A2A_gateway` (Rust workspace: `protocol`, `gateway-core`, `gatewayd`).
 
 Гатевей — прослойка между ACP-агентами (claurst, hermes, opencode) и A2A-клиентами
@@ -24,7 +27,7 @@
 rustc --version   # нужно 1.80+ (зависимости: openssl, native-tls)
 cargo build --workspace
 cargo check --workspace --all-targets
-cargo test --workspace          # 69 тестов (после prod-final, P2-12)
+cargo test --workspace          # 151 тест (Фазы 1–7, включая CLI/журнал/апрувы)
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
@@ -93,6 +96,24 @@ ACP-режим у агентов включается **подкомандой**
   `type` (не `kind`): `{"type":"text","text":"..."}`.
 - claurst env: `CLAURST_DISABLE_MODELS_FETCH=1` (не ходить за списком моделей),
   `CLAURST_SHARE_NO_OPEN=1` (не открывать браузер).
+
+## 4a. CLI-команды (Rust-модули, без внешнего sqlite3)
+
+```bash
+gatewayd config.yaml                     # запуск гейтвея
+
+gatewayd --journal [--limit N] [--level info|warn|error] [--category NAME] \
+         [--since 10m|6h|1d|2w|1mo] [--db PATH]
+# просмотр durable-журнала ASCII-таблицей (алерты, обрывы, апрувы), время в UTC
+
+gatewayd --approvals                     # статусы агентов + фингерпринты
+gatewayd --approve <name>                # одобрить агента (обслуживается после рестарта)
+gatewayd --reject <name>                 # отклонить агента
+# неодобренный агент не обслуживается (HTTP 404 unknown agent_id) и пишется
+# в журнал (category "approval")
+
+gatewayd --setup                         # интерактивный мастер генерации конфига
+```
 
 ## 5. Протокол: ACP-клиент → гатевей (направления 1 и 3, TCP)
 
