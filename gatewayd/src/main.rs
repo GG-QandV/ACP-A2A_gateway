@@ -7,11 +7,18 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::Context;
+use gatewayd::approvals::Status;
+use gatewayd::config::{ApprovalsConfig, EventLogConfig, HealthConfig, JournalConfig, TaskStoreConfig};
+use gatewayd::health::DbTarget;
+use gatewayd::journal::Journal;
 use gatewayd::registry::{AgentEntry, Registry, Transport};
 use gatewayd::{transport_a2a_passthrough, transport_http, transport_tcp};
 use serde::Deserialize;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
+
+mod cli;
+mod setup;
 
 #[derive(Debug, Deserialize)]
 struct RawConfig {
@@ -40,6 +47,27 @@ struct RawConfig {
     /// и ротации. Отсутствие секции = дефолт "stdout" (прежнее поведение).
     #[serde(default)]
     logging: LoggingConfig,
+    /// ДОБАВЛЕНО (Фаза 1 буферного конфига): durable-буфер событий стрима
+    /// (источник истины для tasks/resubscribe, T4). Отсутствие секции =
+    /// выключено (прежнее поведение).
+    #[serde(default)]
+    event_log: EventLogConfig,
+    /// ДОБАВЛЕНО (Фаза 1 буферного конфига): durable-хранилище задач.
+    /// Отсутствие секции = прежнее файловое хранилище.
+    #[serde(default)]
+    task_store: TaskStoreConfig,
+    /// ДОБАВЛЕНО (Фаза 5): durable-журнал событий для пользователя
+    /// (health-алерты, обрывы стримов, апрувы). Отсутствие секции = выключено.
+    #[serde(default)]
+    journal: JournalConfig,
+    /// ДОБАВЛЕНО (Фаза 5): health-мониторинг — периодическая проверка
+    /// размеров БД и занятости стримов. Отсутствие секции = выключено.
+    #[serde(default)]
+    health: HealthConfig,
+    /// ДОБАВЛЕНО (Фаза 7, approvals): человеческий апрув агентов через CLI.
+    /// Отсутствие секции = выключено (все агенты допускаются).
+    #[serde(default)]
+    approvals: ApprovalsConfig,
 }
 
 /// Часть 4 роадмапа стриминга: логирование. `level: "off"` полностью
@@ -205,7 +233,10 @@ fn resolve_env_placeholders(value: &str) -> anyhow::Result<String> {
     }
 }
 
-fn build_registry(raw: &RawConfig) -> anyhow::Result<Registry> {
+fn build_registry(
+    raw: &RawConfig,
+    allowed: &std::collections::HashSet<String>,
+) -> anyhow::Result<(Registry, Vec<String>)> {
     // ДОБАВЛЕНО (аудит P1-10): пустой токен в списке = открытый вход для
     // клиента, приславшего "". Ловим на старте, а не в проде.
     if raw.tokens.is_empty() || raw.tokens.iter().any(|t| t.trim().is_empty()) {
@@ -218,7 +249,12 @@ fn build_registry(raw: &RawConfig) -> anyhow::Result<Registry> {
         .collect::<anyhow::Result<_>>()?;
 
     let mut agents: HashMap<String, AgentEntry> = HashMap::new();
+    let mut excluded: Vec<String> = Vec::new();
     for (id, entry) in &raw.agents {
+        if !allowed.contains(id) {
+            excluded.push(id.clone());
+            continue;
+        }
         let streaming = match entry {
             RawAgentEntry::Stdio { streaming, .. } | RawAgentEntry::Http { streaming, .. } => {
                 streaming
@@ -268,7 +304,20 @@ fn build_registry(raw: &RawConfig) -> anyhow::Result<Registry> {
         );
     }
 
-    Ok(Registry::new(tokens, agents))
+    Ok((Registry::new(tokens, agents), excluded))
+}
+
+/// Agent fingerprint for approvals: what exactly is approved. Changes when
+/// transport/command/cwd/url changes — then re-approval is required.
+fn agent_fingerprint(entry: &RawAgentEntry) -> String {
+    match entry {
+        RawAgentEntry::Stdio { command, cwd, .. } => format!(
+            "stdio:{}:{}",
+            command.join(" "),
+            cwd.as_deref().unwrap_or("")
+        ),
+        RawAgentEntry::Http { url, .. } => format!("http:{url}"),
+    }
 }
 
 /// Обходит подкаталоги хранилища (по одному на agent_id) и убирает
@@ -292,17 +341,77 @@ async fn sweep_all_agents(base_dir: &PathBuf, ttl: std::time::Duration) -> anyho
     Ok(removed)
 }
 
+/// ДОБАВЛЕНО (Фаза 1 буферного конфига): инициализация durable-БД
+/// (event_log, task_store) на старте. Создаёт каталог и файл sqlite;
+/// пустую схему наполняет Фаза 2 (EventLog). Отключённая секция — no-op.
+/// Ошибка здесь фатальна: включённый в конфиге буфер, который не смог
+/// подняться, не должен тихо молчать.
+fn init_buffer_dbs(event_log: &EventLogConfig, task_store: &TaskStoreConfig) -> anyhow::Result<()> {
+    if let Some(cfg) = event_log.enabled.then_some(event_log) {
+        init_sqlite_db(&cfg.storage_path, "event_log")?;
+    }
+    if let Some(cfg) = task_store.enabled.then_some(task_store) {
+        init_sqlite_db(&cfg.storage_path, "task_store")?;
+    }
+    Ok(())
+}
+
+fn init_sqlite_db(path: &std::path::Path, label: &str) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("не удалось создать каталог для {label}: {}", parent.display()))?;
+        }
+    }
+    let conn = rusqlite::Connection::open(path)
+        .with_context(|| format!("не удалось открыть sqlite для {label}: {}", path.display()))?;
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL;
+         PRAGMA synchronous=NORMAL;
+         PRAGMA busy_timeout=5000;",
+    )
+    .with_context(|| format!("не удалось настроить sqlite для {label}: {}", path.display()))?;
+    drop(conn);
+    tracing::info!(label, path = %path.display(), "sqlite БД инициализирована");
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let config_path = std::env::args()
-        .nth(1)
+    let mut args = std::env::args().skip(1);
+    let config_path = args
+        .next()
         .unwrap_or_else(|| "config.yaml".to_string());
+
+    // Фаза 6: интерактивный мастер настройки для пользователя.
+    // `gatewayd --setup [file.yaml]` генерирует весь конфиг с дефолтами;
+    // дев правит YAML напрямую.
+    if config_path == "--setup" {
+        return setup::run(args.next());
+    }
+
+    // Phase 7: CLI journal viewer. `gatewayd --journal [--db PATH] ...`.
+    // Works even while the gateway is stopped (read-only DB open).
+    if config_path == "--journal" {
+        return cli::run_journal(&args.collect::<Vec<_>>());
+    }
+
+    // Phase 7: agent approvals via CLI. `gatewayd --approvals [--db PATH]`,
+    // `gatewayd --approve <name> [--db PATH]`, `--reject <name> ...`.
+    if matches!(config_path.as_str(), "--approvals" | "--approve" | "--reject") {
+        return cli::run_approvals(&config_path, &args.collect::<Vec<_>>());
+    }
+
     let raw_yaml = std::fs::read_to_string(&config_path)
         .with_context(|| format!("не удалось прочитать конфиг: {config_path}"))?;
     let raw_config: RawConfig = serde_yaml::from_str(&raw_yaml)
         .with_context(|| format!("не удалось распарсить конфиг: {config_path}"))?;
 
     tracing_subscriber_init(&raw_config.logging);
+
+    // ДОБАВЛЕНО (Фаза 1 буферного конфига): поднять durable-БД до запуска
+    // транспортов — стримы, стартовавшие сразу, должны иметь куда писать.
+    init_buffer_dbs(&raw_config.event_log, &raw_config.task_store)?;
 
     let tcp_listen = raw_config.listen.clone();
     let http_listen = raw_config.http_listen.clone();
@@ -313,8 +422,32 @@ async fn main() -> anyhow::Result<()> {
     let task_ttl = std::time::Duration::from_secs(raw_config.task_retention_days * 24 * 60 * 60);
     let sweep_dir = task_store_dir.clone();
 
-    let registry = std::sync::Arc::new(build_registry(&raw_config)?);
-
+// Phase 7 (approvals): when enabled, an agent enters the Registry only
+    // after being approved via CLI. Not-approved (pending/rejected) agents are
+    // excluded — the gateway does not serve them.
+    let (registry, excluded_agents) = if raw_config.approvals.enabled {
+        let store = gatewayd::approvals::ApprovalStore::open(&raw_config.approvals.storage_path)?;
+        let mut allowed: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut pending: Vec<String> = Vec::new();
+        for (id, entry) in &raw_config.agents {
+            let fp = agent_fingerprint(entry);
+            match store.register(id, &fp)? {
+                Status::Approved => {
+                    allowed.insert(id.clone());
+                }
+                Status::Pending => pending.push(id.clone()),
+                Status::Rejected => {}
+            }
+        }
+        for id in &pending {
+            tracing::warn!(agent_id = %id, "agent awaits approval via CLI: gatewayd --approve {id}");
+        }
+        build_registry(&raw_config, &allowed)?
+    } else {
+        let all: std::collections::HashSet<String> = raw_config.agents.keys().cloned().collect();
+        build_registry(&raw_config, &all)?
+    };
+    let registry = std::sync::Arc::new(registry);
     tracing::info!(%tcp_listen, %http_listen, "starting acp-a2a gateway (dual transport, 3 directions)");
 
     let tcp_registry = registry.clone();
@@ -324,6 +457,73 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let http_registry = registry.clone();
+    // ДОБАВЛЕНО (Фаза 2/3): поднять writer-таск event_log, если секция
+    // включена в конфиге. Arc уходит в router -> HttpState -> stream_to_sse
+    // и dispatch_a2a_method (tasks/resubscribe, tasks/get-last-seq).
+    let event_log = match raw_config.event_log.enabled {
+        true => Some(gatewayd::event_log::EventLog::spawn(
+            raw_config.event_log.storage_path.clone(),
+            raw_config.event_log.max_size_mb,
+        )?),
+        false => None,
+    };
+
+    // ДОБАВЛЕНО (Фаза 5): durable-журнал событий для пользователя.
+    // Arc уходит в health-монитор (алерты) и (позже) в relay/CLI.
+    let journal = match raw_config.journal.enabled {
+        true => Some(Journal::spawn(
+            raw_config.journal.storage_path.clone(),
+            raw_config.journal.max_size_mb,
+            raw_config.journal.retention_days,
+        )?),
+        false => None,
+    };
+
+    // Phase 7 (approvals): not-approved agents are recorded in the journal.
+    for id in &excluded_agents {
+        if let Some(j) = &journal {
+            j.append(
+                gatewayd::journal::Level::Warn,
+                "approval",
+                &format!("agent {id} is not approved and will not be served (run `gatewayd --approve {id}`)"),
+            )
+            .await?;
+        }
+    }
+
+    // ДОБАВЛЕНО (Фаза 5): health-мониторинг. Цели проверки — только
+    // включённые durable-БД (event_log, task_store, journal).
+    let mut health_targets = Vec::new();
+    if raw_config.event_log.enabled {
+        health_targets.push(DbTarget {
+            label: "event_log",
+            path: raw_config.event_log.storage_path.clone(),
+            max_mb: raw_config.event_log.max_size_mb,
+        });
+    }
+    if raw_config.task_store.enabled {
+        health_targets.push(DbTarget {
+            label: "task_store",
+            path: raw_config.task_store.storage_path.clone(),
+            max_mb: raw_config.task_store.max_size_mb,
+        });
+    }
+    if raw_config.journal.enabled {
+        health_targets.push(DbTarget {
+            label: "journal",
+            path: raw_config.journal.storage_path.clone(),
+            max_mb: raw_config.journal.max_size_mb,
+        });
+    }
+    let health_monitor =
+        gatewayd::health::spawn(registry.clone(), journal.clone(), &raw_config.health, health_targets);
+    // Выключенный монитор = вечная заглушка, чтобы select не выходил
+    // преждевременно (тот же приём, что у log_monitor выше).
+    let health_task = match health_monitor {
+        Some(h) => h,
+        None => tokio::spawn(async { std::future::pending::<()>().await }),
+    };
+
     let http_server = tokio::spawn(async move {
         let direction_4 = transport_http::router(
             http_registry.clone(),
@@ -331,6 +531,7 @@ async fn main() -> anyhow::Result<()> {
             lease_timeout,
             call_timeout,
             public_url,
+            event_log,
         );
         let direction_2 = transport_a2a_passthrough::router(http_registry);
         let app = direction_4.merge(direction_2);
@@ -414,6 +615,7 @@ async fn main() -> anyhow::Result<()> {
         res = http_server => res??,
         res = sweeper => res?,
         res = log_monitor => res?,
+        res = health_task => res?,
     }
 
     Ok(())
@@ -563,7 +765,8 @@ task_store_dir: "/tmp/x"
 turn_lease_timeout_secs: 30
 "#;
         let raw: RawConfig = serde_yaml::from_str(yaml).expect("YAML парсится");
-        let err = match build_registry(&raw) {
+        let all: std::collections::HashSet<String> = raw.agents.keys().cloned().collect();
+        let err = match build_registry(&raw, &all) {
             Ok(_) => panic!("build_registry должен отклонить max_concurrent_streams=0"),
             Err(e) => e.to_string(),
         };

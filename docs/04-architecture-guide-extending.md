@@ -38,6 +38,15 @@ pub enum Reply<T, U> {
 | Multi-tenant роутинг | `gatewayd/src/tenant_router.rs` | `registry.rs`: `Registry` получает поле `tenant_id` в `AgentEntry` | `core/convert.rs` не знает о тенантах — маппинг протоколов tenant-агностичен |
 | Персистентное хранилище задач (Postgres вместо файлов) | `core/src/task_store_pg.rs` | `core/lib.rs`: `pub mod task_store_pg`; вызывающий код (`transport_http.rs`) выбирает реализацию через enum/trait | `TaskStore` (файловая) остаётся как есть — не удаляется, а становится одной из реализаций |
 
+### Уже реализованные модули (примеры прошедших расширений)
+
+| Модуль | Файл | Что добавил | Как встроен |
+|---|---|---|---|
+| Durable event buffer | `gatewayd/src/event_log.rs` | Персистентный буфер событий стрима с монотонным `seq` по задаче, `events_after(after_seq)` | Фоновый writer-таск через mpsc; `Arc` уходит в `HttpState` → `stream_to_sse`/`dispatch_a2a_method` |
+| Journal + health | `gatewayd/src/journal.rs`, `gatewayd/src/health.rs` | Durable журнал (алерты, обрывы, апрувы) + периодическая сводка размеров БД | Один фоновый writer, самоочистка по retention; просмотр — CLI-модулем |
+| Approvals | `gatewayd/src/approvals.rs` | SQLite-хранилище статусов (pending/approved/rejected), фингерпринт агента | Фильтр в `build_registry(raw, allowed)`; неодобренные исключаются и пишутся в журнал (category `approval`) |
+| Rust CLI | `gatewayd/src/cli.rs` | `--journal`, `--approvals`, `--approve/--reject`, `--setup` — без внешнего sqlite3 | Отдельные ветки в `main.rs` до старта серверов; не трогает транспорт |
+
 ## Как добавить новый транспорт (пошагово, на примере WS)
 
 1. Создать `gatewayd/src/transport_ws.rs`.
@@ -65,6 +74,31 @@ pub enum Reply<T, U> {
    файл/структура, не единый God-конвертер).
 4. Существующие `AcpAsA2a`/`A2aAsAcp` не меняются — они ничего не знают
    о существовании нового протокола.
+
+## Как добавить durable-хранилище (по образцу journal/approvals/event_log)
+
+1. Создать `gatewayd/src/<name>.rs`: `struct <Name>Store { ... }` с `open(path)`,
+   операциями записи и чтения. Таблица в SQLite (WAL) — через rusqlite, как в
+   существующих модулях. `pub struct ...` + `#[derive(Clone, Debug)]`.
+2. В `gatewayd/src/lib.rs` — `pub mod <name>;`.
+3. Секция конфига: поле в `RawConfig` (config.rs) с `#[serde(default)]`; секция
+   в `--setup` (setup.rs) и в `render()`.
+4. Встраивание: если это фоновая запись — `tokio::spawn` writer-таск с mpsc в
+   `main.rs`; если это фильтр на старте — отдельная ветка в `main()`. Не смешивать
+   с транспортом: хранилище — отдельный модуль, транспорт получает `Arc<Store>`.
+5. Тесты в том же файле: tempdir-хранилище, цикл записи/чтения, retention/cleanup.
+
+## Как добавить CLI-команду (по образцу cli.rs)
+
+1. В `main.rs` — новая ветка разбора аргументов: `--<cmd>` → `cli::run_<cmd>(...)`.
+   CLI-ветки отрабатывают **до** старта TCP/HTTP-серверов.
+2. В `cli.rs` — `pub fn run_<cmd>(args: &[String]) -> anyhow::Result<()>`.
+   Аргументы парсить вручную (`--db PATH`, позиционные), без clap — проект не
+   зависит от clap.
+3. Вывод — ASCII-таблица с `unix_to_utc` (время в UTC) и truncate длинных полей;
+   только английский текст (интерфейс шлюза — English).
+4. Юнит-тесты на парсинг/форматтеры в том же файле; e2e — ручной прогон бинаря
+   против реального SQLite из `/tmp/gateway/`.
 
 ## Антипаттерны — чего НЕ делать при расширении
 

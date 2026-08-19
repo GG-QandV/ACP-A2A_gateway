@@ -1,0 +1,76 @@
+# config.loc.buffer.yaml — локальный конфиг буфера (Фаза 1).
+# Рабочий конфиг шлюза для разработки/локального запуска стриминга
+# с durable-буфером событий. Плюс к базовым секциям (как config.example.yaml)
+# включает event_log + task_store на SQLite.
+#
+# Запуск: gatewayd config.loc.buffer.yaml
+# Проверка после старта: ls -la /tmp/gateway/ → event_log.db, task_store.db
+
+listen: "0.0.0.0:8347"
+http_listen: "0.0.0.0:8348"
+
+tokens:
+  - "t-dev-local-001"
+
+agents:
+  claurst-main:
+    transport: stdio
+    command: ["claurst", "acp"]
+    cwd: "."
+
+public_url: "http://localhost:8348"
+
+task_store_dir: "/tmp/gateway/tasks"
+task_retention_days: 7
+turn_lease_timeout_secs: 30
+agent_call_timeout_secs: 120
+
+# --- Буферный конфиг (Фаза 1) ---
+
+# Durable-буфер событий стрима: источник истины для tasks/resubscribe (T4).
+# Каждое A2aEvent/StreamEvent пишется с монотонным seq (по задаче) в sqlite.
+event_log:
+  enabled: true
+  storage_backend: sqlite
+  storage_path: /tmp/gateway/event_log.db
+  max_size_mb: 100
+
+# Durable-хранилище задач. enabled: true переключает с файлового
+# TaskStore (core/src/task_store.rs) на sqlite.
+task_store:
+  enabled: true
+  storage_backend: sqlite
+  storage_path: /tmp/gateway/task_store.db
+  max_size_mb: 500
+
+# --- Фаза 5: журнал + health-мониторинг ---
+
+# Durable-журнал событий для пользователя: health-алерты, обрывы стримов,
+# апрувы. Один фоновый writer-таск, самоочистка по retention_days и
+# max_size_mb. Просмотр — позже CLI-модулем (не через внешний sqlite3).
+journal:
+  enabled: true
+  storage_backend: sqlite
+  storage_path: /tmp/gateway/journal.db
+  max_size_mb: 100
+  retention_days: 30
+
+# Health-мониторинг: периодическая сводка размеров БД (event_log,
+# task_store, journal) и занятости слотов стримов. Алерты по занятости
+# БД пишутся в журнал + tracing; сводка — каждые check_interval_secs.
+health:
+  enabled: true
+  check_interval_secs: 300
+  db_size_warn_pct: 80
+
+# --- Фаза 7: апрув агентов через CLI ---
+
+# Человеческий контроль над тем, кого гейтвей обслуживает. Новый агент из
+# config.yaml попадает в статус pending и НЕ запускается, пока не одобрен:
+#   gatewayd --approvals          # список статусов
+#   gatewayd --approve <name>     # одобрить
+#   gatewayd --reject <name>      # отклонить
+# Если command/cwd/url агента меняется — нужен повторный апрув.
+approvals:
+  enabled: true
+  storage_path: /tmp/gateway/approvals.db
