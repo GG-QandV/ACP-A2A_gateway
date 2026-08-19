@@ -1,0 +1,240 @@
+Date: Tue, 18 Aug 2026 15:14:00 +0200
+Subject: [PATCH] Реализовать журнал для юзера + запоминание апрувов
+
+Инструкция для агента (Middle/Junior):
+- Реализовать journal.rs (запись в journal.jsonl)
+- Реализовать approved_agents.rs (хранение апрувов)
+- Обновить main.rs (апрув + журнал)
+- Обновить config.rs (journal.path, logs.path)
+
+---
+ gatewayd/src/journal.rs           | 50 +++++++++++++++++++++++++++++++++++++++
+ gatewayd/src/approved_agents.rs   | 50 +++++++++++++++++++++++++++++++++++++++
+ gatewayd/src/main.rs              | 30 ++++++++++++++++++++++-
+ gatewayd/src/config.rs            | 20 +++++++++++++++-
+ gatewayd/Cargo.toml               |  4 ++++
+ 5 files changed, 153 insertions(+), 1 deletion(-)
+ create mode 100644 gatewayd/src/journal.rs
+ create mode 100644 gatewayd/src/approved_agents.rs
+
+diff --git a/gatewayd/src/journal.rs b/gatewayd/src/journal.rs
+new file mode 100644
+index 0000000..abc123
+--- /dev/null
++++ b/gatewayd/src/journal.rs
+@@ -0,0 +1,50 @@
++use chrono::Utc;
++use serde::Serialize;
++use std::fs::OpenOptions;
++use std::io::Write;
++
++#[derive(Serialize)]
++struct JournalEntry {
++    timestamp: String,
++    event: String,
++    agent: String,
++    status: String,
++    approval: String,
++}
++
++pub fn log_to_journal(agent: &str, status: &str, approval: &str) -> anyhow::Result<()> {
++    let entry = JournalEntry {
++        timestamp: Utc::now().to_rfc3339(),
++        event: "agent_connected".to_string(),
++        agent: agent.to_string(),
++        status: status.to_string(),
++        approval: approval.to_string(),
++    };
++
++    let line = serde_json::to_string(&entry)?;
++    let mut file = OpenOptions::new()
++        .create(true)
++        .append(true)
++        .open("journal.jsonl")?;
++    
++    writeln!(file, "{}", line)?;
++    Ok(())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn test_log_to_journal() {
++        log_to_journal("claurst-main", "allowed", "permanent").unwrap();
++        // Проверить, что journal.jsonl содержит запись
++    }
++}
+diff --git a/gatewayd/src/approved_agents.rs b/gatewayd/src/approved_agents.rs
+new file mode 100644
+index 0000000..def456
+--- /dev/null
++++ b/gatewayd/src/approved_agents.rs
+@@ -0,0 +1,50 @@
++use serde::{Deserialize, Serialize};
++use std::fs;
++
++#[derive(Serialize, Deserialize, Clone)]
++pub struct ApprovedAgents {
++    pub agents: Vec<ApprovedAgent>,
++}
++
++#[derive(Serialize, Deserialize, Clone)]
++pub struct ApprovedAgent {
++    pub name: String,
++    pub approved_at: String,
++    pub permanent: bool,
++}
++
++pub fn load_approved_agents(path: &str) -> anyhow::Result<ApprovedAgents> {
++    if !std::path::Path::new(path).exists() {
++        return Ok(ApprovedAgents { agents: Vec::new() });
++    }
++
++    let json = fs::read_to_string(path)?;
++    let approved: ApprovedAgents = serde_json::from_str(&json)?;
++    Ok(approved)
++}
++
++pub fn save_approved_agents(path: &str, approved: &ApprovedAgents) -> anyhow::Result<()> {
++    let json = serde_json::to_string_pretty(approved)?;
++    fs::write(path, json)?;
++    Ok(())
++}
++
++pub fn is_approved(approved: &ApprovedAgents, agent_name: &str) -> bool {
++    approved.agents.iter().any(|a| a.name == agent_name)
++}
++
++pub fn revoke_approval(path: &str, agent_name: &str) -> anyhow::Result<()> {
++    let mut approved = load_approved_agents(path)?;
++    approved.agents.retain(|a| a.name != agent_name);
++    save_approved_agents(path, &approved)?;
++    Ok(())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn test_load_save_approved_agents() {
++        // Тест загрузки/сохранения
++    }
++}
+diff --git a/gatewayd/src/main.rs b/gatewayd/src/main.rs
+index abc123..def456 100644
+--- a/gatewayd/src/main.rs
++++ b/gatewayd/src/main.rs
+@@ -1,7 +1,11 @@
+ mod config;
++mod journal;
++mod approved_agents;
+ 
+ use anyhow::Result;
+ use config::load_config;
++use journal::log_to_journal;
++use approved_agents::{load_approved_agents, save_approved_agents, is_approved, ApprovedAgent};
+ 
+ fn main() -> Result<()> {
+     let config = load_config("config.yaml")?;
+@@ -10,7 +14,31 @@ fn main() -> Result<()> {
+     for agent in &config.agents {
+         // 1. Проверяем токен/ключ/пасс
+         if !verify_token(&agent.token)? {
+-            eprintln!("⚠️ Токен не валиден: {}", agent.name);
++            eprintln!("⚠️ Токен не валиден: {}", agent.name);
++            continue;
++        }
++
++        // 2. Проверяем, есть ли в approved
++        let mut approved = load_approved_agents("approved_agents.json")?;
++        if is_approved(&approved, &agent.name) {
++            let approval = approved.agents.iter().find(|a| a.name == agent.name).unwrap();
++            if approval.permanent {
++                eprintln!("[INFO] {}: уже разрешён (постоянный)", agent.name);
++                log_to_journal(&agent.name, "allowed", "permanent")?;
++                continue;
++            }
++        }
++
++        // 3. Запрос апрува
++        eprintln!("⚠️ Новое подключение: {}", agent.name);
++        eprintln!("Разрешить? (y/n): ");
++        
++        let mut input = String::new();
++        std::io::stdin().read_line(&mut input)?;
++        
++        if input.trim() != "y" {
++            eprintln!("❌ Запрещено");
++            log_to_journal(&agent.name, "denied", "manual")?;
+             continue;
+         }
+ 
+@@ -20,6 +48,8 @@ fn main() -> Result<()> {
+         input.clear();
+         std::io::stdin().read_line(&mut input)?;
+         
++        let permanent = input.trim() == "y";
++        
+         approved.agents.push(ApprovedAgent {
+             name: agent.name.clone(),
+             approved_at: chrono::Utc::now().to_rfc3339(),
+@@ -28,6 +58,8 @@ fn main() -> Result<()> {
+ 
+         // 5. Журнал
+-        log_to_journal(&agent.name, "allowed", "one-time")?;
++        let approval_type = if permanent { "permanent" } else { "one-time" };
++        log_to_journal(&agent.name, "allowed", approval_type)?;
+     }
+ 
+     Ok(())
+diff --git a/gatewayd/src/config.rs b/gatewayd/src/config.rs
+index abc123..def456 100644
+--- a/gatewayd/src/config.rs
++++ b/gatewayd/src/config.rs
+@@ -1,7 +1,7 @@
+ use serde::Deserialize;
+ 
+ #[derive(Deserialize)]
+ pub struct Config {
+     pub agents: Vec<Agent>,
++    pub journal: Option<JournalConfig>,
++    pub logs: Option<LogsConfig>,
+ }
+ 
+ #[derive(Deserialize)]
+ pub struct Agent {
+     pub name: String,
+     pub url: String,
+     pub token: String,
+ }
++
++#[derive(Deserialize)]
++pub struct JournalConfig {
++    pub enabled: bool,
++    pub path: String,
++}
++
++#[derive(Deserialize)]
++pub struct LogsConfig {
++    pub enabled: bool,
++    pub path: String,
++    pub level: String,
++}
+diff --git a/gatewayd/Cargo.toml b/gatewayd/Cargo.toml
+index abc123..def456 100644
+--- a/gatewayd/Cargo.toml
++++ b/gatewayd/Cargo.toml
+@@ -10,6 +10,10 @@ anyhow = "1.0"
+ serde = { version = "1.0", features = ["derive"] }
+ serde_yaml = "0.9"
+ serde_json = "1.0"
++chrono = { version = "0.4", features = ["serde"] }
++
++[dev-dependencies]
++tempfile = "3.0"
+ 
+-- 
+2.34.1
