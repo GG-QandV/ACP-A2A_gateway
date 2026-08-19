@@ -178,7 +178,7 @@ pub fn query_recent(path: &Path, filter: &JournalFilter) -> anyhow::Result<Vec<J
         params.push((cutoff as i64).into());
     }
     sql.push_str(" ORDER BY id DESC LIMIT ?");
-    params.push((filter.limit.unwrap_or(20).min(1000).max(1) as i64).into());
+    params.push((filter.limit.unwrap_or(20).clamp(1, 1000) as i64).into());
 
     let mut stmt = conn
         .prepare(&sql)
