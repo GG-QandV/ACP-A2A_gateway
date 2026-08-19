@@ -2,13 +2,20 @@
 
 ## Открытые
 
-### 2026-08-18: tasks/resubscribe не реализован (Фаза 2.1)
-- **Что**: клиент, отвалившийся посреди стрима, не может переподключиться к уже идущей задаче — канал эфемерный, закрывается сразу после отключения.
-- **Почему**: оставлено на Фазу 2.1 — требует персистентного буфера событий с seq-номерами в TaskStore, другая структура хранения (Р-22, `decisions-p20-streaming-implemented.md`).
-- **Impact**: medium — стриминг работает для happy path, но не переживает разрыв соединения.
-- **Fix**: `broadcast::channel` или event-log в TaskStore с `after_seq`, по образцу `driver_http_sse.rs` в agent-connector. Совместно с фиксом «continue по contextId таймаутит» (уже закрыт — см. ниже).
+### 2026-08-19: юнит-покрытие 5 вариантов `SessionUpdate` (критерий 1.2) — 0 тестов
+- **Что**: маппинг `SessionUpdate → A2aEvent` в конвертерах не покрыт юнит-тестами на каждый из 5 вариантов enum (`AgentMessageChunk`, `ToolCall`, `ToolCallUpdate`, `Plan`, `UsageUpdate`) — untested variant = молчаливая потеря информации при расширении протокола.
+- **Impact**: low-medium — стриминг работает на happy path, но регрессия маппинга не ловится тестами.
+- **Fix**: юнит-тесты в `core/src/convert.rs` по каждому варианту (см. `docs/streaming-roadmap-checklist.md`, критерий 1.2).
+
+### 2026-08-19: `tasks/resubscribe` — только HTTP, TCP line-протокол без RPC
+- **Что**: `tasks/resubscribe` и `tasks/get-last-seq` реализованы для HTTP (направление 4, `transport_http.rs`); TCP line-протокол (направление 3) не имеет resubscribe RPC — клиент, отвалившийся от TCP-стрима, переподключается только новым `session/prompt`.
+- **Impact**: low — resubscribe нужен HTTP-клиентам; TCP-направление работает без него.
+- **Fix**: по запросу — добавить `tasks/resubscribe` в TCP-транспорт (опционально).
 
 ## Закрыто
+
+### 2026-08-19: tasks/resubscribe не реализован (Фаза 2.1 → реализован Phase 3.2)
+- **Закрыто**: durable event buffer (`gatewayd/src/event_log.rs`, монотонный per-task `seq`), `tasks/get-last-seq` + `tasks/resubscribe` в `transport_http.rs` (replay из event log как SSE-стрим) — клиент, отвалившийся посреди стрима, переподключается к идущей задаче через HTTP. См. коммит b9c0b8b.
 
 ### 2026-08-18: хеш токена — HMAC-SHA256 (коммит a970dcd)
 - **Закрыто**: `RandomState` заменён на HMAC-SHA256 с ключом из `{env:GATEWAY_HMAC_KEY}` (дефолт `default-dev-key-do-not-use-in-prod` для разработки). Криптографический хеш, формат `Owner::Token { hash: u64 }` не изменился — `StoredTask` без миграции. Прода: обязательно задать ключ через env.
@@ -20,7 +27,7 @@
 - **Закрыто**: `ensure_session` уже возвращал существующую сессию (аудиты P1-1/P2-10), добавлен интеграционный тест `second_message_send_same_context_returns_same_session`.
 
 ### 2026-08-18: стриминг в конвертерах — Фаза 2.0 (коммиты af9c9d9, 1ee5574, 36745ac, 1e2de5d, da3749f, a970dcd)
-- **Закрыто**: `Reply::Streaming` реализован через `prompt_streaming()` (Р-20/Р-21). Транспорт: SSE (HTTP, направление 4) + построчный TCP (направление 3, SSE-клиент — см. T4). Лимит `max_concurrent_streams` (Semaphore per-agent, try_acquire_stream в HTTP+TCP, fail-closed). Раздельные first/idle_chunk_timeout в стрим-цикле. Логирование с ротацией (tracing-appender). Тесты T1-T9 + negative control + Р-23/Р-24 + hash HMAC. 124 теста, clippy -D warnings чисто. `tasks/resubscribe` — Фаза 2.1 (см. открытое).
+- **Закрыто**: `Reply::Streaming` реализован через `prompt_streaming()` (Р-20/Р-21). Транспорт: SSE (HTTP, направление 4) + построчный TCP (направление 3, SSE-клиент — см. T4). Лимит `max_concurrent_streams` (Semaphore per-agent, try_acquire_stream в HTTP+TCP, fail-closed). Раздельные first/idle_chunk_timeout в стрим-цикле. Логирование с ротацией (tracing-appender). Тесты T1-T9 + negative control + Р-23/Р-24 + hash HMAC. 151 тест, clippy -D warnings чисто. `tasks/resubscribe` закрыт отдельной записью выше.
 
 ### 2026-08-09: сессии без session/new копились в HashMap (P2-8)
 - **Закрыто**: сессия только через `session/new`, `prompt` отклоняет неизвестный sessionId до acquire, `cancel` освобождает лиз, TTL-выселение, потолок `MAX_SESSIONS_PER_CONNECTION = 256`.
