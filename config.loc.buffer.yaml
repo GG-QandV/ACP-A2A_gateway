@@ -11,12 +11,20 @@ http_listen: "0.0.0.0:8348"
 
 tokens:
   - "t-dev-local-001"
+  - "t-hermes-001"
 
 agents:
   claurst-main:
     transport: stdio
     command: ["/home/gg/.local/bin/claurst", "acp"]
     cwd: "/home/gg/projects/AGENTS/ACP-A2A_gateway"
+  hermes:
+    transport: stdio
+    command: ["/home/gg/.local/bin/hermes", "acp"]
+    cwd: "/home/gg/projects/HERMES"
+    streaming:
+      first_chunk_timeout_secs: 90
+      idle_chunk_timeout_secs: 120
 
 public_url: "http://localhost:8348"
 
@@ -24,6 +32,7 @@ task_store_dir: "/tmp/gateway/tasks"
 task_retention_days: 7
 turn_lease_timeout_secs: 30
 agent_call_timeout_secs: 120
+
 
 # --- Буферный конфиг (Фаза 1) ---
 
