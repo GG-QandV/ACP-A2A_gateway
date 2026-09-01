@@ -2,6 +2,8 @@
 
 A gateway layer between **ACP agents** (claurst, hermes, opencode) and **A2A clients** (external services, other agents). It listens on two ports (TCP + HTTP), serves four directions, issues tokens, and isolates conversations between clients. Includes streaming with a durable event buffer, a journal, health monitoring, and agent approval via CLI.
 
+**Version:** 1.1.2 — release notes in [CHANGELOG.md](CHANGELOG.md). The version lives once in the root `Cargo.toml` (`[workspace.package]`) and is inherited by the `protocol`, `gateway-core` and `gatewayd` crates.
+
 ## Directions
 
 | # | Incoming side | Agent | Transport | Port/route |

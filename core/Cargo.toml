@@ -2,8 +2,8 @@
 # из extern prelude -> error[E0659]: `core` is ambiguous в gatewayd.
 [package]
 name = "gateway-core"
-version = "1.0.2"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
 
 [lib]
 name = "gateway_core"
