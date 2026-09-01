@@ -1,17 +1,17 @@
 //! protocol/src/a2a_sdk_compat.rs
 //!
-//! Совместимость с JSON-RPC слоем официального SDK a2a-rs. Два направления:
-//! 1. Вход: params.message в SDK-форме (role: ROLE_USER, part: {text}) нужно
-//!    привести к protocol::a2a::Message (role: user, part: {kind:text,text}),
-//!    прежде чем отдать в build_task_from_send_params — иначе
-//!    serde_json::from_value::<Message> упадёт на неизвестном варианте role.
-//! 2. Выход: готовый protocol::a2a::Task нужно отрендерить в SDK-форму
-//!    ({task:{...}}, TASK_STATE_*, ROLE_*, {text} без kind) для ответа на
+//! Compatibility with the JSON-RPC layer of the official a2a-rs SDK. Two directions:
+//! 1. Input: params.message in SDK shape (role: ROLE_USER, part: {text}) must be
+//!    converted to protocol::a2a::Message (role: user, part: {kind:text,text})
+//!    before passing it to build_task_from_send_params — otherwise
+//!    serde_json::from_value::<Message> would fail on an unknown role variant.
+//! 2. Output: a finished protocol::a2a::Task must be rendered into SDK shape
+//!    ({task:{...}}, TASK_STATE_*, ROLE_*, {text} without kind) to answer
 //!    SendMessage/GetTask/CancelTask.
 //!
-//! Отдельный модуль, а не правка a2a.rs: сохраняет неизменной текущую
-//! сериализацию Task/Message для семантических клиентов (регрессионный риск
-//! правки прямо в a2a.rs — иначе message/send начинает отвечать иначе).
+//! A separate module rather than an edit of a2a.rs: keeps the current
+//! Task/Message serialization unchanged for semantic clients (regression risk
+//! of editing a2a.rs directly — otherwise message/send starts replying differently).
 
 use crate::a2a::{
     Artifact, FilePart, Message, MessageRole, Part, Task, TaskState,
@@ -26,11 +26,11 @@ pub enum SdkCompatError {
     UnknownPart,
 }
 
-/// Пробует распознать SDK-форму role (`"ROLE_USER"`/`"ROLE_AGENT"`), при
-/// неудаче падает на текущую семантическую (`"user"`/`"agent"`), которую
-/// умеет разобрать сам serde на MessageRole. Возвращает уже нормализованное
-/// значение поля role в формате, ожидаемом protocol::a2a::MessageRole
-/// (lowercase), не трогая исходный Value.
+/// Tries to recognize the SDK role shape (`"ROLE_USER"`/`"ROLE_AGENT"`); on
+/// failure falls back to the current semantic shape (`"user"`/`"agent"`),
+/// which serde itself can parse into MessageRole. Returns the already
+/// normalized role field value in the format expected by
+/// protocol::a2a::MessageRole (lowercase), without touching the original Value.
 fn normalize_role(raw: &Value) -> Result<MessageRole, SdkCompatError> {
     match raw.as_str() {
         Some("ROLE_USER") | Some("user") => Ok(MessageRole::User),
@@ -39,13 +39,13 @@ fn normalize_role(raw: &Value) -> Result<MessageRole, SdkCompatError> {
     }
 }
 
-/// Пробует SDK-форму part (`{"text": "..."}` без поля kind) и падает на
-/// текущую семантическую (`{"kind":"text","text":"..."}`), которую разберёт
-/// сам serde через protocol::a2a::Part. SDK file-part (`{"url":...}` /
-/// `{"raw": base64}`) отдельно маппится на Part::File.
+/// Tries the SDK part shape (`{"text": "..."}` without a kind field) and falls
+/// back to the current semantic shape (`{"kind":"text","text":"..."}`), which
+/// serde itself parses via protocol::a2a::Part. The SDK file-part
+/// (`{"url":...}` / `{"raw": base64}`) is mapped onto Part::File separately.
 fn normalize_part(raw: &Value) -> Result<Part, SdkCompatError> {
-    // Явный SDK-тег отсутствует — a2a-rs SDK protojson не эмитит "kind".
-    // Если "kind" присутствует — это уже семантическая форма, разбираем как есть.
+    // Explicit SDK tag is absent — the a2a-rs SDK protojson does not emit "kind".
+    // If "kind" is present — this is already the semantic shape, parse it as-is.
     if raw.get("kind").is_some() {
         return serde_json::from_value(raw.clone()).map_err(|_| SdkCompatError::UnknownPart);
     }
@@ -70,10 +70,10 @@ fn normalize_part(raw: &Value) -> Result<Part, SdkCompatError> {
     Err(SdkCompatError::UnknownPart)
 }
 
-/// Нормализует произвольный входной `message` (SDK или семантический) в
-/// `protocol::a2a::Message`. Вызывается ДО существующего
-/// `serde_json::from_value::<Message>` в build_task_from_send_params —
-/// заменяет его, а не дополняет, чтобы не парсить дважды.
+/// Normalizes an arbitrary incoming `message` (SDK or semantic) into
+/// `protocol::a2a::Message`. Called BEFORE the existing
+/// `serde_json::from_value::<Message>` in build_task_from_send_params —
+/// replaces it rather than supplements it, to avoid parsing twice.
 pub fn normalize_message(raw: &Value) -> Result<Message, SdkCompatError> {
     let role_raw = raw.get("role").ok_or(SdkCompatError::UnknownRole)?;
     let role = normalize_role(role_raw)?;
@@ -104,7 +104,7 @@ fn task_state_to_sdk(state: TaskState) -> &'static str {
         TaskState::AuthRequired => "TASK_STATE_AUTH_REQUIRED",
         TaskState::Completed => "TASK_STATE_COMPLETED",
         TaskState::Failed => "TASK_STATE_FAILED",
-        TaskState::Canceled => "TASK_STATE_CANCELLED", // SDK proto: "CANCELLED" (2 L), сверено с a2a-rs types.rs в TZ
+        TaskState::Canceled => "TASK_STATE_CANCELLED", // SDK proto: "CANCELLED" (2 L), verified against a2a-rs types.rs in TZ
         TaskState::Rejected => "TASK_STATE_REJECTED",
     }
 }
@@ -158,9 +158,9 @@ fn artifact_to_sdk(artifact: &Artifact) -> Value {
     })
 }
 
-/// Рендерит Task в SDK-форму: обёртка `{"task": {...}}`, camelCase
-/// contextId/messageId, TASK_STATE_*, ROLE_*, части без "kind".
-/// Обязательное требование SDK-клиента a2a-rs (ждёт result.task).
+/// Renders Task into SDK shape: `{"task": {...}}` wrapper, camelCase
+/// contextId/messageId, TASK_STATE_*, ROLE_*, parts without "kind".
+/// Mandatory requirement of the a2a-rs SDK client (it expects result.task).
 pub fn render_task_sdk(task: &Task) -> Value {
     let status = json!({
         "state": task_state_to_sdk(task.status.state),
@@ -230,7 +230,7 @@ mod compat_tests {
         let rendered = render_task_sdk(&task);
         assert_eq!(rendered["task"]["status"]["state"], "TASK_STATE_CANCELLED");
         assert_eq!(rendered["task"]["contextId"], "ctx-1");
-        // Обёртка {task:...} обязательна для SDK-клиента.
+        // The {task:...} wrapper is mandatory for the SDK client.
         assert!(rendered.get("task").is_some());
     }
 
@@ -253,7 +253,7 @@ mod compat_tests {
         let rendered = render_task_sdk(&task);
         assert_eq!(rendered["task"]["status"]["state"], "TASK_STATE_COMPLETED");
         assert_eq!(rendered["task"]["artifacts"][0]["parts"][0]["text"], "pong");
-        // SDK part не должен содержать "kind".
+        // The SDK part must not contain "kind".
         assert!(rendered["task"]["artifacts"][0]["parts"][0].get("kind").is_none());
     }
 }

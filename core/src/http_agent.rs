@@ -1,7 +1,7 @@
 //! core/src/http_agent.rs
 //!
-//! HttpA2aAgent — реализация trait A2aAgent поверх реального HTTP JSON-RPC
-//! клиента к внешнему A2A-агенту.
+//! HttpA2aAgent — implementation of the A2aAgent trait over a real HTTP JSON-RPC
+//! client to an external A2A agent.
 
 use std::time::Duration;
 
@@ -87,8 +87,8 @@ struct JsonRpcError {
     message: String,
 }
 
-// ИСПРАВЛЕНО (найдено компилятором, E0277): был derive(Deserialize),
-// хотя структура используется как ИСХОДЯЩИЕ params в call<P: Serialize>.
+// FIXED (found by the compiler, E0277): it used to be derive(Deserialize),
+// although the struct is used as OUTGOING params in call<P: Serialize>.
 #[derive(Debug, Serialize)]
 struct GetTaskParams<'a> {
     id: &'a str,
@@ -119,9 +119,9 @@ impl A2aAgent for HttpA2aAgent {
         let params = SendMessageParams {
             message,
             configuration: Some(protocol::a2a::MessageSendConfiguration {
-                // ДОБАВЛЕНО (T4): blocking=false для запросов, способных
-                // вернуть SSE-стрим (иначе сервер отдаст один JSON, а не
-                // поток событий).
+                // ADDED (T4): blocking=false for requests capable of
+                // returning an SSE stream (otherwise the server returns a single JSON, not
+                // an event stream).
                 blocking: false,
                 history_length: None,
             }),
@@ -144,8 +144,8 @@ impl A2aAgent for HttpA2aAgent {
             .await
             .map_err(|e| anyhow::anyhow!("A2A HTTP request failed (message/send): {e}"))?;
 
-        // ДОБАВЛЕНО (T4): если сервер вернул SSE — стрим. Иначе — прежнее
-        // поведение (полный JSON Task).
+        // ADDED (T4): if the server returned SSE — stream. Otherwise — the previous
+        // behavior (full JSON Task).
         let content_type = resp
             .headers()
             .get("content-type")
@@ -180,10 +180,10 @@ impl A2aAgent for HttpA2aAgent {
     }
 }
 
-/// ДОБАВЛЕНО (T4): читает SSE-ответ A2A-агента (поток `data: {json}\n\n`)
-/// и шлёт каждый A2aEvent в канал. Завершается при закрытии потока или
-/// ошибке чтения. SSE-фрейм: "data: {json}\n\n" — каждая строка data: —
-/// отдельное событие.
+/// ADDED (T4): reads the A2A agent's SSE response (a `data: {json}\n\n` stream)
+/// and sends each A2aEvent to the channel. Ends when the stream closes or on a
+/// read error. SSE frame: "data: {json}\n\n" — each data: line is a
+/// separate event.
 async fn sse_to_a2a_events(
     resp: reqwest::Response,
     tx: tokio::sync::mpsc::UnboundedSender<protocol::a2a::A2aEvent>,
@@ -202,7 +202,7 @@ async fn sse_to_a2a_events(
         };
         buffer.push_str(&String::from_utf8_lossy(&chunk));
 
-        // SSE: события разделены пустой строкой. Собираем data:-строки.
+        // SSE: events are separated by a blank line. Collect the data: lines.
         while let Some(pos) = buffer.find("\n\n") {
             let frame = buffer[..pos].to_string();
             buffer.drain(..pos + 2);
@@ -217,7 +217,7 @@ async fn sse_to_a2a_events(
             match serde_json::from_str::<protocol::a2a::A2aEvent>(data_line) {
                 Ok(event) => {
                     if tx.send(event).is_err() {
-                        // Получатель отключился — завершаем стрим.
+                        // Receiver disconnected — end the stream.
                         return;
                     }
                 }
@@ -253,9 +253,9 @@ mod tests {
         );
     }
 
-    /// T4: send_task при Content-Type: text/event-stream возвращает
-    /// Reply::Streaming с A2aEvent из SSE-фреймов. Полный путь TCP
-    /// (транспорт шлюза) покрыт в gatewayd/tests/streaming_tcp.rs.
+    /// T4: send_task with Content-Type: text/event-stream returns
+    /// Reply::Streaming with A2aEvents from SSE frames. The full TCP path
+    /// (gateway transport) is covered in gatewayd/tests/streaming_tcp.rs.
     #[tokio::test]
     async fn send_task_returns_streaming_on_sse_response() {
         use axum::http::StatusCode;
@@ -263,10 +263,10 @@ mod tests {
         use axum::routing::post;
         use axum::Router;
 
-        // Mock-сервер: отвечает SSE-потоком из двух событий A2aEvent.
-        // ВАЖНО: события сериализуются через serde_json::to_string(&A2aEvent)
-        // — ТОЧНО как прод stream_to_sse. Никакого ручного JSON-хардкода:
-        // формат берётся из serde-атрибутов реальных типов.
+        // Mock server: responds with an SSE stream of two A2aEvent events.
+        // IMPORTANT: events are serialized via serde_json::to_string(&A2aEvent)
+        // — EXACTLY like the prod stream_to_sse. No manual JSON hardcoding:
+        // the format comes from the serde attributes of the real types.
         let app = Router::new().route("/a2a", post(|| async {
             let working = protocol::a2a::A2aEvent::TaskStatusUpdate {
                 task_id: TaskId("t-1".into()),

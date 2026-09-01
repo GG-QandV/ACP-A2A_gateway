@@ -1,6 +1,6 @@
 //! gatewayd/src/transport_http.rs
-//! Направление 4: A2A-клиент -> ACP-агент.
-//! Эндпоинты: GET /agents/:id/.well-known/agent.json, POST /agents/:id/rpc
+//! Direction 4: A2A client -> ACP agent.
+//! Endpoints: GET /agents/:id/.well-known/agent.json, POST /agents/:id/rpc
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -26,21 +26,21 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use crate::event_log::{EventLog, EventRecord};
 use crate::registry::{Registry, Transport};
 
-/// ДОБАВЛЕНО (Фаза 3.2, T4/resubscribe live): per-task broadcast-hub.
-/// live-события стрима публикуются сюда с seq (см. spawn_stream_relay);
-/// resubscribe после replay истории подписывается на этот канал и
-/// продолжает приём вживую. Запись в hub — всегда ДО live-отправки
-/// resubscriber'у, поэтому при Lacad/catch-up источник истины остаётся
-/// durable event_log (события в broadcast — только кэш последних).
+/// ADDED (Phase 3.2, T4/resubscribe live): per-task broadcast hub.
+/// live stream events are published here with a seq (see spawn_stream_relay);
+/// resubscribe, after replaying history, subscribes to this channel and
+/// continues receiving live. Writing to the hub always happens BEFORE the
+/// live send to the resubscriber, so under Lagged/catch-up the source of
+/// truth stays the durable event_log (broadcast events are only a last-N cache).
 #[derive(Default)]
 pub struct StreamHub {
     senders: tokio::sync::Mutex<HashMap<String, broadcast::Sender<(u64, protocol::a2a::A2aEvent)>>>,
 }
 
 impl StreamHub {
-    /// Подписка на live-события задачи. None = для задачи нет активного
-    /// стрима (релей ещё не стартовал или уже закрылся) — resubscribe
-    /// отдаёт только историю из durable event_log.
+    /// Subscribe to a task's live events. None = no active stream for the
+    /// task (relay hasn't started or already closed) — resubscribe
+    /// returns only history from the durable event_log.
     pub async fn subscribe(
         &self,
         task_id: &str,
@@ -52,8 +52,8 @@ impl StreamHub {
             .map(broadcast::Sender::subscribe)
     }
 
-    /// Публикация live-события. Создаёт канал для задачи при первом
-    /// событии (релей владеет жизненным циклом: close на завершении).
+    /// Publish a live event. Creates the task's channel on the first
+    /// event (the relay owns the lifecycle: closes it on completion).
     pub async fn publish(&self, task_id: &str, seq: u64, event: protocol::a2a::A2aEvent) {
         let mut guard = self.senders.lock().await;
         let tx = match guard.get(task_id) {
@@ -64,36 +64,36 @@ impl StreamHub {
                 tx
             }
         };
-        // Клиент мог отвалиться — не сбой, а норма: broadcast дропает.
+        // Client may have dropped off — not a failure, just normal: broadcast drops it.
         let _ = tx.send((seq, event));
     }
 
-    /// Релей закрывает канал задачи на своём завершении — resubscriber'ы
-    /// получают Closed и понимают, что live-хвоста больше не будет.
+    /// The relay closes the task's channel when it finishes — resubscribers
+    /// get Closed and know there will be no more live tail.
     pub async fn close(&self, task_id: &str) {
         self.senders.lock().await.remove(task_id);
     }
 }
 
-/// Ёмкость broadcast-буфера на задачу. Не должен ломать стрим при
-/// переполнении: Lacad-пропуск закрывается повторным чтением event_log.
+/// Broadcast buffer capacity per task. Must not break the stream on
+/// overflow: a Lagged gap is closed by re-reading the event_log.
 const HUB_CAPACITY: usize = 1024;
 
 pub struct HttpState {
     registry: Arc<Registry>,
     task_store_dir: PathBuf,
     lease_timeout: Duration,
-    /// Внешний адрес шлюза для AgentCard.url (аудит P2-12).
+    /// External gateway address for AgentCard.url (audit P2-12).
     public_url: String,
-    /// ДОБАВЛЕНО (аудит P2-11): таймаут RPC к stdio-агенту из конфига.
+    /// ADDED (audit P2-11): RPC timeout to the stdio agent, from config.
     call_timeout: Duration,
     adapters: tokio::sync::Mutex<HashMap<String, Arc<AcpAsA2a<SupervisedStdioAgent>>>>,
-    /// ДОБАВЛЕНО (Фаза 2/3 буферного конфига): durable-буфер событий
-    /// стрима. None = секция event_log выключена в конфиге — стримы идут
-    /// как раньше (эфемерный канал, без seq на wire).
+    /// ADDED (Phase 2/3 of the buffer config): durable buffer of stream
+    /// events. None = the event_log section is disabled in config — streams
+    /// work as before (ephemeral channel, no seq on the wire).
     event_log: Option<Arc<EventLog>>,
-    /// ДОБАВЛЕНО (Фаза 3.2): per-task broadcast-hub для live-продолжения
-    /// tasks/resubscribe после replay истории.
+    /// ADDED (Phase 3.2): per-task broadcast hub for the live continuation
+    /// of tasks/resubscribe after history replay.
     stream_hub: Arc<StreamHub>,
 }
 
@@ -119,14 +119,14 @@ pub fn router(
     Router::new()
         .route("/agents/:agent_id/.well-known/agent.json", get(agent_card))
         .route("/agents/:agent_id/rpc", post(rpc_handler))
-        // ДОБАВЛЕНО: SDK-формат a2a-rs. a2a-server принимает и
-        // POST /message:send (основной), и POST /message/send (легаси-
-        // алиас, a2a-server/src/rest.rs:24,68) — оба ведём на один
-        // хендлер. В matchit 0.7 `:` в середине сегмента трактуется как
-        // начало параметра, т.е. маршрут "/agents/{id}/message{suffix}"
-        // имеет ДВА параметра — поэтому у него отдельный хендлер с
-        // tuple-экстрактором (suffix игнорируется). Легаси-путь ниже —
-        // один статический сегмент, у него обычный Path<String>.
+        // ADDED: SDK format a2a-rs. a2a-server accepts both
+        // POST /message:send (primary) and POST /message/send (legacy
+        // alias, a2a-server/src/rest.rs:24,68) — both route to one
+        // handler. In matchit 0.7 a `:` inside a segment starts a
+        // parameter, i.e. the route "/agents/{id}/message{suffix}"
+        // has TWO parameters — hence its own handler with a
+        // tuple extractor (suffix is ignored). The legacy path below is
+        // one static segment, it uses a plain Path<String>.
         .route(
             "/agents/:agent_id/message:send",
             post(rest_send_message_handler_sdk),
@@ -146,13 +146,13 @@ fn extract_bearer(headers: &HeaderMap) -> Option<String> {
         .map(str::to_string)
 }
 
-/// ИСПРАВЛЕНО: раньше на этом пути возвращалась одна безликая
-/// anyhow-ошибка, и вызывающий код отвечал 404 / -32601 одинаково на
-/// «нет такого агента», «процесс не поднялся» и «рукопожатие
-/// провалилось». Сообщение врало о природе проблемы: отказ агента
-/// выглядел как опечатка в agent_id, из-за чего диагностика по логам и
-/// статусам вела не туда. В проде это цена каждого инцидента, а не
-/// одного отладочного цикла.
+/// FIXED: previously this path returned a single anonymous anyhow error,
+/// and the caller answered 404 / -32601 identically for "no such agent",
+/// "process failed to start" and "handshake failed". The message lied about
+/// the nature of the problem: an agent refusal looked like a typo in
+/// agent_id, which sent log- and status-based diagnostics in the wrong
+/// direction. In prod this is the cost of every incident, not of one
+/// debug cycle.
 #[derive(Debug, thiserror::Error)]
 enum AdapterError {
     #[error("unknown agent_id: {0}")]
@@ -170,10 +170,10 @@ enum AdapterError {
 }
 
 impl AdapterError {
-    /// 404 — про адресацию: такого агента в реестре нет, и повтор
-    /// запроса ничего не изменит.
-    /// 503 — про доступность: агент настроен, но сейчас не поднимается;
-    /// запрос имеет смысл повторить позже.
+    /// 404 — about addressing: the agent isn't in the registry, and
+    /// retrying the request changes nothing.
+    /// 503 — about availability: the agent is configured but isn't
+    /// starting now; retrying the request later makes sense.
     fn status(&self) -> StatusCode {
         match self {
             Self::UnknownAgent(_) => StatusCode::NOT_FOUND,
@@ -182,8 +182,8 @@ impl AdapterError {
         }
     }
 
-    /// -32601 (method not found) уместен только для несуществующего
-    /// агента. Отказ запуска — ошибка приложения, а не адресации.
+    /// -32601 (method not found) is appropriate only for a nonexistent
+    /// agent. A spawn refusal is an application error, not addressing.
     fn rpc_code(&self) -> i64 {
         match self {
             Self::UnknownAgent(_) => -32601,
@@ -193,8 +193,8 @@ impl AdapterError {
     }
 }
 
-/// Код для «агент настроен, но не поднимается». Отдельный, чтобы клиент
-/// мог отличить временный отказ от постоянного и решить, повторять ли.
+/// Code for "agent is configured but won't start". Kept separate so the
+/// client can tell a temporary refusal from a permanent one and decide to retry.
 const AGENT_UNAVAILABLE_CODE: i64 = -32020;
 
 async fn get_or_spawn_adapter(
@@ -202,10 +202,10 @@ async fn get_or_spawn_adapter(
     agent_id: &str,
 ) -> Result<Arc<AcpAsA2a<SupervisedStdioAgent>>, AdapterError> {
     let mut adapters = state.adapters.lock().await;
-    // ИСПРАВЛЕНО (аудит P2-10): раньше кэш отдавал адаптер, не
-    // интересуясь, жив ли за ним процесс. Теперь мёртвый процесс
-    // поднимает сам адаптер (через SupervisedStdioAgent), а кэш
-    // остаётся валидным — пересоздавать его больше не нужно.
+    // FIXED (audit P2-10): the cache used to hand out an adapter without
+    // caring whether the process behind it was alive. Now a dead process
+    // is respawned by the adapter itself (via SupervisedStdioAgent), and
+    // the cache stays valid — no need to rebuild it anymore.
     if let Some(existing) = adapters.get(agent_id) {
         return Ok(existing.clone());
     }
@@ -227,15 +227,15 @@ async fn get_or_spawn_adapter(
         env,
         call_timeout: state.call_timeout,
         protocol_version: SpawnConfig::DEFAULT_PROTOCOL_VERSION,
-        // ДОБАВЛЕНО (Часть 2 роадмапа стриминга): раздельные таймауты
-        // стрима агента берутся из конфига (streaming. секция).
+        // ADDED (streaming roadmap Part 2): the agent's separate stream
+        // timeouts come from config (streaming. section).
         first_chunk_timeout: entry.first_chunk_timeout,
         idle_chunk_timeout: entry.idle_chunk_timeout,
     })
     .await
     .map_err(|source| {
-        // Логируем причину целиком: клиенту уходит короткий текст,
-        // оператору нужен полный контекст отказа.
+        // Log the cause in full: the client gets a short text,
+        // the operator needs the complete failure context.
         tracing::error!(agent_id, error = ?source, "не удалось поднять агента");
         AdapterError::Unavailable {
             agent_id: agent_id.to_string(),
@@ -243,8 +243,8 @@ async fn get_or_spawn_adapter(
         }
     })?;
 
-    // Адрес именно этого агента, а не шлюза целиком: карточка описывает
-    // конечную точку, по которой клиент будет слать message/send.
+    // The address of this very agent, not the whole gateway: the card describes
+    // the endpoint to which the client will send message/send.
     let agent_url = format!(
         "{}/agents/{agent_id}/rpc",
         state.public_url.trim_end_matches('/')
@@ -337,8 +337,8 @@ async fn rpc_handler(
         Err(e) => return rpc_error(request.id, e.status(), e.rpc_code(), &e.to_string()),
     };
 
-    // ИСПРАВЛЕНО (аудит P1-1): владелец разговора выводится из токена
-    // клиента, иначе адаптер не может отличить одного клиента от другого.
+    // FIXED (audit P1-1): the conversation owner is derived from the client
+    // token; otherwise the adapter can't tell one client from another.
     let owner = Owner::from_token(&token);
 
     let result = dispatch_a2a_method(
@@ -353,14 +353,14 @@ async fn rpc_handler(
         Ok(DispatchResult::Json(value)) => {
             Json(json!({ "jsonrpc": "2.0", "id": request.id, "result": value })).into_response()
         }
-        // ДОБАВЛЕНО (Фаза 3): tasks/resubscribe рендерится как SSE-поток
-        // (история + live) — клиент видит те же id:, что и в живом стриме,
-        // и может продолжить после последнего полученного.
+        // ADDED (Phase 3): tasks/resubscribe renders as an SSE stream
+        // (history + live) — the client sees the same id:s as in the live stream,
+        // and can continue after the last one received.
         Ok(DispatchResult::Resubscribe(stream)) => Sse::new(stream).into_response(),
-        // ДОБАВЛЕНО (задача D): стриминговый ответ рендерится как SSE,
-        // а не как JSON-RPC конверт — клиент читает поток A2aEvent.
-        // ДОБАВЛЕНО (Часть 2, задача A): лимит параллельных стримов —
-        // permit живёт до закрытия SSE-потока, fail-closed.
+        // ADDED (task D): the streaming response renders as SSE,
+        // not as a JSON-RPC envelope — the client reads an A2aEvent stream.
+        // ADDED (Part 2, task A): parallel-stream limit —
+        // the permit lives until the SSE stream closes, fail-closed.
         Ok(DispatchResult::Streaming(rx)) => {
             let permit = match state.registry.try_acquire_stream(&agent_id) {
                 Ok(p) => p,
@@ -376,9 +376,9 @@ async fn rpc_handler(
             let relay = spawn_stream_relay(rx, state.event_log.clone(), state.stream_hub.clone());
             stream_to_sse(relay, permit).into_response()
         }
-        // ДОБАВЛЕНО (аудит P2-10): потеря контекста — не «что-то пошло
-        // не так». Клиент должен отличить её от прочих ошибок, чтобы
-        // начать разговор заново, а не молча продолжать в пустоту.
+        // ADDED (audit P2-10): lost context is not "something went
+        // wrong". The client must distinguish it from other errors to
+        // restart the conversation, not silently continue into a void.
         Err(e) if e.downcast_ref::<ContextLost>().is_some() => rpc_error(
             request.id,
             StatusCode::CONFLICT,
@@ -389,8 +389,8 @@ async fn rpc_handler(
     }
 }
 
-/// Код ошибки для потерянного контекста. Диапазон -32000..-32099
-/// отведён JSON-RPC под ошибки приложения.
+/// Error code for lost context. The -32000..-32099 range is
+/// reserved by JSON-RPC for application errors.
 const CONTEXT_LOST_CODE: i64 = -32010;
 
 fn rpc_error(id: Value, status: StatusCode, code: i64, message: &str) -> axum::response::Response {
@@ -402,20 +402,20 @@ fn rpc_error(id: Value, status: StatusCode, code: i64, message: &str) -> axum::r
 }
 
 // =========================================================================
-// Направление 4 (SDK-клиент): REST POST /agents/:id/message:send
+// Direction 4 (SDK client): REST POST /agents/:id/message:send
 // =========================================================================
 //
-// Контракт ответа — SendMessageResponse из a2a-rs, НЕ JSON-RPC:
-//   успех:   200  { "task": { ... } }                 (render_task_sdk)
-//   ошибка:  <http-status>  { "error": { "code", "status", "message", "details" } }
-// Форма конверта подтверждена a2a-server/src/rest.rs:470, обёртка task —
-// a2a-server/src/rest.rs:1264 (тест читает send_resp["task"]["id"]).
-// HTTP-статус несёт машинный код ошибки; "status" — gRPC-style имя,
-// "code" — внутренний код приложения (-32010 для ContextLost и т.д.).
+// Response contract — SendMessageResponse from a2a-rs, NOT JSON-RPC:
+//   success:   200  { "task": { ... } }                 (render_task_sdk)
+//   error:  <http-status>  { "error": { "code", "status", "message", "details" } }
+// Envelope shape confirmed by a2a-server/src/rest.rs:470, task wrapper —
+// a2a-server/src/rest.rs:1264 (the test reads send_resp["task"]["id"]).
+// HTTP status carries the machine error code; "status" — gRPC-style name,
+// "code" — internal application code (-32010 for ContextLost etc.).
 
-/// Основной SDK-путь POST /agents/:id/message:send.
-/// В matchit 0.7 `:` внутри сегмента начинает параметр — маршрут несёт
-/// два ({id}, {suffix}), второй не нужен и отбрасывается.
+/// Primary SDK path POST /agents/:id/message:send.
+/// In matchit 0.7 a `:` inside a segment starts a parameter — the route carries
+/// two ({id}, {suffix}); the second is unneeded and discarded.
 async fn rest_send_message_handler_sdk(
     State(state): State<Arc<HttpState>>,
     AxumPath((agent_id, _suffix)): AxumPath<(String, String)>,
@@ -425,8 +425,8 @@ async fn rest_send_message_handler_sdk(
     rest_send_message_core(state, &agent_id, &headers, &body).await
 }
 
-/// Легаси-алиас POST /agents/:id/message/send — один параметр, обычный
-/// экстрактор. Тот же путь обработки, что и у message:send.
+/// Legacy alias POST /agents/:id/message/send — one parameter, plain
+/// extractor. Same processing path as message:send.
 async fn rest_send_message_handler(
     State(state): State<Arc<HttpState>>,
     AxumPath(agent_id): AxumPath<String>,
@@ -450,8 +450,8 @@ async fn rest_send_message_core(
         return rest_sdk_error(StatusCode::UNAUTHORIZED, -32000, "invalid token");
     }
 
-    // Валидируем тело ДО подъёма адаптера: битый запрос не должен
-    // спавнить процесс агента ради того, чтобы быть отвергнутым.
+    // Validate the body BEFORE spawning the adapter: a broken request
+    // shouldn't spawn an agent process just to be rejected.
     let task = match build_task_from_send_params_sdk(body) {
         Ok(t) => t,
         Err(e) => return rest_sdk_error(StatusCode::BAD_REQUEST, -32602, &e.to_string()),
@@ -465,12 +465,12 @@ async fn rest_send_message_core(
     let owner = Owner::from_token(&token);
 
     match adapter.send_task_as(owner, task).await {
-        // Обёртка {task: ...} обязательна: SDK-клиент разворачивает
-        // SendMessageResponse сам (render_task_sdk её и строит).
+        // The {task: ...} wrapper is mandatory: the SDK client unwraps
+        // SendMessageResponse itself (render_task_sdk builds it).
         Ok(gateway_core::Reply::Complete(t)) => Json(render_task_sdk(&t)).into_response(),
-        // ДОБАВЛЕНО (задача D): вместо заглушки — SSE-поток A2aEvent.
-        // ДОБАВЛЕНО (Часть 2, задача A): лимит параллельных стримов —
-        // fail-closed, permit живёт до закрытия потока.
+        // ADDED (task D): a stub replaced by an SSE stream of A2aEvent.
+        // ADDED (Part 2, task A): parallel-stream limit —
+        // fail-closed, the permit lives until the stream closes.
         Ok(gateway_core::Reply::Streaming(rx)) => {
             let permit = match state.registry.try_acquire_stream(agent_id) {
                 Ok(p) => p,
@@ -489,8 +489,8 @@ async fn rest_send_message_core(
             let relay = spawn_stream_relay(rx, state.event_log.clone(), state.stream_hub.clone());
             stream_to_sse(relay, permit).into_response()
         }
-        // Тот же контракт, что и у /rpc: потерянный контекст — 409 +
-        // ABORTED, а не абстрактная внутренняя ошибка.
+        // Same contract as /rpc: lost context — 409 +
+        // ABORTED, not an abstract internal error.
         Err(e) if e.downcast_ref::<ContextLost>().is_some() => {
             rest_sdk_error(StatusCode::CONFLICT, CONTEXT_LOST_CODE, &e.to_string())
         }
@@ -498,8 +498,8 @@ async fn rest_send_message_core(
     }
 }
 
-/// REST-конверт ошибки SDK: {"code", "status", "message", "details"}.
-/// Поля "jsonrpc" и "id" отсутствуют намеренно — это не JSON-RPC ответ.
+/// SDK REST error envelope: {"code", "status", "message", "details"}.
+/// "jsonrpc" and "id" fields are absent on purpose — this is not a JSON-RPC reply.
 fn rest_sdk_error(status: StatusCode, code: i64, message: &str) -> axum::response::Response {
     (
         status,
@@ -515,11 +515,11 @@ fn rest_sdk_error(status: StatusCode, code: i64, message: &str) -> axum::respons
         .into_response()
 }
 
-/// gRPC-style имя из HTTP-статуса (маппинг как у grpc-status). Каждый
-/// код, который реально отдаёт rest_sdk_error, обязан быть здесь —
-/// регрессию ловит тест http_status_to_sdk_name_covers_all_used_codes.
-/// Публичен, чтобы интеграционный тест проверял именно этот код, а не
-/// свою копию маппинга.
+/// gRPC-style name from the HTTP status (mapping like grpc-status). Every
+/// code rest_sdk_error actually returns must be here —
+/// regression is caught by test http_status_to_sdk_name_covers_all_used_codes.
+/// Public so the integration test checks exactly this code, not
+/// its own copy of the mapping.
 pub fn http_status_to_sdk_name(status: StatusCode) -> &'static str {
     match status {
         StatusCode::BAD_REQUEST => "INVALID_ARGUMENT",
@@ -533,23 +533,23 @@ pub fn http_status_to_sdk_name(status: StatusCode) -> &'static str {
     }
 }
 
-/// Один элемент потока после relay: seq (Some = событие персистено в
-/// event_log и может быть продолжено через resubscribe) и само событие.
+/// One stream item after the relay: seq (Some = event persisted in
+/// event_log and continuable via resubscribe) plus the event itself.
 struct StreamItem {
     seq: Option<u64>,
     event: protocol::a2a::A2aEvent,
 }
 
-/// ДОБАВЛЕНО (Фаза 3.2, T4/resubscribe): relay-таск, отделяющий жизнь
-/// стрима от жизни клиентского соединения. Читает A2aEvent из канала
-/// агента ДО их отправки клиенту:
-/// 1. персистит событие с task_id в event_log (источник истины для
-///    resubscribe), в случае сбоя — не ломает стрим, шлёт без seq;
-/// 2. публикует (seq, event) в per-task hub для live-продолжения
-///    resubscriber'ов (ДО клиента — подписчик не пропустит событие);
-/// 3. отдаёт событие клиенту текущего соединения.
-///    Клиент отвалился — relay живёт дальше: агент не канселится, события
-///    продолжают писаться в durable-буфер и hub, resubscribe нагонит.
+/// ADDED (Phase 3.2, T4/resubscribe): relay task that separates stream
+/// lifetime from the client connection's lifetime. Reads A2aEvents from the agent
+/// channel BEFORE sending them to the client:
+/// 1. persists the event with task_id into event_log (source of truth for
+///    resubscribe); on failure — doesn't break the stream, sends without seq;
+/// 2. publishes (seq, event) to the per-task hub for live continuation
+///    of resubscribers (BEFORE the client — a subscriber won't miss the event);
+/// 3. hands the event to the current connection's client.
+///    Client dropped — the relay keeps running: the agent isn't cancelled, events
+///    keep being written to the durable buffer and hub; resubscribe will catch up.
 fn spawn_stream_relay(
     rx: tokio::sync::mpsc::UnboundedReceiver<protocol::a2a::A2aEvent>,
     event_log: Option<Arc<EventLog>>,
@@ -569,8 +569,8 @@ fn spawn_stream_relay(
                     match serde_json::to_string(&event) {
                         Ok(json) => match log.append(&task_id, &json).await {
                             Ok(seq) => {
-                                // В hub — ДО клиента: resubscriber, подписавшийся
-                                // на задачу, не должен пропустить это событие.
+                                // To the hub — BEFORE the client: a resubscriber that has
+                                // subscribed to the task must not miss this event.
                                 hub.publish(&task_id, seq, event.clone()).await;
                                 Some(seq)
                             }
@@ -591,11 +591,11 @@ fn spawn_stream_relay(
                 }
                 _ => None,
             };
-            // Клиент мог отвалиться — игнорируем send-ошибку, relay продолжает.
+            // Client may have dropped off — ignore the send error, the relay continues.
             let _ = client_tx.send(StreamItem { seq: persisted, event });
         }
-        // Канал агента закрылся (стрим завершён) — resubscriber'ы получают
-        // Closed из hub и понимают, что live-хвоста больше не будет.
+        // The agent channel closed (stream finished) — resubscribers get
+        // Closed from the hub and know there will be no more live tail.
         if let Some(task_id) = known_task {
             hub.close(&task_id).await;
         }
@@ -603,28 +603,28 @@ fn spawn_stream_relay(
     client_rx
 }
 
-/// ДОБАВЛЕНО (Часть 1 роадмапа стриминга, задача D): рендерит готовый
-/// поток A2aEvent в HTTP SSE-ответ (text/event-stream). Контракт seam
-/// Reply<T,U>: транспорт не знает про ACP SessionUpdate — он получает
-/// уже смаппленные A2aEvent и просто сериализует их в SSE-фреймы.
-/// Каждое событие — отдельный `data: {...}\n\n`.
+/// ADDED (streaming roadmap Part 1, task D): renders a ready A2aEvent
+/// stream into an HTTP SSE response (text/event-stream). Seam contract
+/// Reply<T,U>: the transport knows nothing about ACP SessionUpdate — it receives
+/// already-mapped A2aEvents and just serializes them into SSE frames.
+/// Each event is a separate `data: {...}\n\n`.
 ///
-/// ДОБАВЛЕНО (Часть 2, задача A): `permit` удерживает слот параллельных
-/// стримов агента до закрытия потока (RAII-паттерн, как у TurnGuard) —
-/// map-замыкание захватывает permit по move, и он дропается вместе со
-/// стримом.
+/// ADDED (Part 2, task A): `permit` holds one of the agent's parallel-stream
+/// slots until the stream closes (RAII pattern, like TurnGuard) —
+/// the map closure captures the permit by move, and it drops together
+/// with the stream.
 ///
-/// ДОБАВЛЕНО (Фаза 3.2): источник — relay-таск (spawn_stream_relay), а не
-/// канал агента напрямую. seq из персистенции уходит клиенту в SSE
-/// `id:`-поле: клиент запоминает последний обработанный id и при
-/// reconnect шлёт его как after_seq. События без seq (не персистены) идут
-/// без id.
+/// ADDED (Phase 3.2): the source is the relay task (spawn_stream_relay), not
+/// the agent channel directly. The seq from persistence goes to the client in
+/// the SSE `id:` field: the client remembers the last processed id and on
+/// reconnect sends it as after_seq. Events without seq (not persisted) go
+/// without id.
 fn stream_to_sse(
     rx: tokio::sync::mpsc::UnboundedReceiver<StreamItem>,
     permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
     let stream = UnboundedReceiverStream::new(rx).map(move |item| {
-        // permit удерживается живым в этом замыкании на весь стрим.
+        // the permit is kept alive in this closure for the whole stream.
         let _ = &permit;
         let mut ev = Event::default()
             .json_data(item.event)
@@ -637,8 +637,8 @@ fn stream_to_sse(
     Sse::new(stream)
 }
 
-/// task_id из A2aEvent для персистенции в event_log. Message не несёт
-/// task_id — такие события не буферизуются.
+/// task_id from an A2aEvent for persistence into event_log. Message carries no
+/// task_id — such events aren't buffered.
 fn event_task_id(event: &protocol::a2a::A2aEvent) -> Option<String> {
     match event {
         protocol::a2a::A2aEvent::TaskStatusUpdate { task_id, .. }
@@ -649,27 +649,27 @@ fn event_task_id(event: &protocol::a2a::A2aEvent) -> Option<String> {
     }
 }
 
-/// ДОБАВЛЕНО (Фаза 3.2, T4/resubscribe live): SSE-поток продолжения
-/// стрима. Две фазы:
-/// 1. История — события с seq > after_seq из durable event_log (replay).
-/// 2. Live — после исчерпания истории подписка на per-task hub
-///    (spawn_stream_relay публикует сюда каждое событие). Отдаём только
-///    события с seq > последнего отданного (дедуп: история и live могут
-///    пересекаться на границе). broadcast переполнился (Lagged) — повторно
-///    читаем durable-историю с последнего seq (catch-up) и продолжаем live.
-///    Закрытие канала агента (стрим завершён) — hub.close, подписчик
-///    получает Closed и поток завершается.
+/// ADDED (Phase 3.2, T4/resubscribe live): SSE stream for stream
+/// continuation. Two phases:
+/// 1. History — events with seq > after_seq from the durable event_log (replay).
+/// 2. Live — once history is exhausted, subscribe to the per-task hub
+///    (spawn_stream_relay publishes every event here). Serve only
+///    events with seq > the last one served (dedup: history and live may
+///    overlap at the boundary). broadcast overflowed (Lagged) — re-read the
+///    durable history from the last seq (catch-up) and continue live.
+///    Agent channel closed (stream finished) — hub.close, the subscriber
+///    gets Closed and the stream ends.
 async fn resubscribe_stream(
     log: Arc<EventLog>,
     hub: Arc<StreamHub>,
     task_id: String,
     after_seq: u64,
 ) -> anyhow::Result<futures_util::stream::BoxStream<'static, Result<Event, Infallible>>> {
-    // Состояние unfold-машины. Фазы:
-    //  queue непуст  -> отдаём историю (из durable event_log, seq > after_seq);
-    //  queue пуст    -> переключаемся на live-подписку hub (не трогаем её,
-    //                   пока история не исчерпана);
-    //  live закрыт   -> стрим завершён, поток закрываем.
+    // State of the unfold machine. Phases:
+    //  queue non-empty -> serve history (from durable event_log, seq > after_seq);
+    //  queue empty     -> switch to the hub live subscription (don't touch it
+    //                     until history is exhausted);
+    //  live closed     -> stream finished, close the stream.
     struct State {
         queue: std::collections::VecDeque<EventRecord>,
         live: Option<broadcast::Receiver<(u64, protocol::a2a::A2aEvent)>>,
@@ -679,8 +679,8 @@ async fn resubscribe_stream(
         task_id: String,
     }
 
-    // История читается ДО построения стрима — первый элемент отдаётся без
-    // латентной подписки, и live-фаза не стартует раньше наличия истории.
+    // History is read BEFORE building the stream — the first item is served
+    // without a latent subscription, and the live phase doesn't start before history exists.
     let history: Vec<EventRecord> = log.events_after(&task_id, after_seq, 10_000).await?;
     let last_seq = history.last().map(|r| r.seq).unwrap_or(after_seq);
 
@@ -695,20 +695,20 @@ async fn resubscribe_stream(
 
     let stream = futures_util::stream::unfold(state, |mut st| async move {
         loop {
-            // 1) История: пока есть записи, отдаём их (источник истины).
+            // 1) History: while records remain, serve them (source of truth).
             if let Some(rec) = st.queue.pop_front() {
                 st.last_seq = rec.seq;
                 return Some((Ok(event_from_record(&rec)), st));
             }
-            // 2) Live: история исчерпана — подписываемся на hub один раз.
+            // 2) Live: history exhausted — subscribe to the hub once.
             if st.live.is_none() {
                 st.live = st.hub.subscribe(&st.task_id).await;
-                // hub.subscribe == None: для задачи нет активного стрима
-                // (релей не стартовал или закрылся) — live-хвоста не будет.
+                // hub.subscribe == None: no active stream for the task
+                // (relay not started or closed) — there will be no live tail.
                 st.live.as_ref()?;
             }
-            // 3) События live с дедупом по seq (граница история/live может
-            //    пересекаться) и catch-up при Lagged.
+            // 3) Live events with seq dedup (the history/live boundary may
+            //    overlap) and catch-up on Lagged.
             let rx = st.live.as_mut().expect("live подписка есть");
             match rx.recv().await {
                 Ok((seq, event)) if seq > st.last_seq => {
@@ -721,10 +721,10 @@ async fn resubscribe_stream(
                         st,
                     ));
                 }
-                // Дубликат на границе история/live — пропускаем.
+                // Duplicate at the history/live boundary — skip.
                 Ok(_) => {}
-                // broadcast переполнен — catch-up через durable историю:
-                // читаем всё, что потеряли, и продолжаем live.
+                // broadcast overflowed — catch-up via durable history:
+                // read everything we lost, then continue live.
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     tracing::info!(
                         task_id = %st.task_id,
@@ -746,7 +746,7 @@ async fn resubscribe_stream(
                         }
                     }
                 }
-                // Стрим завершён (релей закрыл канал задачи) — конец потока.
+                // Stream finished (relay closed the task channel) — end of the stream.
                 Err(broadcast::error::RecvError::Closed) => return None,
             }
         }
@@ -754,8 +754,8 @@ async fn resubscribe_stream(
     Ok(stream.boxed())
 }
 
-/// Сериализует EventRecord из durable event_log в SSE-фрейм с id=seq.
-/// Битое событие не роняет поток — идёт явный маркер ошибки.
+/// Serializes an EventRecord from the durable event_log into an SSE frame with id=seq.
+/// A corrupt event doesn't crash the stream — an explicit error marker is emitted.
 fn event_from_record(rec: &EventRecord) -> Event {
     match serde_json::from_str::<protocol::a2a::A2aEvent>(&rec.event_json) {
         Ok(ev) => Event::default()
@@ -777,14 +777,14 @@ fn event_from_record(rec: &EventRecord) -> Event {
     }
 }
 
-/// Результат диспетчера: либо синхронный JSON (Complete), либо поток SSE
-/// (Streaming), либо replay+live из event_log/hub (Resubscribe).
+/// Dispatcher result: either synchronous JSON (Complete), an SSE stream
+/// (Streaming), or replay+live from event_log/hub (Resubscribe).
 enum DispatchResult {
     Json(Value),
     Streaming(tokio::sync::mpsc::UnboundedReceiver<protocol::a2a::A2aEvent>),
-    /// ДОБАВЛЕНО (Фаза 3): готовый SSE-поток для tasks/resubscribe —
-    /// сначала история из durable event_log (seq > after_seq), затем
-    /// live-продолжение из per-task hub (Фаза 3.2).
+    /// ADDED (Phase 3): ready-made SSE stream for tasks/resubscribe —
+    /// first history from the durable event_log (seq > after_seq), then
+    /// live continuation from the per-task hub (Phase 3.2).
     Resubscribe(
         futures_util::stream::BoxStream<
             'static,
@@ -807,19 +807,19 @@ async fn dispatch_a2a_method(
                 gateway_core::Reply::Complete(t) => {
                     Ok(DispatchResult::Json(serde_json::to_value(t)?))
                 }
-                // ДОБАВЛЕНО (задача D): вместо заглушки — SSE-поток.
+                // ADDED (task D): a stub replaced by an SSE stream.
                 gateway_core::Reply::Streaming(rx) => Ok(DispatchResult::Streaming(rx)),
             }
         }
 
-        // ДОБАВЛЕНО: SDK-формат a2a-rs (метод SendMessage, camelCase/proto
-        // поля). Ответ рендерится через render_task_sdk — обёртка {task},
-        // TASK_STATE_*, ROLE_*. Семантическая ветка выше не меняется.
+        // ADDED: SDK format a2a-rs (SendMessage method, camelCase/proto
+        // fields). The response renders via render_task_sdk — {task} wrapper,
+        // TASK_STATE_*, ROLE_*. The semantic branch above is unchanged.
         "SendMessage" => {
             let task: Task = build_task_from_send_params_sdk(&request.params)?;
             match adapter.send_task_as(owner, task).await? {
                 gateway_core::Reply::Complete(t) => Ok(DispatchResult::Json(render_task_sdk(&t))),
-                // ДОБАВЛЕНО (задача D): вместо заглушки — SSE-поток.
+                // ADDED (task D): a stub replaced by an SSE stream.
                 gateway_core::Reply::Streaming(rx) => Ok(DispatchResult::Streaming(rx)),
             }
         }
@@ -834,10 +834,10 @@ async fn dispatch_a2a_method(
             Ok(DispatchResult::Json(serde_json::to_value(task)?))
         }
 
-        // ДОБАВЛЕНО: SDK-алиас tasks/get. Параметр "name" в SDK JSON-RPC
-        // содержит путь вида "tasks/<id>" — извлекаем id из хвоста, либо,
-        // если клиент прислал плоское "id" (не по спеке SDK, но щадящий
-        // разбор), берём его напрямую.
+        // ADDED: SDK alias for tasks/get. The "name" parameter in SDK JSON-RPC
+        // carries a path like "tasks/<id>" — extract the id from the tail, or,
+        // if the client sent a flat "id" (not per SDK spec, but lenient
+        // parsing), take it directly.
         "GetTask" => {
             let id = extract_sdk_task_id(&request.params)
                 .ok_or_else(|| anyhow::anyhow!("GetTask: id/name обязателен"))?;
@@ -857,14 +857,14 @@ async fn dispatch_a2a_method(
             Ok(DispatchResult::Json(serde_json::to_value(task)?))
         }
 
-        // ДОБАВЛЕНО (Фаза 3 буферного конфига, T4/resubscribe): продолжение
-        // стрима после разрыва соединения. Клиент передаёт последний
-        // обработанный seq (after_seq). Сначала сервер отдаёт историю из
-        // durable event_log (события с seq > after_seq, по возрастанию),
-        // затем — ДОБАВЛЕНО (Фаза 3.2) — live-продолжение из per-task hub:
-        // если стрим задачи ещё жив, новые события приходят вживую сразу
-        // после replay. Если event_log выключен в конфиге — ошибка:
-        // восстановить не из чего, лучше честный отказ, чем тихая пустота.
+        // ADDED (buffer-config Phase 3, T4/resubscribe): stream
+        // continuation after a connection drop. The client passes the last
+        // processed seq (after_seq). First the server serves history from the
+        // durable event_log (events with seq > after_seq, ascending),
+        // then — ADDED (Phase 3.2) — live continuation from the per-task hub:
+        // if the task's stream is still alive, new events arrive live right
+        // after replay. If event_log is disabled in config — error:
+        // there is nothing to restore from; an honest refusal beats a silent void.
         "tasks/resubscribe" => {
             let log = event_log.as_ref().ok_or_else(|| {
                 anyhow::anyhow!("tasks/resubscribe: event_log не включён в конфиге")
@@ -889,8 +889,8 @@ async fn dispatch_a2a_method(
             Ok(DispatchResult::Resubscribe(stream))
         }
 
-        // ДОБАВЛЕНО (Фаза 3): клиент перед reconnect может спросить
-        // последний маркер задачи. Ответ — { "seq": N, "task_id": "..." }.
+        // ADDED (Phase 3): before reconnect the client can query the
+        // task's last marker. Response — { "seq": N, "task_id": "..." }.
         "tasks/get-last-seq" => {
             let log = event_log.as_ref().ok_or_else(|| {
                 anyhow::anyhow!("tasks/get-last-seq: event_log не включён в конфиге")
@@ -918,9 +918,9 @@ async fn dispatch_a2a_method(
     }
 }
 
-/// SDK GetTask/CancelTask params несут либо {"name": "tasks/<id>"} (по
-/// спеке SDK), либо плоское {"id": "<id>"} (щадящий разбор — некоторые
-/// клиенты шлют так же, как в семантическом формате). Пробуем оба.
+/// SDK GetTask/CancelTask params carry either {"name": "tasks/<id>"} (per
+/// the SDK spec) or a flat {"id": "<id>"} (lenient parsing — some
+/// clients send it the same way as in the semantic format). Try both.
 fn extract_sdk_task_id(params: &Value) -> Option<String> {
     if let Some(name) = params.get("name").and_then(Value::as_str) {
         return name.rsplit('/').next().map(str::to_string);
@@ -936,11 +936,11 @@ fn build_task_from_send_params(params: &Value) -> anyhow::Result<Task> {
 
     let task_id = format!("task-{}", uuid_stub());
 
-    // ИСПРАВЛЕНО (аудит P1-1): contextId раньше приравнивался к task_id,
-    // то есть каждое сообщение начинало новый разговор, а на стороне
-    // адаптера все они всё равно попадали в одну общую сессию. Теперь
-    // contextId клиента уважается (штатное поле A2A), а если его нет —
-    // выдаётся новый и возвращается клиенту в Task.contextId.
+    // FIXED (audit P1-1): contextId used to be equated with task_id,
+    // i.e. every message started a new conversation, while on the adapter
+    // side they all landed in one shared session anyway. Now the client's
+    // contextId is respected (a standard A2A field), and if it's missing —
+    // a new one is issued and returned to the client in Task.contextId.
     let context_id = params
         .get("message")
         .and_then(|m| m.get("contextId"))
@@ -963,10 +963,10 @@ fn build_task_from_send_params(params: &Value) -> anyhow::Result<Task> {
     })
 }
 
-/// SDK-вариант build_task_from_send_params: использует normalize_message
-/// вместо прямого serde_json::from_value::<Message>, чтобы принять
-/// ROLE_USER/{text} без поля kind. contextId читается из camelCase (SDK)
-/// с фоллбэком на snake_case (на случай смешанных клиентов).
+/// SDK variant of build_task_from_send_params: uses normalize_message
+/// instead of direct serde_json::from_value::<Message>, to accept
+/// ROLE_USER/{text} without a kind field. contextId is read from camelCase (SDK)
+/// with a snake_case fallback (for mixed clients).
 fn build_task_from_send_params_sdk(params: &Value) -> anyhow::Result<Task> {
     let message_value = params
         .get("message")
@@ -998,10 +998,10 @@ fn build_task_from_send_params_sdk(params: &Value) -> anyhow::Result<Task> {
     })
 }
 
-/// ИСПРАВЛЕНО (аудит P1-3): был голый наносекундный таймстамп —
-/// предсказуемый и перечислимый ID задачи, что вместе с отсутствием
-/// проверки владельца в tasks/get открывало чужие задачи. Плюс убран
-/// unwrap() на системном времени.
+/// FIXED (audit P1-3): it was a bare nanosecond timestamp —
+/// a predictable, enumerable task ID, which together with the missing
+/// owner check in tasks/get exposed other parties' tasks. Also removed
+/// the unwrap() on system time.
 fn uuid_stub() -> String {
     use std::io::Read;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1028,8 +1028,8 @@ fn uuid_stub() -> String {
 mod tests {
     use super::*;
 
-    /// Регрессия: раньше все три причины отдавали 404 / -32601, и отказ
-    /// запуска агента выглядел в логах как опечатка в agent_id.
+    /// Regression: previously all three causes returned 404 / -32601, and an agent
+    /// spawn failure looked in logs like a typo in agent_id.
     #[test]
     fn unknown_agent_is_addressing_error() {
         let e = AdapterError::UnknownAgent("нет-такого".into());
@@ -1057,8 +1057,8 @@ mod tests {
         assert_eq!(e.status(), StatusCode::BAD_REQUEST);
     }
 
-    /// Причина отказа должна доходить до текста ошибки: оператор читает
-    /// её в ответе и в логе, и «недоступен» без причины бесполезно.
+    /// The refusal cause must reach the error text: the operator reads
+    /// it in the response and in the log, and "unavailable" without a cause is useless.
     #[test]
     fn unavailable_message_keeps_cause() {
         let e = AdapterError::Unavailable {

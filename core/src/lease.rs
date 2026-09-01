@@ -1,11 +1,11 @@
 //! core/src/lease.rs
 //!
-//! TurnLease: сериализация promptов на одну сессию. Без него два
-//! одновременных session/prompt (или task/send) к одному ACP-процессу
-//! перемешивают его stdin/stdout поток.
+//! TurnLease: serializes prompts for one session. Without it, two
+//! concurrent session/prompt (or task/send) calls to one ACP process
+//! interleave its stdin/stdout stream.
 //!
-//! Fail-closed: если лиз не получен за timeout, вызывающий код НЕ входит
-//! в критическую секцию (в отличие от тихого зависания).
+//! Fail-closed: if the lease is not acquired within the timeout, the caller does
+//! NOT enter the critical section (as opposed to hanging silently).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -24,8 +24,8 @@ pub struct TurnLease {
     locks: Mutex<HashMap<SessionId, Arc<Mutex<()>>>>,
 }
 
-/// RAII guard: лиз освобождается автоматически при Drop, даже если
-/// вызывающий код вернётся через `?` на середине обработки.
+/// RAII guard: the lease is released automatically on Drop, even if
+/// the caller returns via `?` in the middle of processing.
 pub struct TurnGuard(#[allow(dead_code)] OwnedMutexGuard<()>);
 
 impl TurnLease {
@@ -45,30 +45,30 @@ impl TurnLease {
         }
     }
 
-    /// Число сессий, за которыми сейчас числится лиз. Нужно, чтобы
-    /// утечку можно было измерить в тесте, а не только рассуждать о ней.
+    /// Number of sessions currently tracked with a lease. Needed so the
+    /// leak can be measured in a test, not just reasoned about.
     pub async fn tracked_sessions(&self) -> usize {
         self.locks.lock().await.len()
     }
 
-    /// Вызывается при закрытии сессии, чтобы не накапливать записи в HashMap.
+    /// Called when a session closes, so HashMap entries do not accumulate.
     pub async fn forget(&self, session: &SessionId) {
         self.locks.lock().await.remove(session);
     }
 }
 
-// ИСПРАВЛЕНО (найдено компилятором, E0119): ручной
-// `impl From<TurnLeaseTimeoutError> for anyhow::Error` конфликтовал с
-// blanket-impl из anyhow (`impl<E: StdError + Send + Sync> From<E>`).
-// TurnLeaseTimeoutError уже реализует StdError через thiserror, поэтому
-// конверсия через `?` работает и без этого impl — он просто лишний.
+// FIXED (caught by the compiler, E0119): a manual
+// `impl From<TurnLeaseTimeoutError> for anyhow::Error` conflicted with
+// the blanket impl from anyhow (`impl<E: StdError + Send + Sync> From<E>`).
+// TurnLeaseTimeoutError already implements StdError via thiserror, so
+// the `?` conversion works without this impl — it was simply redundant.
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Instant;
 
-    /// Тесты из docs/03-dev-guide-testing.md — в репо отсутствовали.
+    /// Tests from docs/03-dev-guide-testing.md — missing in the repo.
     #[tokio::test]
     async fn second_acquire_waits_for_first_release() {
         let lease = TurnLease::default();
@@ -101,7 +101,7 @@ mod tests {
         let _held = lease.acquire(&session, Duration::from_secs(1)).await.unwrap();
         let result = lease.acquire(&session, Duration::from_millis(50)).await;
 
-        // Fail-closed: ошибка, а не паника и не тихий проход в критическую секцию.
+        // Fail-closed: an error, not a panic and not a silent pass into the critical section.
         assert!(result.is_err());
     }
 

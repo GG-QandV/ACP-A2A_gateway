@@ -1,28 +1,28 @@
 // ============================================================================
 // gatewayd/tests/dispatch_sdk_wire.rs
 //
-// Contract-тесты нового SDK-wire пути в dispatch_a2a_method. Покрывают
-// найденные при аудите хвосты и конфликты с существующим кодом:
+// Contract tests for the new SDK-wire path in dispatch_a2a_method. They cover
+// audit leftovers and conflicts with the existing code found during the audit:
 //
-// 1. Регрессия: "message/send" (семантика) продолжает отвечать плоским
-//    Task без обёртки — новая ветка "SendMessage" не должна задеть старую.
-// 2. Конфликт кодов ошибок: неизвестный метод для СТАРОЙ ветки уходит через
-//    generic Err(e) → status=200, code=-32000 (см. rpc_handler as-is), а
-//    НЕ -32601. Значит "method not found" для SDK-имени с опечаткой
-//    (например "sendMessage" lowercase, которого нет ни в одной ветке)
-//    получит ТОТ ЖЕ -32000, а не -32601 — важно зафиксировать явно, чтобы
-//    клиентский error.rs (driver-a2a-client) не полагался на -32601 как на
-//    единственный признак "неправильный wire_format".
-// 3. ContextLost (-32010, downcast) не пересекается с новой SDK-веткой:
-//    adapter.send_task_as может вернуть ContextLost независимо от того,
-//    каким методом его вызвали — рендерер ошибки в rpc_handler остаётся
-//    общим и должен сработать одинаково для message/send и SendMessage.
-// 4. extract_sdk_task_id: параллельный путь params.name vs params.id — при
-//    одновременном присутствии обоих полей "name" должен иметь приоритет
-//    (по SDK-спеке), это неочевидное решение зафиксировано тестом.
-// 5. build_task_from_send_params_sdk: contextId camelCase должен победить
-//    over legacy context_id snake_case при одновременном наличии обоих —
-//    предотвращает скрытый паразитный конфликт двух источников contextId.
+// 1. Regression: "message/send" (semantic) keeps replying with a flat
+//    Task without a wrapper — the new "SendMessage" branch must not affect the old one.
+// 2. Error-code conflict: an unknown method for the OLD branch goes through
+//    generic Err(e) → status=200, code=-32000 (see rpc_handler as-is), and
+//    NOT -32601. So "method not found" for a misspelled SDK name
+//    (e.g. lowercase "sendMessage", present in neither branch)
+//    will get the SAME -32000, not -32601 — important to pin down explicitly so
+//    the client-side error.rs (driver-a2a-client) does not rely on -32601 as the
+//    sole sign of a "wrong wire_format".
+// 3. ContextLost (-32010, downcast) does not intersect the new SDK branch:
+//    adapter.send_task_as may return ContextLost regardless of which
+//    method it was called with — the error renderer in rpc_handler stays
+//    shared and must behave identically for message/send and SendMessage.
+// 4. extract_sdk_task_id: parallel path params.name vs params.id — when
+//    both fields are present at once, "name" must have priority
+//    (per the SDK spec); this non-obvious decision is pinned by a test.
+// 5. build_task_from_send_params_sdk: camelCase contextId must win
+//    over legacy snake_case context_id when both are present at once —
+//    prevents a hidden parasitic conflict of two contextId sources.
 // ============================================================================
 
 use protocol::a2a_sdk_compat::{normalize_message, render_task_sdk};
@@ -56,13 +56,13 @@ fn sample_completed_task(id: &str, ctx: &str) -> Task {
     }
 }
 
-// --- 1. Регрессия: семантический рендер не пересекается со SDK-рендером ---
+// --- 1. Regression: semantic rendering does not intersect with SDK rendering ---
 
 #[test]
 fn semantic_serialization_stays_flat_no_task_wrapper() {
     let task = sample_completed_task("task-1", "ctx-1");
-    // Путь "message/send" всё ещё использует прямой serde_json::to_value(t)
-    // — не render_task_sdk. Подтверждаем, что обёртки {task:...} там нет.
+    // The "message/send" path still uses direct serde_json::to_value(t)
+    // — not render_task_sdk. Confirming there is no {task:...} wrapper there.
     let flat = serde_json::to_value(&task).expect("serialize");
     assert!(flat.get("task").is_none(), "семантический ответ должен остаться плоским");
     assert_eq!(flat["id"], "task-1");
@@ -78,25 +78,25 @@ fn sdk_serialization_wraps_in_task_and_uses_upper_state() {
     assert_eq!(sdk["task"]["contextId"], "ctx-1");
 }
 
-// --- 2. TaskState kebab-case подтверждён реальным кодом a2a.rs ---
+// --- 2. TaskState kebab-case confirmed by the real a2a.rs code ---
 
 #[test]
 fn task_state_serializes_as_kebab_case_not_snake_case() {
     let status = TaskStatus { state: TaskState::InputRequired, message: None, timestamp: None };
     let v = serde_json::to_value(&status).expect("serialize");
-    // Подтверждение факта из protocol/src/a2a.rs: rename_all = "kebab-case".
-    // Прошлые ТЗ предполагали "input_required" (snake) — это было неверно.
+    // Confirmation of the fact from protocol/src/a2a.rs: rename_all = "kebab-case".
+    // Earlier specs assumed "input_required" (snake) — that was wrong.
     assert_eq!(v["state"], "input-required");
     assert_ne!(v["state"], "input_required");
 }
 
-// --- 3. normalize_message: конфликт двух форм role/part ---
+// --- 3. normalize_message: conflict between two role/part forms ---
 
 #[test]
 fn normalize_message_prefers_explicit_kind_tag_over_sdk_guess() {
-    // Part с "kind" присутствует — должен идти по семантической ветке,
-    // даже если также случайно есть "text" на верхнем уровне (защита от
-    // регрессии того же гапа, что был найден в клиентском wire/spec.rs).
+    // A Part with "kind" present — must go through the semantic branch,
+    // even if a top-level "text" also happens to be there (protection against
+    // regressing the same gap that was found in the client-side wire/spec.rs).
     let raw = json!({
         "role": "user",
         "parts": [{ "kind": "text", "text": "explicit" }]
@@ -123,22 +123,22 @@ fn normalize_message_handles_sdk_file_part_via_url() {
 
 #[test]
 fn normalize_message_rejects_empty_parts_as_unknown_part_not_panic() {
-    // Гап-регрессия: params.message.parts == [] раньше могло бы дать
-    // Ok(Message{parts: vec![]}) молча — здесь явно фиксируем поведение:
-    // пустой массив — валиден (0 частей — это ошибка бизнес-логики выше,
-    // не ошибка нормализации), просто убеждаемся, что не паникует.
+    // Gap regression: params.message.parts == [] could previously yield
+    // Ok(Message{parts: vec![]}) silently — here we pin the behavior explicitly:
+    // an empty array is valid (0 parts is a business-logic error higher up,
+    // not a normalization error); we just make sure it does not panic.
     let raw = json!({ "role": "user", "parts": [] });
     let msg = normalize_message(&raw).expect("empty parts must not panic");
     assert!(msg.parts.is_empty());
 }
 
-// --- 4. extract_sdk_task_id: приоритет name над id при конфликте ---
+// --- 4. extract_sdk_task_id: name takes priority over id on conflict ---
 //
-// extract_sdk_task_id не экспортирован из модуля напрямую в этом дифф-файле
-// (объявлен fn-приватным в transport_http.rs) — тест ниже фиксирует ожидаемое
-// поведение как контракт для ревью; при интеграции перенести в
-// gatewayd/src/transport_http.rs как #[cfg(test)] mod tests, где функция
-// видна напрямую (см. существующий блок tests в конце файла).
+// extract_sdk_task_id is not exported from the module directly in this diff file
+// (declared fn-private in transport_http.rs) — the test below pins the expected
+// behavior as a contract for review; on integration, move it into
+// gatewayd/src/transport_http.rs as #[cfg(test)] mod tests, where the function
+// is visible directly (see the existing tests block at the end of the file).
 
 #[test]
 fn extract_sdk_task_id_contract_name_wins_over_id() {
@@ -159,12 +159,12 @@ fn extract_sdk_task_id_contract_name_wins_over_id() {
     assert_eq!(extract_sdk_task_id(&params_empty), None);
 }
 
-// --- 5. contextId camelCase должен побеждать над snake_case при конфликте ---
+// --- 5. camelCase contextId must win over snake_case on conflict ---
 
 #[test]
 fn build_task_context_id_prefers_camel_case_over_snake_case() {
-    // Воспроизводит логику build_task_from_send_params_sdk без реального
-    // adapter — только разбор params.
+    // Reproduces the logic of build_task_from_send_params_sdk without a real
+    // adapter — only params parsing.
     fn resolve_context_id(params: &serde_json::Value) -> String {
         params
             .get("message")
@@ -181,13 +181,13 @@ fn build_task_context_id_prefers_camel_case_over_snake_case() {
     assert_eq!(resolve_context_id(&params), "ctx-camel");
 }
 
-// --- 6. Живой contract-тест диспетчера через mock axum-роут ---
+// --- 6. Live dispatcher contract test via a mock axum router ---
 //
-// Полный E2E с реальным AcpAsA2a/SupervisedStdioAgent не поднимается в
-// unit-тесте (требует spawn процесса) — покрывается отдельно "живым E2E"
-// по DoD ТЗ (docs/design/SPEC-add-adapterd-wire-format.md §5, п.4), вручную
-// или в CI-джобе с mock-агентом. Здесь фиксируем только чистую сериализацию
-// пары normalize_message → render_task_sdk без сети.
+// A full E2E with a real AcpAsA2a/SupervisedStdioAgent does not come up in a
+// unit test (requires spawning a process) — it is covered separately by "live E2E"
+// per the spec DoD (docs/design/SPEC-add-adapterd-wire-format.md §5, item 4), manually
+// or in a CI job with a mock agent. Here we pin only the pure serialization
+// of the normalize_message → render_task_sdk pair, without networking.
 #[test]
 fn full_roundtrip_sdk_message_to_sdk_task_without_network() {
     let raw_request = json!({
@@ -197,8 +197,8 @@ fn full_roundtrip_sdk_message_to_sdk_task_without_network() {
     let inbound = normalize_message(&raw_request).expect("normalize inbound");
     assert!(matches!(inbound.role, MessageRole::User));
 
-    // Симулируем, что adapter.send_task_as вернул Completed с этим же текстом
-    // отражённым в артефакте (реальный adapter делает это по-своему).
+    // Simulating that adapter.send_task_as returned Completed with this same text
+    // reflected in the artifact (the real adapter does it its own way).
     let mut task = sample_completed_task("task-echo", "ctx-echo");
     task.status.message = Some(inbound);
     let outbound = render_task_sdk(&task);

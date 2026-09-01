@@ -1,4 +1,4 @@
-//! protocol/src/acp.rs — точная схема по agentclientprotocol.com/protocol/v1/schema
+//! protocol/src/acp.rs — exact schema per agentclientprotocol.com/protocol/v1/schema
 
 use serde::{Deserialize, Serialize};
 
@@ -10,12 +10,12 @@ pub struct SessionId(pub String);
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InitializeRequest {
-    /// ИЗМЕНЕНО: было String. По ACP версия протокола — число, и шлюз
-    /// обязан слать её числом; толерантность уместна на приёме, но не
-    /// в собственном представлении (закон Постела: либерален на входе,
-    /// строг на выходе). Раньше внутренний тип не соответствовал
-    /// протоколу, и шлюз отправлял агенту строку "1" — claurst это
-    /// проглотил, строгий парсер отверг бы.
+    /// CHANGED: was String. Per ACP the protocol version is a number, and the
+    /// gateway must send it as a number; tolerance is appropriate at ingestion,
+    /// not in our own representation (Postel's law: liberal in what you accept,
+    /// strict in what you emit). Previously the internal type did not match
+    /// the protocol, and the gateway sent the agent the string "1" — claurst
+    /// swallowed it, a strict parser would have rejected it.
     #[serde(deserialize_with = "de_protocol_version")]
     pub protocol_version: ProtocolVersion,
     #[serde(default)]
@@ -51,10 +51,10 @@ pub struct Implementation {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InitializeResponse {
-    /// Версия протокола. claurst отвечает числом (1), встречаются
-    /// реализации со строкой — принимаем оба, храним и отдаём числом.
-    // default = функция, а не Default::default(): у u32 он равен 0,
-    // а отсутствующее поле означает версию 1, не нулевую.
+    /// Protocol version. claurst answers with a number (1), some
+    /// implementations send a string — we accept both, store and return a number.
+    // default = a function, not Default::default(): for u32 it equals 0,
+    // while an absent field means version 1, not a zero one.
     #[serde(default = "default_protocol_version", deserialize_with = "de_protocol_version")]
     pub protocol_version: ProtocolVersion,
     #[serde(default)]
@@ -65,19 +65,19 @@ pub struct InitializeResponse {
     pub auth_methods: Vec<AuthMethod>,
 }
 
-/// Версия ACP. Сериализуется всегда числом.
+/// ACP version. Always serialized as a number.
 pub type ProtocolVersion = u32;
 
-/// Версия по умолчанию, если агент поле не прислал.
+/// Default version when the agent did not send the field.
 pub const DEFAULT_PROTOCOL_VERSION: ProtocolVersion = 1;
 
 fn default_protocol_version() -> ProtocolVersion {
     DEFAULT_PROTOCOL_VERSION
 }
 
-/// Либеральный приём: число, строка с числом или строка вида "1.0"
-/// (берём мажорную часть). Всё, что не разбирается, — ошибка на границе,
-/// а не мусор, доехавший до логики.
+/// Lenient ingestion: a number, a numeric string, or a string like "1.0"
+/// (we take the major part). Anything unparsable is an error at the boundary,
+/// not garbage that reached the logic.
 fn de_protocol_version<'de, D>(d: D) -> Result<ProtocolVersion, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -149,11 +149,11 @@ pub struct SessionCapabilities {
     pub resume: bool,
 }
 
-/// ДОБАВЛЕНО (интеграция hermes, T-002): sessionCapabilities парсится
-/// либерально — и bool (claurst), и любой другой JSON-узел (hermes шлёт
-/// объекты: `list: {}`, `resume: {}`). Значение поля нигде не читается,
-/// поэтому чужие формы не должны ронять десериализацию initialize.
-/// Не замена bool на другой тип, а добавление толерантности на входе.
+/// ADDED (hermes integration, T-002): sessionCapabilities is parsed
+/// leniently — both a bool (claurst) and any other JSON node (hermes sends
+/// objects: `list: {}`, `resume: {}`). The field value is not read anywhere,
+/// so foreign shapes must not break initialize deserialization.
+/// Not a replacement of bool with another type, but adding tolerance at input.
 fn de_bool_lenient<'de, D>(d: D) -> Result<bool, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -265,12 +265,12 @@ pub enum StopReason {
 #[serde(rename_all = "camelCase")]
 pub struct PromptResponse {
     pub stop_reason: StopReason,
-    /// ДОБАВЛЕНО (аудит P2-1): содержательный ответ агента. Приходит от
-    /// агента через session/update-нотификации (AgentMessageChunk) —
-    /// раньше их некуда было положить и они выбрасывались, из-за чего
-    /// A2A-клиент получал Task вообще без Part'ов.
-    /// Поле опционально: агенты, кладущие контент прямо в результат
-    /// session/prompt, тоже работают.
+    /// ADDED (audit P2-1): the agent's substantive response. It arrives from
+    /// the agent via session/update notifications (AgentMessageChunk) —
+    /// previously there was nowhere to put them and they were discarded, so
+    /// the A2A client got a Task with no Parts at all.
+    /// The field is optional: agents that put content directly into the
+    /// session/prompt result work too.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub content: Vec<ContentBlock>,
 }

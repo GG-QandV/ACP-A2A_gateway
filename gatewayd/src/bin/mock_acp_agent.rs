@@ -1,20 +1,20 @@
 //! gatewayd/src/bin/mock_acp_agent.rs
-//! Тестовый ACP-агент для интеграционных тестов gatewayd (E2E-харнес).
+//! Test ACP agent for gatewayd integration tests (E2E harness).
 //!
-//! Говорит по ACP (JSON-RPC 2.0 over stdio) ровно настолько, насколько
-//! нужно шлюзу: initialize, session/new, session/prompt. Ответы собираются
-//! по схеме protocol/src/acp.rs (camelCase, "type" как дискриминатор
-//! ContentBlock, stopReason "end_turn"). Любой другой запрос с id
-//! получает -32601 method_not_found.
+//! Speaks ACP (JSON-RPC 2.0 over stdio) exactly as much as
+//! the gateway needs: initialize, session/new, session/prompt. Responses are built
+//! per the protocol/src/acp.rs schema (camelCase, "type" as the
+//! ContentBlock discriminator, stopReason "end_turn"). Any other request with an id
+//! gets -32601 method_not_found.
 //!
-//! Режимы через окружение (задаются в Registry/AgentEntry теста):
-//!   MOCK_AGENT_PROMPT_TEXT        — текст ответа (по умолчанию "pong")
-//!   MOCK_AGENT_EXIT_AFTER_PROMPTS — после N успешных session/prompt
-//!                                   ответить и выйти с кодом 0. Нужно для
-//!                                   теста ContextLost: процесс умирает,
-//!                                   супервизор перезапускает его (поколение
-//!                                   растёт), и разговор старого поколения
-//!                                   помечается потерянным.
+//! Modes via environment variables (set in Registry/AgentEntry of the test):
+//!   MOCK_AGENT_PROMPT_TEXT        — response text (default "pong")
+//!   MOCK_AGENT_EXIT_AFTER_PROMPTS — after N successful session/prompt
+//!                                   calls, respond and exit with code 0. Needed for
+//!                                   the ContextLost test: the process dies,
+//!                                   the supervisor restarts it (the generation
+//!                                   counter grows), and the old-generation conversation
+//!                                   is marked as lost.
 
 use std::io::{BufRead, Write};
 use std::thread;
@@ -55,7 +55,7 @@ fn main() {
             continue;
         };
 
-        // Notification (без id): session/cancel и прочее — отвечать нечего.
+        // Notification (no id): session/cancel and the like — nothing to answer.
         let Some(id) = msg.get("id").cloned() else {
             continue;
         };
@@ -77,9 +77,9 @@ fn main() {
             }
             "session/prompt" => {
                 prompts_served += 1;
-                // ДОБАВЛЕНО (тесты стриминга): перед финальным ответом
-                // уходят чанки agent_message_chunk, каждый со своей
-                // задержкой — чтобы тест ловил их по одному, не батчем.
+                // ADDED (streaming tests): before the final response
+                // agent_message_chunk chunks are emitted, each with its own
+                // delay — so the test catches them one by one, not as a batch.
                 if stream_chunks > 0 {
                     let session_id = msg
                         .pointer("/params/sessionId")
@@ -115,8 +115,8 @@ fn main() {
                         let _ = out.flush();
                     }
                 }
-                // Отвечаем на промпт, затем, если достигнут лимит — умираем.
-                // Задержка перед финальным ответом — для теста idle_chunk_timeout.
+                // Respond to the prompt, then, if the limit is reached — die.
+                // Delay before the final response — for the idle_chunk_timeout test.
                 if final_delay_ms > 0 {
                     thread::sleep(Duration::from_millis(final_delay_ms));
                 }

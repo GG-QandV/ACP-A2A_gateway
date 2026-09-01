@@ -1,16 +1,16 @@
 //! gatewayd/tests/streaming_http.rs
 //!
-//! T3 (Часть 1 роадмапа стриминга): реальный HTTP SSE-клиент получает
-//! несколько A2aEvent до терминального (final: true). Использует тот же
-//! внутрипроцессный харнес, что rest_transport.rs: Registry -> реальный
-//! stdio-процесс mock_acp_agent (с MOCK_AGENT_STREAM_CHUNKS), роутер —
-//! из lib-части gatewayd, запрос через tower::ServiceExt::oneshot.
+//! T3 (Streaming roadmap Part 1): a real HTTP SSE client receives
+//! several A2aEvents before the terminal one (final: true). Uses the same
+//! in-process harness as rest_transport.rs: Registry -> real
+//! mock_acp_agent stdio process (with MOCK_AGENT_STREAM_CHUNKS), the router is
+//! from the gatewayd lib part, the request goes through tower::ServiceExt::oneshot.
 //!
-//! Mock-агент шлёт 3 чанка agent_message_chunk с задержкой, затем
-//! финальный PromptResponse. Через convert.rs (направление 4) каждый
-//! чанк становится A2aEvent::TaskStatusUpdate(final:false), терминал —
-//! TaskStatusUpdate(final:true). SSE-клиент должен увидеть несколько
-//! событий до final-маркера.
+//! The mock agent sends 3 agent_message_chunk chunks with a delay, then
+//! a final PromptResponse. Through convert.rs (direction 4) each
+//! chunk becomes A2aEvent::TaskStatusUpdate(final:false), the terminal one —
+//! TaskStatusUpdate(final:true). The SSE client should see several
+//! events before the final marker.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -78,7 +78,7 @@ async fn request_body_for(app: &axum::Router, agent_id: &str, body: Value) -> Re
         .expect("request completes")
 }
 
-/// T3: реальный SSE-клиент получает несколько событий до final: true.
+/// T3: a real SSE client receives several events before final: true.
 #[tokio::test]
 async fn sse_client_receives_multiple_events_before_final() {
     let mut env = HashMap::new();
@@ -121,7 +121,7 @@ async fn sse_client_receives_multiple_events_before_final() {
         .expect("SSE тело читается");
 
     let text = String::from_utf8_lossy(&body).to_string();
-    // Каждое событие — "data: {json}\n\n". Считаем A2aEvent-события.
+    // Each event is "data: {json}\n\n". Count the A2aEvent events.
     let events: Vec<&str> = text
         .split("data: ")
         .filter(|s| s.starts_with('{'))
@@ -136,7 +136,7 @@ async fn sse_client_receives_multiple_events_before_final() {
     for raw in &events {
         let json_part = raw.split("\n\n").next().unwrap_or("");
         if let Ok(v) = serde_json::from_str::<Value>(json_part) {
-            // SSE-фрейм содержит A2aEvent TaskStatusUpdate
+            // The SSE frame contains an A2aEvent TaskStatusUpdate
             if v.get("status").is_some() {
                 let is_final = v.get("final").and_then(Value::as_bool).unwrap_or(false);
                 if !is_final {
@@ -153,10 +153,10 @@ async fn sse_client_receives_multiple_events_before_final() {
     assert!(has_terminal, "должен быть терминальный final:true: {text}");
 }
 
-/// Р-24: несуществующий agent_id возвращает 404 (UnknownAgent из lookup),
-/// а не 503 (StreamCapacityExhausted из try_acquire_stream) — порядок
-/// «lookup раньше permit» не должен регрессировать: если кто-то в будущем
-/// поменяет порядок, этот тест поймает регрессию.
+/// P-24: a nonexistent agent_id returns 404 (UnknownAgent from lookup),
+/// not 503 (StreamCapacityExhausted from try_acquire_stream) — the
+/// "lookup before permit" order must not regress: if someone in the future
+/// swaps the order, this test catches the regression.
 #[tokio::test]
 async fn unknown_agent_returns_404_not_503() {
     let app = build_router("hermes-stream", HashMap::new());

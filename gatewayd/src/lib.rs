@@ -1,8 +1,8 @@
 //! gatewayd/src/lib.rs
-//! Библиотечная часть бинаря gatewayd. Модули вынесены сюда, чтобы
-//! интеграционные тесты (gatewayd/tests/) могли собирать Router и
-//! Registry без запуска полного процесса: lib не зависит от main() и
-//! от чтения конфига, поэтому тест-харнес подключает свой Registry.
+//! Library part of the gatewayd binary. Modules live here so that
+//! integration tests (gatewayd/tests/) can build Router and
+//! Registry without launching the full process: lib does not depend on
+//! main() or on reading the config, so the test harness plugs in its own Registry.
 
 pub mod approvals;
 pub mod config;

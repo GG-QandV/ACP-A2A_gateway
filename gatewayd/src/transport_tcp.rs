@@ -1,5 +1,5 @@
 //! gatewayd/src/transport_tcp.rs
-//! Направления 1 (ACP<->ACP passthrough) и 3 (ACP-клиент -> A2A-агент).
+//! Directions 1 (ACP<->ACP passthrough) and 3 (ACP client -> A2A agent).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -16,13 +16,13 @@ use tokio::process::Command;
 
 use crate::registry::{Registry, Transport};
 
-/// ДОБАВЛЕНО (аудит P1-5): read_line читал строку неограниченной длины —
-/// один клиент мог выесть память процесса одной строкой без \n.
+/// ADDED (audit P1-5): read_line used to read a line of unlimited length —
+/// a single client could exhaust process memory with one line without \n.
 const MAX_LINE_BYTES: u64 = 8 * 1024 * 1024;
-/// ДОБАВЛЕНО (аудит P1-5): молчащее соединение висело вечно (slowloris).
+/// ADDED (audit P1-5): an idle connection used to hang forever (slowloris).
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// read_line с потолком. Семантика возврата та же: Ok(0) на EOF.
+/// read_line with a cap. Return semantics are the same: Ok(0) on EOF.
 async fn read_line_limited<R: tokio::io::AsyncBufRead + Unpin>(
     reader: &mut R,
     line: &mut String,
@@ -133,8 +133,8 @@ async fn handle_stdio_passthrough(
     cmd.stdin(std::process::Stdio::piped());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::inherit());
-    // ИСПРАВЛЕНО (аудит P2-9): без kill_on_drop процесс агента переживал
-    // соединение и оставался сиротой при панике/отмене таска.
+    // FIXED (audit P2-9): without kill_on_drop the agent process outlived
+    // the connection and remained an orphan on task panic/cancellation.
     cmd.kill_on_drop(true);
 
     let mut child = cmd.spawn()?;
@@ -177,9 +177,9 @@ async fn handle_stdio_passthrough(
     Ok(())
 }
 
-/// ИСПРАВЛЕНО (аудит P2-3): поле id было обязательным, поэтому
-/// JSON-RPC notification не парсился и клиент получал parse error.
-/// В ACP session/cancel — именно notification (см. core/src/agent.rs).
+/// FIXED (audit P2-3): the id field was mandatory, so a
+/// JSON-RPC notification did not parse and the client got a parse error.
+/// In ACP session/cancel it is exactly a notification (see core/src/agent.rs).
 #[derive(Debug, Deserialize)]
 struct JsonRpcRequest {
     #[serde(default)]
@@ -209,9 +209,9 @@ struct JsonRpcErrBody {
     message: String,
 }
 
-/// Параметры TCP-обработчика A2A-агента (задача E): registry и agent_id
-/// нужны для лимита параллельных стримов (try_acquire_stream) — отдельной
-/// структурой, чтобы не раздувать сигнатуру до 8 аргументов.
+/// Parameters of the TCP handler for an A2A agent (task E): registry and agent_id
+/// are needed for the concurrent-stream limit (try_acquire_stream) — as a
+/// separate struct to avoid bloating the signature to 8 arguments.
 struct HttpTargetParams {
     url: String,
     push_token: Option<String>,
@@ -255,7 +255,7 @@ async fn handle_http_target(
 
         let response = dispatch_acp_method(&adapter, &request).await;
 
-        // Notification (id отсутствует): по JSON-RPC ответ не отправляется.
+        // Notification (id absent): per JSON-RPC no response is sent.
         let Some(id) = request.id.clone() else {
             if let Err(e) = response {
                 tracing::warn!(method = %request.method, error = %e, "notification failed");
@@ -265,11 +265,11 @@ async fn handle_http_target(
 
         match response {
             Ok(AcpDispatchResult::Json(result)) => write_ok(&mut writer, id, result).await?,
-            // ДОБАВЛЕНО (задача E): поток SessionUpdate пишется в тот же
-            // TCP-сокет построчно — каждая нотификация session/update,
-            // до закрытия канала.
-            // ДОБАВЛЕНО (Часть 2, задача A): лимит параллельных стримов —
-            // permit живёт в scope до конца записи потока (RAII).
+            // ADDED (task E): the SessionUpdate stream is written to the same
+            // TCP socket line by line — each one a session/update notification,
+            // until the channel closes.
+            // ADDED (Part 2, task A): concurrent-stream limit —
+            // the permit lives in scope until the stream write finishes (RAII).
             Ok(AcpDispatchResult::Streaming(mut rx)) => {
                 let _permit = match registry.try_acquire_stream(&agent_id) {
                     Ok(p) => p,
@@ -292,7 +292,7 @@ async fn handle_http_target(
                     let mut bytes = serde_json::to_vec(&payload)?;
                     bytes.push(b'\n');
                     if let Err(e) = writer.write_all(&bytes).await {
-                        // ЛОГ-ЛОВУШКА (ERROR, по умолчанию включена):
+                        // LOG TRAP (ERROR, enabled by default):
                         tracing::error!(
                             session_id = %session_id,
                             error = %e,
@@ -309,9 +309,9 @@ async fn handle_http_target(
     Ok(())
 }
 
-/// Результат ACP-диспетчера: синхронный JSON (Complete) либо поток
-/// SessionUpdate (Streaming) — построчно пишется в TCP-сокет как
-/// session/update-нотификации.
+/// Result of the ACP dispatcher: synchronous JSON (Complete) or a
+/// SessionUpdate stream (Streaming) — written line by line to the TCP socket as
+/// session/update notifications.
 enum AcpDispatchResult {
     Json(Value),
     Streaming(tokio::sync::mpsc::UnboundedReceiver<protocol::acp::SessionUpdate>),
@@ -338,8 +338,8 @@ async fn dispatch_acp_method(
                 gateway_core::Reply::Complete(resp) => {
                     Ok(AcpDispatchResult::Json(serde_json::to_value(resp)?))
                 }
-                // ДОБАВЛЕНО (задача E): вместо заглушки — поток SessionUpdate,
-                // который handle_http_target пишет построчно в TCP-сокет.
+                // ADDED (task E): instead of a stub — a SessionUpdate stream,
+                // which handle_http_target writes line by line to the TCP socket.
                 gateway_core::Reply::Streaming(rx) => Ok(AcpDispatchResult::Streaming(rx)),
             }
         }

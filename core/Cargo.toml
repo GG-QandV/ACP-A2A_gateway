@@ -1,5 +1,5 @@
-# ПЕРЕИМЕНОВАН: name = "core" конфликтовал со встроенным crate `core`
-# из extern prelude -> error[E0659]: `core` is ambiguous в gatewayd.
+# RENAMED: name = "core" conflicted with the builtin crate `core`
+# from the extern prelude -> error[E0659]: `core` is ambiguous in gatewayd.
 [package]
 name = "gateway-core"
 version.workspace = true
@@ -17,15 +17,15 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tracing = { workspace = true }  # ДОБАВЛЕНО (аудит P2-10): супервизор логирует перезапуски
+tracing = { workspace = true }  # ADDED (audit P2-10): supervisor logs restarts
 chrono = { version = "0.4", features = ["clock"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }
-futures-util = "0.3"  # ДОБАВЛЕНО (T4): StreamExt для SSE-клиента
-hmac = "0.12"         # ДОБАВЛЕНО (HMAC токена)
-sha2 = "0.10"         # ДОБАВЛЕНО (HMAC токена)
+futures-util = "0.3"  # ADDED (T4): StreamExt for the SSE client
+hmac = "0.12"         # ADDED (token HMAC)
+sha2 = "0.10"         # ADDED (token HMAC)
 
 [dev-dependencies]
 tempfile = "3"
-filetime = "0.2"  # тестам нужно состарить файл, чтобы проверить уборку
-axum = "0.7"      # ДОБАВЛЕНО (T4): mock SSE-сервер для HttpA2aAgent
+filetime = "0.2"  # tests need to age a file to verify cleanup
+axum = "0.7"      # ADDED (T4): mock SSE server for HttpA2aAgent
 tower = { version = "0.4", features = ["util"] }

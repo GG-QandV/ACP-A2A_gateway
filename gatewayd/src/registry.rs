@@ -1,6 +1,6 @@
 //! gatewayd/src/registry.rs
-//! Плоский реестр агентов + токен-проверка. Токен — allow/deny на вход
-//! в гейтвей, не привязан к списку агентов.
+//! Flat agent registry + token check. The token is allow/deny for entry
+//! into the gateway, not bound to the agent list.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -21,21 +21,21 @@ pub enum Transport {
 #[derive(Debug, Clone)]
 pub struct AgentEntry {
     pub transport: Transport,
-    /// Семафор параллельных стримов на агента (Часть 2 роадмапа стриминга).
-    /// Ёмкость задаётся из конфига `streaming.max_concurrent_streams`,
-    /// не хардкодится.
+    /// Semaphore for concurrent streams per agent (Streaming roadmap Part 2).
+    /// Capacity comes from the `streaming.max_concurrent_streams` config,
+    /// not hardcoded.
     pub stream_permits: Arc<tokio::sync::Semaphore>,
-    /// Заданная ёмкость семафора (Semaphore не хранит её публично).
+    /// Configured semaphore capacity (Semaphore does not store it publicly).
     pub stream_limit: usize,
-    /// ДОБАВЛЕНО (Часть 2 роадмапа стриминга): таймаут ДО первого чанка
-    /// стрима агента — из конфига `streaming.first_chunk_timeout_secs`.
+    /// ADDED (Streaming roadmap Part 2): timeout BEFORE the first chunk
+    /// of the agent stream — from the `streaming.first_chunk_timeout_secs` config.
     pub first_chunk_timeout: std::time::Duration,
-    /// ДОБАВЛЕНО (Часть 2 роадмапа стриминга): таймаут МЕЖДУ чанками
-    /// стрима агента — из конфига `streaming.idle_chunk_timeout_secs`.
+    /// ADDED (Streaming roadmap Part 2): timeout BETWEEN chunks
+    /// of the agent stream — from the `streaming.idle_chunk_timeout_secs` config.
     pub idle_chunk_timeout: std::time::Duration,
 }
 
-/// ДОБАВЛЕНО (Фаза 5): одна строка сводки занятых слотов стримов.
+/// ADDED (Phase 5): one summary line of occupied stream slots.
 #[derive(Debug, Clone)]
 pub struct StreamUsage {
     pub agent_id: String,
@@ -86,8 +86,8 @@ impl Registry {
         self.agents.get(agent_id)
     }
 
-    /// ДОБАВЛЕНО (Фаза 5, health-мониторинг): сводка занятых слотов
-    /// стримов по всем агентам — для периодического health-чека.
+    /// ADDED (Phase 5, health monitoring): summary of occupied stream
+    /// slots across all agents — for the periodic health check.
     pub fn stream_usage(&self) -> Vec<StreamUsage> {
         let mut usage: Vec<StreamUsage> = self
             .agents
@@ -102,8 +102,8 @@ impl Registry {
         usage
     }
 
-    /// Пытается занять слот стрима на агента (fail-closed). Возвращает
-    /// permit — держать до конца стрима, чтобы освободить слот.
+    /// Tries to acquire a stream slot on an agent (fail-closed). Returns
+    /// a permit — hold it until the stream ends to release the slot.
     pub fn try_acquire_stream(
         &self,
         agent_id: &str,
@@ -179,7 +179,7 @@ mod tests {
         assert!(reg.lookup("nonexistent").is_none());
     }
 
-    /// T7: семафор отклоняет запрос сверх лимита — явная ошибка, не зависание.
+    /// T7: the semaphore rejects requests beyond the limit — explicit error, no hang.
     #[test]
     fn semaphore_rejects_stream_beyond_limit() {
         let tokens: HashSet<String> = ["t-valid".to_string()].into_iter().collect();
@@ -214,8 +214,8 @@ mod tests {
         assert!(err.to_string().contains("nonexistent"));
     }
 
-    /// T7: drop permit'а (RAII, как TurnGuard) освобождает слот — новый
-    /// стрим проходит после того, как предыдущий закрылся.
+    /// T7: dropping the permit (RAII, like TurnGuard) frees the slot — a new
+    /// stream goes through after the previous one closed.
     #[test]
     fn releasing_a_permit_allows_new_stream() {
         let tokens: HashSet<String> = ["t-valid".to_string()].into_iter().collect();

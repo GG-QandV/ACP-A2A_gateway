@@ -1,23 +1,23 @@
 //! gatewayd/src/dialect_probe.rs
 //!
-//! Диалект-зонд для Направления 2 (A2A-клиент -> A2A-агент, passthrough).
-//! Реализует §3 тЗ (SPEC-a2a-dialects-gateway-adapter.md): шлюз сам ходит к
-//! сторонним A2A-агентам через transport_a2a_passthrough (Transport::Http{url,
-//! push_token}) и должен знать, на каком диалекте (SDK/Spec) агент отвечает
-//! ДО того, как проксировать первый реальный запрос клиента.
+//! Dialect probe for Direction 2 (A2A client -> A2A agent, passthrough).
+//! Implements §3 of the spec (SPEC-a2a-dialects-gateway-adapter.md): the gateway itself goes to
+//! third-party A2A agents via transport_a2a_passthrough (Transport::Http{url,
+//! push_token}) and must know which dialect (SDK/Spec) the agent answers in
+//! BEFORE proxying the first real client request.
 //!
-//! Принцип (§3.1 тЗ): зонд идемпотентен — GetTask/tasks/get с несуществующим
-//! task_id (случайный UUID), НЕ SendMessage/message/send (те создают задачу).
-//! Результат кэшируется на agent_id — один зонд на первый контакт.
+//! Principle (§3.1 of the spec): the probe is idempotent — GetTask/tasks/get with a nonexistent
+//! task_id (random UUID), NOT SendMessage/message/send (those create a task).
+//! The result is cached on agent_id — one probe per first contact.
 //!
-//! Распознавание "метод не найден" — по коду -32601 (стандартный JSON-RPC
-//! 2.0) ИЛИ по нормализованному тексту с несколькими известными
-//! формулировками ("method not found", "method_not_found", "unknown
-//! method") — НЕ по одной точной подстроке конкретного шлюза. Тот же
-//! фикс, что применён в клиентском
-//! driver-a2a-client/src/dialect_probe.rs (D1): стандартный сервер
-//! отвечает -32601 "Method not found" без двоеточия, точная подстрока
-//! "method_not_found:" это пропускает.
+//! "method not found" recognition — by code -32601 (standard JSON-RPC
+//! 2.0) OR by normalized text with several known
+//! wordings ("method not found", "method_not_found", "unknown
+//! method") — NOT by one exact substring of a particular gateway. The same
+//! fix as applied in the client-side
+//! driver-a2a-client/src/dialect_probe.rs (D1): a standard server
+//! answers -32601 "Method not found" without a colon, the exact substring
+//! "method_not_found:" misses this.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -62,10 +62,10 @@ impl DialectCache {
         self.cache.insert(agent_id.to_string(), dialect);
     }
 
-    /// Инвалидация кэшированного диалекта (D3): вызывается, когда реальный
-    /// (не зондовый) проксируемый запрос вернул MethodNotFound — признак
-    /// того, что закэшированный диалект неверен для этого endpoint.
-    /// Следующий запрос к agent_id выполнит зонд заново.
+    /// Invalidation of the cached dialect (D3): called when a real
+    /// (non-probe) proxied request returned MethodNotFound — a sign
+    /// that the cached dialect is wrong for this endpoint.
+    /// The next request to agent_id runs the probe again.
     pub fn remove(&self, agent_id: &str) {
         self.cache.remove(agent_id);
     }
@@ -146,17 +146,17 @@ async fn try_probe_request(
     Ok(interpret_probe_response(&body).then_some(candidate))
 }
 
-/// ИСПРАВЛЕНО (тот же D1-принцип, что в driver-a2a-client): проверяет код
-/// -32601 (стандартный JSON-RPC "method not found") ИЛИ нормализованный
-/// текст с несколькими формулировками, а не одну точную подстроку.
+/// FIXED (same D1 principle as in driver-a2a-client): checks code
+/// -32601 (standard JSON-RPC "method not found") OR normalized
+/// text with several wordings, not one exact substring.
 fn interpret_probe_response(body: &Value) -> bool {
     !response_indicates_method_not_found(body)
 }
 
-/// Распознаёт MethodNotFound в JSON-RPC-ответе (общая для зонда и для
-/// инвалидации кэша D3). True = сервер не распознал метод — по коду -32601
-/// (стандарт JSON-RPC 2.0) ИЛИ нормализованному тексту ("method not found",
-/// "method_not_found", "unknown method"). False = сервер понял метод.
+/// Recognizes MethodNotFound in a JSON-RPC response (shared by the probe and by
+/// the D3 cache invalidation). True = the server did not recognize the method — by code -32601
+/// (JSON-RPC 2.0 standard) OR normalized text ("method not found",
+/// "method_not_found", "unknown method"). False = the server understood the method.
 pub fn response_indicates_method_not_found(body: &Value) -> bool {
     const JSONRPC_STANDARD_METHOD_NOT_FOUND: i64 = -32601;
 

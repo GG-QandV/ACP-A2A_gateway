@@ -7,9 +7,9 @@ edition.workspace = true
 name = "gatewayd"
 path = "src/main.rs"
 
-# Тестовый ACP-агент для E2E-харнеса интеграционных тестов
-# (gatewayd/tests/rest_transport.rs). Собственный бинарь, а не боевой:
-# путь подставляется в Registry через CARGO_BIN_EXE_mock_acp_agent.
+# Test ACP agent for the E2E harness of integration tests
+# (gatewayd/tests/rest_transport.rs). Its own binary, not production:
+# the path is injected into Registry via CARGO_BIN_EXE_mock_acp_agent.
 [[bin]]
 name = "mock_acp_agent"
 path = "src/bin/mock_acp_agent.rs"
@@ -32,11 +32,11 @@ uuid = { workspace = true }
 tokio-stream = "0.1"
 futures-util = "0.3"
 tracing-appender = "0.2"
-# Часть 4 роадмапа стриминга (4.4): gzip-компрессия ротированных
-# лог-файлов при compress_rotated: true.
+# Streaming roadmap Part 4 (4.4): gzip compression of rotated
+# log files when compress_rotated: true.
 flate2 = "1"
-# Фаза 1 буферного конфига: durable event_log/task_store. bundled — своя
-# статическая sqlite3, не зависит от системной библиотеки (устойчивость).
+# Buffer config Phase 1: durable event_log/task_store. bundled — own
+# static sqlite3, independent of the system library (robustness).
 rusqlite = { version = "0.31", features = ["bundled"] }
 
 [dev-dependencies]

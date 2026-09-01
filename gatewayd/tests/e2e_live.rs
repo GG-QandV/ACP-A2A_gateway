@@ -1,20 +1,20 @@
 //! gatewayd/tests/e2e_live.rs
 //!
-//! Живой E2E шлюза (ТЗ §2.6 п.4, направление 2): реальный HTTP-запрос к
-//! поднятому gatewayd с агентом hermes-main (hermes acp). В отличие от
-//! rest_transport.rs (внутрипроцессный харнес на mock_acp_agent) — идёт
-//! через сеть к живому процессу шлюза и реальному агенту.
+//! Live gateway E2E (spec §2.6 item 4, direction 2): a real HTTP request to
+//! a running gatewayd with the hermes-main agent (hermes acp). Unlike
+//! rest_transport.rs (in-process harness on mock_acp_agent) — it goes
+//! over the network to a live gateway process and a real agent.
 //!
-//! Требует поднятого шлюза:
+//! Requires a running gateway:
 //!   gatewayd /tmp/gateway-e2e/config.yaml
-//! (конфиг: agents.hermes-main = [hermes, acp], токен t-e2e-001,
+//! (config: agents.hermes-main = [hermes, acp], token t-e2e-001,
 //! http_listen 127.0.0.1:8348).
 //!
-//! Запуск:
+//! Run:
 //!   cargo test -p gatewayd --test e2e_live -- --ignored --nocapture
 //!
-//! E2E_GATEWAY_URL / E2E_TOKEN / E2E_AGENT переопределяют базовый URL,
-//! токен и agent_id (по умолчанию http://127.0.0.1:8348, t-e2e-001,
+//! E2E_GATEWAY_URL / E2E_TOKEN / E2E_AGENT override the base URL,
+//! token and agent_id (defaults: http://127.0.0.1:8348, t-e2e-001,
 //! hermes-main).
 
 use serde_json::json;
@@ -49,8 +49,8 @@ async fn post_json(url: &str, token: &str, body: Value) -> reqwest::Response {
         .expect("request to live gateway must reach it")
 }
 
-/// Живой E2E по spec-wire: message/send доходит до hermes и возвращает
-/// Completed с текстом (плоский Task, lowercase state).
+/// Live E2E over spec-wire: message/send reaches hermes and returns
+/// Completed with text (flat Task, lowercase state).
 #[tokio::test]
 #[ignore]
 async fn e2e_live_spec_wire_message_send_completes() {
@@ -85,8 +85,8 @@ async fn e2e_live_spec_wire_message_send_completes() {
     println!("E2E spec OK: text={text:?}");
 }
 
-/// Живой E2E по SDK-wire: SendMessage через шлюз доходит до hermes и
-/// возвращает TASK_STATE_COMPLETED в обёртке {task}.
+/// Live E2E over SDK-wire: SendMessage through the gateway reaches hermes and
+/// returns TASK_STATE_COMPLETED in a {task} wrapper.
 #[tokio::test]
 #[ignore]
 async fn e2e_live_sdk_wire_send_message_completes() {
@@ -123,7 +123,7 @@ async fn e2e_live_sdk_wire_send_message_completes() {
     println!("E2E SDK OK: text={text:?}");
 }
 
-/// Живой E2E: agent-card доступен по токену и отдаёт url rpc-эндпоинта.
+/// Live E2E: the agent-card is reachable by token and serves the rpc endpoint url.
 #[tokio::test]
 #[ignore]
 async fn e2e_live_agent_card_available() {
@@ -148,8 +148,8 @@ async fn e2e_live_agent_card_available() {
     println!("E2E card OK: url={card_url}");
 }
 
-/// Собирает текст ответа из частей артефактов результата. И spec, и SDK
-/// несут текст в поле "text" (spec: {"kind":"text","text":...}, sdk:
+/// Collects the reply text from the result artifact parts. Both spec and SDK
+/// carry text in the "text" field (spec: {"kind":"text","text":...}, sdk:
 /// {"text":...}).
 fn extract_text(result: &Value) -> String {
     let mut out = String::new();

@@ -1,15 +1,15 @@
 //! gatewayd/src/config.rs
-//! Буферный конфиг (Фаза 1): секции `event_log` и `task_store` локального
-//! durable-хранилища стриминга. Вынесены в lib, чтобы интеграционные тесты
-//! (gatewayd/tests/) могли парсить конфиг без запуска бинаря.
+//! Buffering config (Phase 1): `event_log` and `task_store` sections of the local
+//! durable storage for streaming. Extracted into lib so that integration tests
+//! (gatewayd/tests/) can parse the config without running the binary.
 
 use std::path::PathBuf;
 
 use serde::Deserialize;
 
-/// Секция `event_log:` — durable-буфер событий стрима (источник истины
-/// для `tasks/resubscribe`, см. Фаза 2.1 / T4). Отсутствие секции =
-/// выключено (прежнее поведение: только эфемерный канал).
+/// `event_log:` section — durable buffer of stream events (source of truth
+/// for `tasks/resubscribe`, see Phase 2.1 / T4). Absence of the section =
+/// disabled (previous behavior: ephemeral channel only).
 #[derive(Debug, Clone, Deserialize)]
 pub struct EventLogConfig {
     #[serde(default)]
@@ -18,14 +18,14 @@ pub struct EventLogConfig {
     pub storage_backend: String,
     #[serde(default = "default_event_log_path")]
     pub storage_path: PathBuf,
-    /// Потолок размера файла БД в МБ. По достижении — самоочистка
-    /// старейших событий по seq (Фаза 2, writer-задача). 0 = без лимита.
+    /// Cap on the DB file size in MB. Once reached — self-cleanup
+    /// of the oldest events by seq (Phase 2, writer task). 0 = no limit.
     #[serde(default = "default_max_size_mb")]
     pub max_size_mb: u64,
 }
 
-/// Секция `task_store:` — durable-хранилище задач. Отсутствие секции =
-/// прежнее файловое хранилище (core/src/task_store.rs).
+/// `task_store:` section — durable task storage. Absence of the section =
+/// previous file-based storage (core/src/task_store.rs).
 #[derive(Debug, Clone, Deserialize)]
 pub struct TaskStoreConfig {
     #[serde(default)]
@@ -38,10 +38,10 @@ pub struct TaskStoreConfig {
     pub max_size_mb: u64,
 }
 
-/// ДОБАВЛЕНО (Фаза 5, журнал для юзера): секция `journal:` — durable
-/// журнал событий (health-алерты, обрывы стримов, апрувы). Пишется
-/// writer-таском (как event_log), чистится по retention_days и по
-/// max_size_mb. Отсутствие секции = выключено.
+/// ADDED (Phase 5, journal for the user): `journal:` section — durable
+/// event journal (health alerts, stream drops, approvals). Written
+/// by the writer task (like event_log), cleaned by retention_days and by
+/// max_size_mb. Absence of the section = disabled.
 #[derive(Debug, Clone, Deserialize)]
 pub struct JournalConfig {
     #[serde(default)]
@@ -52,26 +52,26 @@ pub struct JournalConfig {
     pub storage_path: PathBuf,
     #[serde(default = "default_max_size_mb")]
     pub max_size_mb: u64,
-    /// Сколько дней хранить события журнала. 0 = без TTL (чистится только
-    /// по max_size_mb).
+    /// How many days to keep journal events. 0 = no TTL (cleaned only
+    /// by max_size_mb).
     #[serde(default = "default_journal_retention_days")]
     pub retention_days: u64,
 }
 
-/// ДОБАВЛЕНО (Фаза 5, health-мониторинг): секция `health:` — фоновый
-/// наблюдатель: размеры всех БД против лимитов, занятые слоты стримов,
-/// периодическая сводка. Алерты пишутся в журнал + tracing. Отсутствие
-/// секции = выключено (прежнее поведение).
+/// ADDED (Phase 5, health monitoring): `health:` section — a background
+/// watcher: sizes of all DBs against limits, occupied stream slots,
+/// periodic summary. Alerts are written to the journal + tracing. Absence
+/// of the section = disabled (previous behavior).
 #[derive(Debug, Clone, Deserialize)]
 pub struct HealthConfig {
     #[serde(default)]
     pub enabled: bool,
-    /// Период прогона проверки в секундах. 0 = проверка не запускается
-    /// (сводка не пишется).
+    /// Period of running the check in seconds. 0 = the check is not started
+    /// (no summary is written).
     #[serde(default = "default_health_interval_secs")]
     pub check_interval_secs: u64,
-    /// Порог занятости лимита БД (в %), по достижении которого пишется
-    /// предупреждение в журнал. 0 = не предупреждать.
+    /// DB limit occupancy threshold (in %), once reached a warning
+    /// is written to the journal. 0 = do not warn.
     #[serde(default = "default_health_db_warn_pct")]
     pub db_size_warn_pct: u64,
 }
@@ -182,7 +182,7 @@ impl Default for HealthConfig {
 mod tests {
     use super::*;
 
-    /// Отсутствие обеих секций = выключено, не паникает (backward compat).
+    /// Both sections absent = disabled, no panic (backward compat).
     #[test]
     fn absent_sections_are_disabled() {
         let yaml = "event_log: {}\ntask_store: {}\n";
@@ -197,8 +197,8 @@ mod tests {
         assert!(!task_store.enabled);
     }
 
-    /// ДОБАВЛЕНО (Фаза 5): отсутствующие journal/health секции = выключено,
-    /// дефолты заполнены, backward-compat.
+    /// ADDED (Phase 5): missing journal/health sections = disabled,
+    /// defaults filled, backward-compat.
     #[test]
     fn absent_journal_and_health_are_disabled() {
         let journal: JournalConfig = serde_yaml::from_str("").unwrap();
@@ -212,7 +212,7 @@ mod tests {
         assert_eq!(health.db_size_warn_pct, 80);
     }
 
-    /// ДОБАВЛЕНО (Фаза 5): явные секции переопределяют дефолты.
+    /// ADDED (Phase 5): explicit sections override defaults.
     #[test]
     fn explicit_journal_and_health_override_defaults() {
         let journal: JournalConfig =

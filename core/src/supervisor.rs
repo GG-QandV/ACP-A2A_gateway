@@ -1,20 +1,20 @@
 //! core/src/supervisor.rs
 //!
-//! ИСПРАВЛЕНО (аудит P2-10): кэш адаптеров в transport_http не проверял
-//! живость процесса. Умерший агент оставался в кэше навсегда, и все
-//! запросы к нему возвращали ошибку до ручного рестарта шлюза. С
-//! появлением разговоров на contextId цена выросла: падает не один
-//! клиент, а все разговоры этого агента разом.
+//! FIXED (audit P2-10): the adapter cache in transport_http did not check
+//! process liveness. A dead agent stayed in the cache forever, and every
+//! request to it returned an error until a manual gateway restart. With
+//! contextId-based conversations the cost grew: it is not one client that breaks,
+//! but all of that agent's conversations at once.
 //!
-//! Здесь процесс переспавнивается, но — и это главное — переспавн не
-//! прячется от клиента. Каждый живой процесс имеет номер поколения;
-//! сессии, заведённые в прошлом поколении, помечаются потерянными, и
-//! первое обращение к такому разговору получает явную ошибку
-//! `ContextLost`, а не тихое продолжение в пустой сессии.
+//! Here the process is respawned, but — and this is the key point — the respawn is not
+//! hidden from the client. Each live process has a generation number;
+//! sessions created in a previous generation are marked lost, and
+//! the first access to such a conversation receives an explicit
+//! `ContextLost` error, not a quiet continuation in an empty session.
 //!
-//! Без пометки клиент не может отличить «агент помнит разговор» от
-//! «агент перезапустился и не помнит» — для шлюза, который торгует
-//! непрерывностью разговора, это неприемлемо.
+//! Without the marker, the client cannot tell "the agent remembers the conversation" from
+//! "the agent restarted and does not remember" — for a gateway that trades in
+//! conversation continuity, that is unacceptable.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -32,9 +32,9 @@ use crate::agent::AcpAgent;
 use crate::reply::Reply;
 use crate::stdio_agent::StdioAcpAgent;
 
-/// Разговор оборвался, потому что процесс агента был перезапущен.
-/// Отдельный тип, а не строка: транспорт обязан отличить это от прочих
-/// ошибок и сказать клиенту, что контекст потерян, а не «что-то пошло не так».
+/// The conversation broke because the agent process was restarted.
+/// A separate type, not a string: the transport must distinguish this from other
+/// errors and tell the client the context was lost, not "something went wrong".
 #[derive(Debug, thiserror::Error)]
 #[error("контекст потерян: процесс агента был перезапущен (поколение {previous} -> {current})")]
 pub struct ContextLost {
@@ -42,21 +42,21 @@ pub struct ContextLost {
     pub current: u64,
 }
 
-/// Параметры запуска, которых достаточно для повторного спавна.
+/// Launch parameters sufficient for a respawn.
 #[derive(Debug, Clone)]
 pub struct SpawnConfig {
     pub command: Vec<String>,
     pub cwd: Option<String>,
     pub env: HashMap<String, String>,
     pub call_timeout: Duration,
-    /// Версия ACP, заявляемая шлюзом при рукопожатии. Число, как в
-    /// протоколе — раньше была строка, и шлюз слал агенту "1".
+    /// The ACP version the gateway declares during the handshake. A number, as in
+    /// the protocol — it used to be a string, and the gateway sent "1" to the agent.
     pub protocol_version: protocol::acp::ProtocolVersion,
-    /// ДОБАВЛЕНО (Часть 2 роадмапа стриминга): таймаут ДО первого чанка
-    /// стрима (эквивалент call_timeout для уже начавшегося потока).
+    /// ADDED (Streaming roadmap Part 2): timeout BEFORE the first chunk of a
+    /// stream (call_timeout equivalent for an already-started stream).
     pub first_chunk_timeout: Duration,
-    /// ДОБАВЛЕНО (Часть 2 роадмапа стриминга): таймаут МЕЖДУ чанками
-    /// уже начатого стрима — не блокирует долгий, но живой поток.
+    /// ADDED (Streaming roadmap Part 2): timeout BETWEEN chunks of an already
+    /// started stream — does not block a long but live stream.
     pub idle_chunk_timeout: Duration,
 }
 
@@ -67,16 +67,16 @@ impl SpawnConfig {
 
 struct Current {
     agent: Arc<StdioAcpAgent>,
-    /// Ответ на initialize текущего процесса. Рукопожатие делается ОДИН
-    /// раз на процесс, сразу после спавна, и его результат переиспользуется.
+    /// The initialize response of the current process. The handshake is done ONCE
+    /// per process, right after spawn, and its result is reused.
     init: InitializeResponse,
     generation: u64,
-    /// Момент последнего спавна — по нему выдерживается backoff, чтобы
-    /// агент, падающий на старте, не перезапускался в цикле.
+    /// Moment of the last spawn — the backoff is held against it, so that an
+    /// agent crashing at startup is not restarted in a loop.
     spawned_at: Instant,
 }
 
-/// Держит живой процесс ACP-агента, переспавнивая его после смерти.
+/// Keeps a live ACP-agent process, respawning it after death.
 pub struct SupervisedStdioAgent {
     config: SpawnConfig,
     current: Mutex<Current>,
@@ -84,8 +84,8 @@ pub struct SupervisedStdioAgent {
     respawn_backoff: Duration,
 }
 
-/// Минимальная пауза между попытками спавна. Меньше — и падающий на
-/// старте агент превращается в цикл перезапусков.
+/// Minimum pause between spawn attempts. Any shorter, and an agent crashing at
+/// startup turns into a restart loop.
 pub const DEFAULT_RESPAWN_BACKOFF: Duration = Duration::from_secs(5);
 
 impl SupervisedStdioAgent {
@@ -112,15 +112,15 @@ impl SupervisedStdioAgent {
         })
     }
 
-    /// ИСПРАВЛЕНО (найдено при разборе live-теста): initialize вызывался
-    /// ТОЛЬКО из card(), то есть при запросе agent.json. Клиент, идущий
-    /// сразу в message/send, доводил агента до session/new без
-    /// рукопожатия — прямое нарушение ACP. После респавна свежий процесс
-    /// не получал initialize вообще никогда, даже если исходный получил.
+    /// FIXED (found while dissecting the live test): initialize was called
+    /// ONLY from card(), i.e. on an agent.json request. A client going
+    /// straight to message/send drove the agent to session/new without a
+    /// handshake — a direct ACP violation. After a respawn the fresh process
+    /// never got initialize at all, even if the original one did.
     ///
-    /// Теперь рукопожатие — часть подъёма процесса: каждый живой
-    /// процесс инициализирован ровно один раз, и первый, и любой
-    /// последующий.
+    /// Now the handshake is part of bringing the process up: every live
+    /// process is initialized exactly once — the first one, and any
+    /// subsequent one.
     async fn spawn_and_handshake(
         config: &SpawnConfig,
     ) -> anyhow::Result<(Arc<StdioAcpAgent>, InitializeResponse)> {
@@ -137,10 +137,10 @@ impl SupervisedStdioAgent {
         let init = agent
             .initialize(InitializeRequest {
                 protocol_version: config.protocol_version,
-                // Клиентские возможности шлюза пусты сознательно: fs,
-                // терминал и запрос разрешений он не реализует, а значит
-                // не должен их заявлять. Корректный агент, увидев это,
-                // не станет слать встречные запросы.
+                // The gateway's client capabilities are deliberately empty: it does
+                // not implement fs, terminal, or permission requests, so it
+                // must not declare them. A correct agent, seeing this,
+                // will not send counter-requests.
                 client_capabilities: ClientCapabilities::default(),
                 client_info: Some(Implementation {
                     name: "acp-a2a-gateway".into(),
@@ -152,8 +152,8 @@ impl SupervisedStdioAgent {
         Ok((Arc::new(agent), init))
     }
 
-    /// Живой агент. Если процесс умер — поднимает новый и увеличивает
-    /// номер поколения; вызывающий код узнаёт об этом по `generation()`.
+    /// Live agent. If the process died — spawns a new one and increments the
+    /// generation number; the calling code learns of it via `generation()`.
     async fn healthy(&self) -> anyhow::Result<Arc<StdioAcpAgent>> {
         let mut current = self.current.lock().await;
 
@@ -188,9 +188,9 @@ impl SupervisedStdioAgent {
 
 #[async_trait]
 impl AcpAgent for SupervisedStdioAgent {
-    /// Рукопожатие уже сделано при подъёме процесса — повторно слать
-    /// initialize нельзя, ACP этого не предполагает. Отдаём сохранённый
-    /// ответ живого процесса.
+    /// The handshake is already done when the process comes up — sending
+    /// initialize again is not allowed, ACP does not assume it. Return the saved
+    /// response of the live process.
     async fn initialize(&self, _req: InitializeRequest) -> anyhow::Result<InitializeResponse> {
         self.healthy().await?;
         Ok(self.current.lock().await.init.clone())
@@ -207,9 +207,9 @@ impl AcpAgent for SupervisedStdioAgent {
         self.healthy().await?.prompt(req).await
     }
 
-    /// ДОБАВЛЕНО (Р-20): делегирует prompt_streaming() живому процессу.
-    /// Без этого дефолтный метод трейта вызвал бы self.prompt() (Complete)
-    /// — стриминг через супервизор не работал бы.
+    /// ADDED (P-20): delegates prompt_streaming() to the live process.
+    /// Without this, the trait's default method would call self.prompt() (Complete)
+    /// — streaming through the supervisor would not work.
     async fn prompt_streaming(
         &self,
         req: PromptRequest,
@@ -221,8 +221,8 @@ impl AcpAgent for SupervisedStdioAgent {
         self.healthy().await?.cancel(session).await
     }
 
-    /// Форсирует проверку живости и, при необходимости, перезапуск —
-    /// поэтому вызванный следом generation() уже актуален.
+    /// Forces a liveness check and, if needed, a restart —
+    /// so the generation() called right after is already current.
     async fn ensure_ready(&self) -> anyhow::Result<()> {
         self.healthy().await.map(|_| ())
     }
