@@ -1,7 +1,7 @@
 //! gatewayd/src/dialect_probe.rs
 //!
 //! Диалект-зонд для Направления 2 (A2A-клиент -> A2A-агент, passthrough).
-//! Реализует §3 тЗ (TZ-a2a-dialects-gateway-adapter.md): шлюз сам ходит к
+//! Реализует §3 тЗ (SPEC-a2a-dialects-gateway-adapter.md): шлюз сам ходит к
 //! сторонним A2A-агентам через transport_a2a_passthrough (Transport::Http{url,
 //! push_token}) и должен знать, на каком диалекте (SDK/Spec) агент отвечает
 //! ДО того, как проксировать первый реальный запрос клиента.

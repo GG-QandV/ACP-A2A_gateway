@@ -1,6 +1,6 @@
 # Гайд по гейтвею: що це, як запустити, як підключати агентів
 
-> **English version**: [docs/06-gateway-guide-en.md](06-gateway-guide-en.md) ·
+> **English version**: [docs/06-gateway-guide.md](docs/06-gateway-guide.md) ·
 > **Русская версия**: [docs/06-gateway-guide.md](06-gateway-guide.md)
 
 Репозиторій: `GG-QandV/ACP-A2A_gateway` (Rust workspace: `protocol`, `core`, `gatewayd`).

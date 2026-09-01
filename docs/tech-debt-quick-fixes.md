@@ -1,19 +1,21 @@
-# Быстрые исправления TECH_DEBT — от простого к сложному
+# Quick TECH_DEBT fixes — from simple to complex
 
-Три пункта, отсортированные по реальной сложности реализации, не по impact. Для двух — готовый диф
-(файлы прочитаны целиком в этой сессии, риск угадывания сигнатур нулевой). Для одного (Р-24) —
-инструкция без гарантированного дифа, потому что актуальный текст `transport_http.rs`/`transport_tcp.rs`
-после интеграции `try_acquire_stream` (коммит `36745ac`) не подтверждён построчно — project files
-отстают от `main` на GitHub, показывают до-стриминговую версию с заглушками "Фаза 1".
+> **Language:** English · [Русская версия](tech-debt-quick-fixes-ru.md)
+
+Three items, sorted by real implementation complexity, not by impact. For two of them a ready diff is
+provided (files were read in full in this session, risk of guessing signatures is zero). For one (P-24) —
+instructions without a guaranteed diff, because the current text of `transport_http.rs`/`transport_tcp.rs`
+after the `try_acquire_stream` integration (commit `36745ac`) is not confirmed line by line — project files
+lag behind `main` on GitHub and show the pre-streaming version with "Phase 1" stubs.
 
 ---
 
-## 1. Р-23: `biased` в `select!` (тривиальный, диф готов)
+## 1. P-23: `biased` in `select!` (trivial, diff ready)
 
-**Файл**: `core/src/stdio_agent.rs`, метод `prompt_streaming()`.
+**File**: `core/src/stdio_agent.rs`, method `prompt_streaming()`.
 
-**Что менять**: добавить `biased;` первой строкой внутри блока `tokio::select! { ... }` между
-`resp_rx` и `rx.recv()`.
+**What to change**: add `biased;` as the first line inside the `tokio::select! { ... }` block between
+`resp_rx` and `rx.recv()`.
 
 ```diff
          tokio::select! {
@@ -30,11 +32,11 @@
              first = rx.recv() => {
 ```
 
-**Порядок веток имеет значение с `biased`**: `resp_rx` идёт первой в исходном коде, значит с `biased`
-приоритет получит именно она — при одновременной готовности выбор всегда будет в пользу
-`Reply::Complete`, а не `Reply::Streaming`. Если нужен обратный приоритет (предпочитать
-`Streaming`, если агент явно начал стримить), нужно **поменять порядок веток местами**, не только
-добавить `biased`:
+**Branch order matters with `biased`**: `resp_rx` goes first in the original code, so with `biased`
+the priority goes to exactly it — when both are ready simultaneously, the choice will always be in favor
+of `Reply::Complete`, not `Reply::Streaming`. If the reverse priority is needed (prefer
+`Streaming` if the agent has explicitly started streaming), you must **swap the branches**, not just
+add `biased`:
 
 ```diff
          tokio::select! {
@@ -44,7 +46,7 @@
 +                    self.updates.lock().await.remove(&session_key);
 +                    anyhow::bail!("stream channel closed before any event");
 +                };
-+                // ...остальной код ветки first без изменений...
++                // ...the rest of the first branch unchanged...
 +            }
              resp = &mut resp_rx => {
                  let resp: PromptResponse = match resp {
@@ -62,156 +64,155 @@
          }
 ```
 
-**Рекомендация**: второй вариант (chunk-ветка первой) — он соответствует намерению "если агент начал
-стримить, доверяем этому сигналу" (Р-23 в decisions.md). Применить один из двух вариантов, добавить
-тест-регрессию:
+**Recommendation**: the second variant (chunk branch first) — it matches the intent "if the agent started
+streaming, trust that signal" (P-23 in decisions.md). Apply one of the two variants, add a regression test:
 
 ```rust
 #[tokio::test]
 async fn simultaneous_response_and_chunk_prefers_streaming_path() {
-    // Мок-агент шлёт 1 session/update и финальный ответ практически
-    // одновременно (без задержки между ними) — с biased и chunk-веткой
-    // первой результат должен быть детерминированным: Reply::Streaming,
-    // не случайный выбор между Complete/Streaming при повторных прогонах.
+    // The mock agent sends 1 session/update and the final response almost
+    // simultaneously (no delay between them) — with biased and the chunk branch
+    // first the result must be deterministic: Reply::Streaming,
+    // not a random choice between Complete/Streaming across repeated runs.
 }
 ```
 
-**Negative control**: убрать `biased` — тест выше должен стать flaky (не всегда красный, но
-нестабильный при множественных прогонах `cargo test -- --test-threads=1 --repeat 20`, если такая
-опция доступна, иначе просто зафиксировать как известный риск в комментарии перед фиксом).
+**Negative control**: remove `biased` — the test above should become flaky (not always red, but
+unstable across multiple runs `cargo test -- --test-threads=1 --repeat 20`, if such an option is
+available, otherwise just record it as a known risk in a comment before the fix).
 
 ---
 
-## 2. Хеш токена: минимальный шаг без новой зависимости (малый, диф готов)
+## 2. Token hash: minimal step without a new dependency (small, diff ready)
 
-TECH_DEBT формулирует полный fix как "заменить на HMAC при усилении модели угроз" — это осознанно
-отложенная работа, не срочная (impact: low, подбор не в текущей модели угроз [file:49]). Но есть
-промежуточный шаг, который устраняет главную слабость `DefaultHasher` **без новых зависимостей и
-без изменения формата** `Owner::Token { hash: u64 }` — что критично, потому что `Owner` уже
-сериализуется и хранится в `StoredTask` (`docs/decisions.md`, Р-11), и смена формата потребовала бы
-миграции данных.
+TECH_DEBT formulates the full fix as "replace with HMAC when the threat model hardens" — this is consciously
+deferred work, not urgent (impact: low, brute-forcing is not in the current threat model [file:49]). But there is
+an intermediate step that removes the main weakness of `DefaultHasher` **without new dependencies and
+without changing the format** of `Owner::Token { hash: u64 }` — which is critical, because `Owner` is already
+serialized and stored in `StoredTask` (`docs/decisions.md`, P-11), and changing the format would require
+a data migration.
 
-**Файл**: `core/src/owner.rs`.
+**File**: `core/src/owner.rs`.
 
-**Проблема**: `DefaultHasher::new()` — это стабильный `SipHash13` без случайного ключа. Хеш одного и
-того же токена **одинаковый при каждом запуске процесса**, что теоретически позволяет
-предвычислить/закешировать коллизии заранее (атакующий может офлайн подобрать токен B такой, что
-`hash(A) == hash(B)`, один раз, и это будет работать на любом запуске гейтвея).
+**Problem**: `DefaultHasher::new()` is a stable `SipHash13` without a random key. The hash of one and the
+same token is **identical on every process start**, which theoretically allows
+precomputing/caching collisions in advance (an attacker can offline pick a token B such that
+`hash(A) == hash(B)` once, and it will work on any gateway run).
 
-**Минимальное исправление**: `std::collections::hash_map::RandomState` — тот же API (`Hasher`
-trait), но со случайным ключом, генерируемым **при каждом старте процесса**. Коллизия, предвычисленная
-атакующим заранее, перестаёт работать после следующего рестарта — цена подбора вырастает с "один раз
-офлайн" до "заново при каждом деплое".
+**Minimal fix**: `std::collections::hash_map::RandomState` — the same API (`Hasher`
+trait), but with a random key generated **on every process start**. A collision precomputed
+by the attacker in advance stops working after the next restart — the cost of brute-forcing grows from "once
+offline" to "from scratch on every deploy".
 
 ```diff
  impl Owner {
      pub fn from_token(token: &str) -> Self {
          use std::hash::{Hash, Hasher};
 -        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-+        // ИСПРАВЛЕНО (TECH_DEBT: хеш токена): RandomState вместо
-+        // DefaultHasher — тот же нижнеуровневый алгоритм (SipHash), но
-+        // со случайным ключом на каждый старт процесса. Не заменяет
-+        // полноценный HMAC (см. TECH_DEBT: "заменить на HMAC при
-+        // усилении модели угроз" — остаётся будущей работой), но
-+        // устраняет предвычисляемость коллизий между рестартами без
-+        // единой новой зависимости и без изменения формата Owner::Token.
++        // FIXED (TECH_DEBT: token hash): RandomState instead of
++        // DefaultHasher — the same low-level algorithm (SipHash), but
++        // with a random key per process start. Does not replace
++        // a full HMAC (see TECH_DEBT: "replace with HMAC when the
++        // threat model hardens" — remains future work), but
++        // eliminates collision precomputability across restarts without
++        // a single new dependency and without changing the Owner::Token format.
 +        let mut hasher = OWNER_HASH_SEED.build_hasher();
          token.hash(&mut hasher);
          Owner::Token { hash: hasher.finish() }
      }
 ```
 
-Плюс глобальный `RandomState`, инициализируемый один раз на процесс (не при каждом вызове
-`from_token` — иначе один и тот же токен даст **разные** хеши в течение жизни процесса, что сломает
-всю логику "тот же клиент = тот же владелец"):
+Plus a global `RandomState`, initialized once per process (not on every
+`from_token` call — otherwise one and the same token would give **different** hashes during the process lifetime, which would
+break all "same client = same owner" logic):
 
 ```rust
-// Добавить в начало файла, после use-директив:
+// Add at the top of the file, after the use-directives:
 use std::collections::hash_map::RandomState;
 
-/// Один seed на весь процесс — иначе from_token("t-1") дважды подряд
-/// давал бы разные хеши, и проверка "тот же клиент" всегда бы падала.
+/// One seed for the whole process — otherwise two consecutive
+/// from_token("t-1") calls would give different hashes, and the "same client" check would always fail.
 static OWNER_HASH_SEED: std::sync::LazyLock<RandomState> =
     std::sync::LazyLock::new(RandomState::new);
 ```
 
-**Проверить версию Rust**: `LazyLock` стабилизирован в Rust 1.80. Проект уже требует 1.80+
-(`docs/06-gateway-guide.md`, §2: `rustc --version   # нужно 1.80+`) — совместимо без дополнительных
-зависимостей типа `once_cell`.
+**Check the Rust version**: `LazyLock` was stabilized in Rust 1.80. The project already requires 1.80+
+(`docs/06-gateway-guide.md`, §2: `rustc --version   # needs 1.80+`) — compatible without additional
+dependencies like `once_cell`.
 
-**Тесты**: существующие 4 теста в `core/src/owner.rs` (`same_token_gives_same_owner`,
+**Tests**: the existing 4 tests in `core/src/owner.rs` (`same_token_gives_same_owner`,
 `different_tokens_give_different_owners`, `anonymous_never_equals_token_owner`,
-`owner_survives_serde_roundtrip`) должны остаться зелёными без изменений — они проверяют поведение
-внутри одного запуска процесса, где seed фиксирован. Добавить один новый тест, документирующий
-смену поведения между процессами (не автоматизируется в юнит-тесте напрямую, но фиксируется
-комментарием):
+`owner_survives_serde_roundtrip`) must stay green without changes — they check behavior
+within a single process run, where the seed is fixed. Add one new test documenting
+the behavior change between processes (not automatable in a unit test directly, but recorded
+by a comment):
 
 ```rust
-/// Хеш одного и того же токена меняется МЕЖДУ перезапусками процесса
-/// (RandomState, не DefaultHasher) — внутри одного запуска (как в этом
-/// тесте) он стабилен, что и требуется для сравнения владельцев.
-/// Смена между процессами не проверяется юнит-тестом (нужен отдельный
-/// процесс), но задокументирована как ожидаемое поведение.
+/// The hash of the same token changes BETWEEN process restarts
+/// (RandomState, not DefaultHasher) — within a single run (as in this
+/// test) it is stable, which is exactly what owner comparison requires.
+/// The change between processes is not checked by a unit test (needs a separate
+/// process), but is documented as expected behavior.
 #[test]
 fn hash_is_stable_within_process_lifetime() {
     let a = Owner::from_token("t-1");
     let b = Owner::from_token("t-1");
-    assert_eq!(a, b, "внутри одного процесса хеш одного токена должен быть стабилен");
+    assert_eq!(a, b, "within one process the hash of the same token must be stable");
 }
 ```
 
-**Обновление TECH_DEBT.md**: пункт не закрывается полностью (HMAC остаётся будущей работой), но
-формулировка обновляется:
+**TECH_DEBT.md update**: the item is not fully closed (HMAC remains future work), but the
+wording is updated:
 
 ```markdown
-### 2026-08-09: хеш токена — `std::hash::DefaultHasher` (частично закрыто)
-- **Что**: хеш токена был стабилен между рестартами процесса (DefaultHasher без случайного seed).
-- **Закрыто частично (2026-08-XX)**: заменён на `RandomState` — случайный seed на каждый старт
-  процесса, устраняет предвычисляемые коллизии между деплоями. Формат `Owner::Token { hash: u64 }`
-  не изменился — данные в `StoredTask` не требуют миграции.
-- **Осталось**: не криптографический хеш внутри одного запуска — если модель угроз ужесточится
-  (например, появится риск подбора токена в реальном времени против живого процесса), нужен
-  полноценный HMAC с секретным ключом из конфига/env, а не только случайный seed.
-- **Impact**: low (не изменился)
-- **Fix (оставшийся)**: HMAC-SHA256 с ключом из `{env:GATEWAY_HMAC_KEY}` при усилении модели угроз.
+### 2026-08-09: token hash — `std::hash::DefaultHasher` (partially closed)
+- **What**: the token hash was stable across process restarts (DefaultHasher without a random seed).
+- **Partially closed (2026-08-XX)**: replaced with `RandomState` — a random seed on every process
+  start, eliminates precomputable collisions across deploys. The format `Owner::Token { hash: u64 }`
+  did not change — data in `StoredTask` requires no migration.
+- **Remaining**: not a cryptographic hash within a single run — if the threat model hardens
+  (e.g. real-time token brute-forcing against a live process appears), a
+  full HMAC with a secret key from config/env is needed, not just a random seed.
+- **Impact**: low (unchanged)
+- **Fix (remaining)**: HMAC-SHA256 with a key from `{env:GATEWAY_HMAC_KEY}` when the threat model hardens.
 ```
 
 ---
 
-## 3. Р-24: порядок `lookup` перед `try_acquire_stream` (малый-средний, инструкция без дифа)
+## 3. P-24: `lookup` before `try_acquire_stream` (small-medium, instructions without a diff)
 
-**Не даю готовый диф** — причина честная: project files в этой сессии показывают версию
-`transport_http.rs`/`transport_tcp.rs` **до** интеграции `try_acquire_stream` (заглушки "Фаза 1"
-всё ещё на месте в прочитанном тексте), хотя коммит `36745ac` на GitHub эту интеграцию уже сделал.
-Писать диф против неподтверждённого текста — риск повторить ту же ошибку, что уже случалась в этом
-разговоре с расхождением имён (`RpcOutcome` vs фактический `DispatchResult`).
+**I am not giving a ready diff** — the reason is honest: project files in this session show the version
+of `transport_http.rs`/`transport_tcp.rs` **before** the `try_acquire_stream` integration ("Phase 1" stubs
+are still in place in the text that was read), although commit `36745ac` on GitHub has already done this integration.
+Writing a diff against unconfirmed text risks repeating the same mistake that already happened in this
+conversation with a name mismatch (`RpcOutcome` vs the actual `DispatchResult`).
 
-**Что нужно сделать** (инструкция для проверки и точечной правки):
+**What needs to be done** (instructions for verification and pinpoint edit):
 
-1. Открыть актуальный `gatewayd/src/transport_http.rs` (после коммита `36745ac`) в реальном
-   репозитории — не через этот чат.
-2. Найти место, где вызывается `registry.try_acquire_stream(&agent_id)` — по коммит-сообщению
-   `36745ac`, это `rpc_handler` (JSON-RPC) и `rest_send_message_core` (SDK REST).
-3. Проверить: вызов `try_acquire_stream` идёт **после** `get_or_spawn_adapter`/`registry.lookup`
-   (то есть после того, как уже подтверждено, что `agent_id` существует), или раньше?
-   - Если **после** lookup — всё корректно, `StreamCapacityExhausted` для несуществующего
-     агента физически не может случиться (agent_id уже проверен раньше), задача закрыта, можно
-     просто добавить комментарий в `docs/decisions.md` (Р-24) "проверено — порядок корректен".
-   - Если **до** lookup — нужна точечная правка: переставить вызов `try_acquire_stream` после
-     успешного `get_or_spawn_adapter`, и различать в обработке ошибки: `AdapterError::UnknownAgent`
-     (404) должен возвращаться раньше, чем гейтвей даже попытается занять permit.
-4. То же самое проверить в `gatewayd/src/transport_tcp.rs`, `handle_http_target` — там `try_acquire_stream`
-   по коммиту `36745ac` вызывается "в scope" через новую `HttpTargetParams struct".
+1. Open the current `gatewayd/src/transport_http.rs` (after commit `36745ac`) in the real
+   repository — not through this chat.
+2. Find the place where `registry.try_acquire_stream(&agent_id)` is called — per the commit message of
+   `36745ac`, that is `rpc_handler` (JSON-RPC) and `rest_send_message_core` (SDK REST).
+3. Check: does the `try_acquire_stream` call come **after** `get_or_spawn_adapter`/`registry.lookup`
+   (i.e. after it is already confirmed that `agent_id` exists), or before?
+   - If **after** lookup — everything is correct, `StreamCapacityExhausted` for a nonexistent
+     agent physically cannot happen (agent_id was already checked earlier), the task is closed, you can
+     just add a comment to `docs/decisions.md` (P-24) "checked — order is correct".
+   - If **before** lookup — a pinpoint edit is needed: move the `try_acquire_stream` call after a
+     successful `get_or_spawn_adapter`, and distinguish in error handling: `AdapterError::UnknownAgent`
+     (404) must be returned before the gateway even tries to take a permit.
+4. Check the same in `gatewayd/src/transport_tcp.rs`, `handle_http_target` — there `try_acquire_stream`
+   per commit `36745ac` is called "in scope" through the new `HttpTargetParams struct".
 
-**Почему это не "готовый диф"**: сама правка (если она нужна) — это перемещение одной строки вызова
-метода, тривиально по объёму. Но написать её сейчас означало бы гадать точное имя переменной,
-структуру `HttpTargetParams` (упомянутую в коммите, но не виденную построчно) и точный текст ошибки,
-которые я не подтвердил чтением. Проверка — 5 минут глазами в реальном файле; неверный диф на
-основе устаревших project files — риск сломать то, что уже работает.
+**Why this is not a "ready diff"**: the fix itself (if it is needed) is moving one method-call line,
+trivial in volume. But writing it now would mean guessing the exact variable name, the structure of
+`HttpTargetParams` (mentioned in the commit but not seen line by line), and the exact error text,
+which I have not confirmed by reading. Verification is 5 minutes of eyeballs in the real file; a wrong diff
+based on outdated project files is a risk of breaking what already works.
 
-**Критерий, что проверка не нужна вообще**: если тест `unknown_agent_stream_acquisition_fails` в
-`gatewayd/src/registry.rs` — единственная проверка на этот случай, и никакого HTTP/TCP
-интеграционного теста на "запрос к несуществующему agent_id с активным лимитом стримов возвращает
-404, не 503" не существует — стоит **добавить** такой тест как минимум, даже если порядок вызовов
-уже корректен, потому что иначе регрессия (если кто-то поменяет порядок в будущем рефакторинге)
-не будет пойман.
+**Criterion that no check is needed at all**: if the test `unknown_agent_stream_acquisition_fails` in
+`gatewayd/src/registry.rs` is the only check for this case, and no HTTP/TCP integration test for
+"a request to a nonexistent agent_id with an active stream limit returns 404, not 503" exists — it is
+worth **adding** such a test as a minimum, even if the call order is already
+correct, because otherwise a regression (if someone changes the order in a future refactor)
+would not be caught.

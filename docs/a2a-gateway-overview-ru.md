@@ -1,5 +1,7 @@
 # Описание A2A-шлюза `ACP-A2A_gateway`
 
+
+> **Язык:** русский · [English version](./a2a-gateway-overview.md)
 **Источник:** `/home/gg/projects/AGENTS/ACP-A2A_gateway` (репо)
 **Хост:** `89.58.12.118`, сервис `acp-gateway`, домен `agentmesh-labs.mnemostroma.com`
 **Роль:** посредник A2A-клиент → ACP-агенты (hermes, claurst).
@@ -109,5 +111,5 @@ gatewayd (transport_http.rs)
   нет `{task: ...}` обёртки.
 - Стриминг (`SendStreamingMessage` / SSE) не реализован («Фаза 1»).
 - Multi-turn: второй `message/send` в ту же сессию виснет до
-  `agent_call_timeout_secs` (известный баг upstream, `TECH_DEBT.md`).
+  `agent_call_timeout_secs` (известный баг upstream, `TECH_DEBT-ru.md`).
 - Хеш токена — не криптографический (`DefaultHasher`).

@@ -29,6 +29,6 @@
 ## Посилання
 
 - **Повна стратегія (UK):** [A2A-protocol-strategy-2026-uk.md](A2A-protocol-strategy-2026-uk.md)
-- Версія EN: [A2A-protocol-strategy-2026-en.md](A2A-protocol-strategy-2026-en.md)
+- Версія EN: [docs/A2A-protocol-strategy-2026.md](docs/A2A-protocol-strategy-2026.md)
 - Версія RU: [A2A-protocol-strategy-2026.md](A2A-protocol-strategy-2026.md)
-- Уніфіковане ТЗ (шлюз / адаптер / зонд): [TZ-a2a-dialects-gateway-adapter.md](TZ-a2a-dialects-gateway-adapter.md) (у репо шлюзу)
+- Уніфіковане ТЗ (шлюз / адаптер / зонд): [SPEC-a2a-dialects-gateway-adapter.md](SPEC-a2a-dialects-gateway-adapter.md) (у репо шлюзу)

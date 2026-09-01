@@ -1,47 +1,47 @@
-# SPEC v2: универсальный ACP/A2A gateway (упрощённая архитектура)
+# SPEC v2: universal ACP/A2A gateway (simplified architecture)
 
-Пересмотр по замечанию: убрана искусственная граница "Gateway" vs
-"Bridge" как двух разных бинарников. Один процесс, одна точка входа,
-логика ветвится по совпадению протоколов клиента и агента.
+> **Language:** English · [Русская версия](SPEC-universal-gateway-v2-ru.md)
+
+Revision in response to the review comment: the artificial boundary between
+"Gateway" and "Bridge" as two separate binaries has been removed. One process,
+one entry point, logic branches on whether the client and agent protocols match.
 
 ---
 
-## 1. Идея в одну фразу
+## 1. The idea in one sentence
 
-Токен пускает или не пускает **к гейтвею вообще** — не более того.
-Дальше: протокол клиента == протокол агента → голый проксинг без
-преобразования. Протоколы разные → универсальный конвертер (один и
-тот же код для обоих направлений A2A→ACP и ACP→A2A, за счёт
-адаптеров одного trait'а через другой).
+The token decides whether to admit a client **to the gateway at all** — nothing
+more. Further on: client protocol == agent protocol → bare proxying without
+conversion. Different protocols → universal converter (the same code for both
+A2A→ACP and ACP→A2A directions, thanks to adapters of one trait through the other).
 
 ```
                  ┌───────────────────────────────────────────┐
                  │              acp-a2a-gateway               │
-  ACP-клиент ───▶│  1. token check (пускать/не пускать)       │
-  A2A-клиент ───▶│  2. lookup target agent (id → протокол)    │
+   ACP client ──▶│  1. token check (allow/deny)               │
+   A2A client ──▶│  2. lookup target agent (id → protocol)    │
                  │  3. client.proto == agent.proto ?          │
-                 │       да  → passthrough (raw proxy)        │──▶ ACP-агент
-                 │       нет → universal converter            │──▶ A2A-агент
+                 │       yes → passthrough (raw proxy)        │──▶ ACP agent
+                 │       no  → universal converter            │──▶ A2A agent
                  └───────────────────────────────────────────┘
 ```
 
-Никакого отдельного `acp-gateway` бинарника и отдельного `bridge`
-бинарника — один сервис, один конфиг, один порт (или набор портов на
-транспорт, см. §5).
+No separate `acp-gateway` binary and no separate `bridge` binary — one service,
+one config, one port (or a set of ports per transport, see §5).
 
 ---
 
 ## 2. Token
 
-- Токен — это **allow/deny на вход в гейтвей**, точка. Не привязан к
-  конкретным агентам, не порождает ACL-матрицу "токен → список агентов".
-- Список валидных токенов — плоский набор в конфиге (или один shared
-  secret на первую итерацию).
-- Выбор целевого агента — отдельный параметр запроса (id агента в
-  `session/new`/`initialize` для ACP, путь `/agents/{id}/rpc` для A2A),
-  никак не завязан на токен.
-- Невалидный/отсутствующий токен → разрыв соединения на транспортном
-  уровне, до разбора ACP/A2A payload.
+- The token is an **allow/deny for entering the gateway**, full stop. It is not
+  tied to specific agents and does not spawn an ACL matrix "token → agent list".
+- The list of valid tokens is a flat set in the config (or a single shared
+  secret for the first iteration).
+- Target agent selection is a separate request parameter (agent id in
+  `session/new`/`initialize` for ACP, path `/agents/{id}/rpc` for A2A), not
+  tied to the token in any way.
+- Invalid/missing token → connection dropped at the transport level, before
+  parsing the ACP/A2A payload.
 
 ```rust
 fn check_token(token: &str, valid: &HashSet<String>) -> bool {
@@ -49,26 +49,26 @@ fn check_token(token: &str, valid: &HashSet<String>) -> bool {
 }
 ```
 
-Это всё, что нужно от auth-слоя для MVP.
+This is all that is required from the auth layer for the MVP.
 
 ---
 
-## 3. Passthrough (одинаковые протоколы, без преобразования)
+## 3. Passthrough (same protocols, no conversion)
 
-Когда клиент и целевой агент говорят на одном протоколе (ACP↔ACP или
-A2A↔A2A), гейтвей **не парсит семантику** JSON-RPC методов — только
-перекладывает кадры:
+When the client and the target agent speak the same protocol (ACP↔ACP or
+A2A↔A2A), the gateway **does not parse the semantics** of JSON-RPC methods —
+it only shuttles frames:
 
-- ACP↔ACP: newline-delimited JSON-RPC уже одинаков что у клиента
-  (сетевой транспорт), что у агента (stdio) — просто readline-цикл в
-  обе стороны, без структур `InitializeRequest`/`Prompt`/и т.п.
-- A2A↔A2A: HTTP-запрос форвардится как reverse-proxy (включая SSE-стрим
-  как есть).
+- ACP↔ACP: newline-delimited JSON-RPC is already identical both at the client
+  (network transport) and at the agent (stdio) — just a readline loop in both
+  directions, without `InitializeRequest`/`Prompt`/etc. structs.
+- A2A↔A2A: the HTTP request is forwarded as a reverse-proxy (including the
+  SSE stream as-is).
 
-**Важная оговорка**: "без преобразования" — это про отсутствие
-*семантического* маппинга методов. Транспортная разница всё равно есть
-(TCP-кадр клиента ≠ stdin/stdout байты агента) и её нужно перегонять —
-но это тривиальный byte/line copy, а не парсинг типов.
+**Important caveat**: "without conversion" refers to the absence of
+*semantic* method mapping. The transport difference still exists (the client's
+TCP frame ≠ the agent's stdin/stdout bytes) and must be relayed — but that is
+a trivial byte/line copy, not type parsing.
 
 ```rust
 trait Passthrough {
@@ -77,17 +77,17 @@ trait Passthrough {
 }
 ```
 
-Один generic pump и для ACP↔ACP, и для A2A↔A2A (разница только в
-транспортных обвязках: TCP-сокет vs stdio-канал vs HTTP-стрим).
+One generic pump for both ACP↔ACP and A2A↔A2A (the only difference is in the
+transport wrappings: TCP socket vs stdio channel vs HTTP stream).
 
 ---
 
-## 4. Universal converter (разные протоколы)
+## 4. Universal converter (different protocols)
 
-Когда протоколы не совпадают — один и тот же конвертер работает в обе
-стороны за счёт двух трейтов и адаптеров друг через друга (как в §6
-исходного ТЗ, оставляем как ядро — это единственное место, где
-реально нужна сложность):
+When the protocols do not match — the very same converter works in both
+directions thanks to two traits and adapters of one through the other (as in §6
+of the original spec, we keep it as the core — this is the only place where
+complexity is genuinely needed):
 
 ```rust
 #[async_trait]
@@ -108,19 +108,19 @@ trait A2aAgent {
     async fn stream(&self, id: TaskId) -> UnboundedReceiver<A2aEvent>;
 }
 
-// один универсальный адаптер в каждую сторону — это и есть "конвертер"
-struct AcpAsA2a<T: AcpAgent>(T);   // A2A-клиент видит ACP-агента как A2aAgent
-impl<T: AcpAgent> A2aAgent for AcpAsA2a<T> { /* маппинг из §5.1 ТЗ */ }
+// one universal adapter per direction — this is exactly the "converter"
+struct AcpAsA2a<T: AcpAgent>(T);   // an A2A client sees an ACP agent as an A2aAgent
+impl<T: AcpAgent> A2aAgent for AcpAsA2a<T> { /* mapping from §5.1 of the original spec */ }
 
-struct A2aAsAcp<T: A2aAgent>(T);   // ACP-клиент видит A2A-агента как AcpAgent
-impl<T: A2aAgent> AcpAgent for A2aAsAcp<T> { /* маппинг из §5.2 ТЗ */ }
+struct A2aAsAcp<T: A2aAgent>(T);   // an ACP client sees an A2A agent as an AcpAgent
+impl<T: A2aAgent> AcpAgent for A2aAsAcp<T> { /* mapping from §5.2 of the original spec */ }
 ```
 
-Гейтвею не важно, кто снаружи (ACP или A2A клиент) и кто внутри (ACP
-или A2A агент) — если протоколы не совпали, он берёт нужный адаптер и
-отдаёт клиенту интерфейс его родного протокола. Это и есть "универсальный
-преобразователь а2а/асп/а2а" одним куском кода, а не двумя разными
-бинарниками-бриджами.
+The gateway does not care who is outside (an ACP or an A2A client) or who is
+inside (an ACP or an A2A agent) — if the protocols did not match, it takes the
+needed adapter and hands the client the interface of its native protocol. This
+is the "universal a2a/acp/a2a converter" as one piece of code, not two
+different bridge binaries.
 
 ---
 
@@ -128,15 +128,15 @@ impl<T: A2aAgent> AcpAgent for A2aAsAcp<T> { /* маппинг из §5.2 ТЗ *
 
 ```
 gateway/
-├── proto-acp/       # типы + framing ACP (JSON-RPC over stdio/TCP)
-├── proto-a2a/       # типы + framing A2A (JSON-RPC over HTTP/SSE)
+├── proto-acp/       # ACP types + framing (JSON-RPC over stdio/TCP)
+├── proto-a2a/       # A2A types + framing (JSON-RPC over HTTP/SSE)
 ├── core/            # trait AcpAgent, trait A2aAgent, AcpAsA2a, A2aAsAcp
-├── passthrough/     # generic pump byte-copy для одинаковых протоколов
+├── passthrough/     # generic byte-copy pump for identical protocols
 └── gatewayd/         # bin: token check → agent lookup → passthrough | converter
 ```
 
-Реестр агентов — плоский конфиг `id → {protocol, transport, endpoint}`,
-без токен-специфичных списков доступа:
+The agent registry is a flat config `id → {protocol, transport, endpoint}`,
+without token-specific access lists:
 
 ```yaml
 listen: "0.0.0.0:8347"
@@ -148,32 +148,32 @@ agents:
 
 ---
 
-## 6. Критерии приёмки
+## 6. Acceptance criteria
 
-1. ACP-клиент → `claurst-main` (ACP-агент): passthrough, PONG проходит без изменений полей.
-2. A2A-клиент → `ops-agent` (A2A-агент): reverse-proxy, включая SSE-стрим.
-3. A2A-клиент → `claurst-main` (ACP-агент): через `AcpAsA2a`, `task/send` доходит как `session/prompt`, ответ маппится обратно.
-4. ACP-клиент → `ops-agent` (A2A-агент): через `A2aAsAcp`, `session/prompt` доходит как `task/send`.
-5. Неверный токен → разрыв на любом из четырёх сценариев выше, до чтения payload.
-6. `cargo check --workspace` + clippy без warnings.
+1. ACP client → `claurst-main` (ACP agent): passthrough, PONG passes through with unchanged fields.
+2. A2A client → `ops-agent` (A2A agent): reverse-proxy, including the SSE stream.
+3. A2A client → `claurst-main` (ACP agent): via `AcpAsA2a`, `task/send` arrives as `session/prompt`, the response is mapped back.
+4. ACP client → `ops-agent` (A2A agent): via `A2aAsAcp`, `session/prompt` arrives as `task/send`.
+5. Wrong token → drop in any of the four scenarios above, before reading the payload.
+6. `cargo check --workspace` + clippy with no warnings.
 
 ---
 
-## 7. Оценка
+## 7. Estimate
 
-| Часть                                                    | Дни     |
+| Part                                                    | Days     |
 | ---------------------------------------------------------- | ------- |
-| `proto-acp` + `proto-a2a` (типы, framing)                   | 1.5     |
+| `proto-acp` + `proto-a2a` (types, framing)                   | 1.5     |
 | Token-check + agent registry + dispatch (passthrough vs converter) | 1     |
 | Passthrough pump (ACP↔ACP, A2A↔A2A)                         | 1.5     |
-| Универсальный конвертер: `AcpAsA2a` + `A2aAsAcp` (маппинги §5.1/5.2 исходного ТЗ) | 4–5 |
-| Тесты: 4 сценария из §6 приёмки + мок-агенты                | 2       |
-| **Итого MVP (один бинарник, оба направления, TCP+HTTP)**    | **10–11** |
+| Universal converter: `AcpAsA2a` + `A2aAsAcp` (mappings §5.1/5.2 of the original spec) | 4–5 |
+| Tests: the 4 scenarios from §6 acceptance + mock agents                | 2       |
+| **Total MVP (one binary, both directions, TCP+HTTP)**    | **10–11** |
 
-Сверху (не входит в MVP, но было в исходном ТЗ): WS-транспорт, TLS,
-rate limiting, reconnect+backoff, метрики/health, `session/load`,
-permission-policy `allow/deny/ask` — ориентировочно **+6–8 дней**.
+On top of this (not part of the MVP, but present in the original spec): WS
+transport, TLS, rate limiting, reconnect+backoff, metrics/health, `session/load`,
+permission-policy `allow/deny/ask` — roughly **+6–8 days**.
 
-**Итого весь объём: ≈16–19 человеко-дней** — меньше прошлой оценки за
-счёт того, что один универсальный конвертер закрывает оба направления
-сразу, а не два отдельных бридж-бинарника.
+**Total scope: ≈16–19 person-days** — less than the previous estimate because
+one universal converter covers both directions at once, instead of two
+separate bridge binaries.

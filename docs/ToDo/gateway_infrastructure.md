@@ -1,78 +1,76 @@
-# Инфраструктура сервиса Gateway (корпоратив)
+# Gateway Service Infrastructure (enterprise)
 
-**Версия**: 1.0  
-**Дата**: 2026-08-18  
-**Статус**: На будущее (для корпоративной версии)
+> **Language:** English · [Русская версия](gateway_infrastructure-ru.md)
+
+**Version**: 1.0  
+**Date**: 2026-08-18  
+**Status**: For the future (for the enterprise version)
 
 ---
 
-## 1. Архитектура
+## 1. Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                     Шлюз (gatewayd)                         │
-│                                                             │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐ │
-│  │ Авто-роутер │  │   Сторож    │  │ Генератор токенов   │ │
-│  │ (Local/     │  │ (Guard)     │  │ (Token Worker)      │ │
-│  │  Server)    │  │ - Верифика- │  │ - Сбор хешей        │ │
-│  │             │  │   ция       │  │ - Выдача токенов    │ │
-│  │             │  │ - Ротация   │  │ - Привязка к агенту │ │
-│  │             │  │ - Блокиров- │  │                     │ │
-│  │             │  │   ка        │  │                     │ │
-│  └─────────────┘  └─────────────┘  └─────────────────────┘ │
-└─────────────────────────────────────────────────────────────┘
-         │                    │                    │
+┌──────────────────────────────────────────────────────────────┐
+│                       Gateway (gatewayd)                     │
+│                                                              │
+│  ┌──────────────┐  ┌──────────────┐  ┌────────────────────┐  │
+│  │ Auto-router  │  │    Guard     │  │  Token generator   │  │
+│  │ (Local/      │  │  - Verify    │  │  (Token Worker)    │  │
+│  │  Server)     │  │  - Rotation  │  │  - Hash collection │  │
+│  │              │  │  - Blocking  │  │  - Token issuing   │  │
+│  │              │  │              │  │  - Agent binding   │  │
+│  └──────────────┘  └──────────────┘  └────────────────────┘  │
+└──────────────────────────────────────────────────────────────┘
          │                    │                    │
          ▼                    ▼                    ▼
-┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐
-│   Агент         │ │   Журнал        │ │   Токен-хранилище│
-│ (t-dev-*,       │ │ (кто, когда,    │ │ (tokens.json)   │
-│  t-prod-*,      │ │  статус)        │ │                 │
-│  mTLS)          │ │                 │ │ - Токен         │
-└─────────────────┘ └─────────────────┘ │ - Хеш агента    │
-                                        │ - TTL           │
-                                        │ - Статус        │
-                                        └─────────────────┘
+┌───────────────────┐ ┌───────────────────┐ ┌───────────────────┐
+│      Agent        │ │      Journal      │ │  Token storage    │
+│ (t-dev-*,         │ │ (who, when,       │ │ (tokens.json)     │
+│  t-prod-*,        │ │  status)          │ │  - Token          │
+│  mTLS)            │ │                   │ │  - Agent hash     │
+│                   │ │                   │ │  - TTL            │
+│                   │ │                   │ │  - Status         │
+└───────────────────┘ └───────────────────┘ └───────────────────┘
 ```
 
 ---
 
-## 2. Компоненты
+## 2. Components
 
-### 2.1 Авто-роутер
+### 2.1 Auto-router
 
-**Задача**: Определяет режим (LOCAL/SERVER) по токену, IP, mTLS.
+**Task**: Determines the mode (LOCAL/SERVER) by token, IP, mTLS.
 
-**Логика**:
+**Logic**:
 ```rust
 pub fn detect_mode(
     token: &str,
     ip: &str,
     has_client_cert: bool,
 ) -> anyhow::Result<GatewayMode> {
-    // 1. Проверяем токен
+    // 1. Check the token
     if !token.starts_with("t-dev-") && !token.starts_with("t-prod-") {
-        anyhow::bail!("Неизвестный тип токена: {}", token);
+        anyhow::bail!("Unknown token type: {}", token);
     }
 
-    // 2. Проверяем, устарел ли токен
+    // 2. Check whether the token has expired
     if is_token_expired(token) {
-        anyhow::bail!("Токен устарел: {}", token);
+        anyhow::bail!("Token expired: {}", token);
     }
 
-    // 3. mTLS: нет сертификата → запрещаем
+    // 3. mTLS: no certificate → deny
     if !has_client_cert {
-        anyhow::bail!("Нет клиентского сертификата (mTLS)");
+        anyhow::bail!("No client certificate (mTLS)");
     }
 
-    // 4. Определяем режим
+    // 4. Determine the mode
     let mode = if token.starts_with("t-dev-") && is_local_ip(ip) {
         GatewayMode::Local
     } else if token.starts_with("t-prod-") {
         GatewayMode::Server
     } else {
-        anyhow::bail!("Неизвестная комбинация токена и IP");
+        anyhow::bail!("Unknown token/IP combination");
     };
 
     Ok(mode)
@@ -81,11 +79,11 @@ pub fn detect_mode(
 
 ---
 
-### 2.2 Сторож (Guard)
+### 2.2 Guard
 
-**Задача**: Верификация, ротация, блокировка токенов.
+**Task**: Verification, rotation, blocking of tokens.
 
-**Структура токена**:
+**Token structure**:
 ```rust
 pub struct Token {
     pub id: String,
@@ -102,28 +100,28 @@ pub enum TokenStatus {
 }
 ```
 
-**Верификация**:
+**Verification**:
 ```rust
 pub fn verify(&self, token_id: &str, agent_hash: &str) -> anyhow::Result<()> {
-    // 1. Ищем токен
+    // 1. Look up the token
     let token = self.tokens
         .iter()
         .find(|t| t.id == token_id)
-        .ok_or_else(|| anyhow::anyhow!("Токен не найден: {}", token_id))?;
+        .ok_or_else(|| anyhow::anyhow!("Token not found: {}", token_id))?;
 
-    // 2. Проверяем статус
+    // 2. Check the status
     if token.status != TokenStatus::Active {
-        anyhow::bail!("Токен не активен: {} (статус: {:?})", token_id, token.status);
+        anyhow::bail!("Token is not active: {} (status: {:?})", token_id, token.status);
     }
 
-    // 3. Проверяем, не истёк ли
+    // 3. Check whether it has expired
     if Utc::now() > token.expires_at {
-        anyhow::bail!("Токен истёк: {}", token_id);
+        anyhow::bail!("Token expired: {}", token_id);
     }
 
-    // 4. Проверяем хеш агента (привязка токена к агенту)
+    // 4. Check the agent hash (binding the token to the agent)
     if token.agent_hash != agent_hash {
-        anyhow::bail!("Хеш агента не совпадает (токен: {}, агент: {})", 
+        anyhow::bail!("Agent hash mismatch (token: {}, agent: {})", 
                      token_id, agent_hash);
     }
 
@@ -131,7 +129,7 @@ pub fn verify(&self, token_id: &str, agent_hash: &str) -> anyhow::Result<()> {
 }
 ```
 
-**Ротация**:
+**Rotation**:
 ```rust
 pub fn rotate_expired(&mut self) {
     for token in &mut self.tokens {
@@ -142,7 +140,7 @@ pub fn rotate_expired(&mut self) {
 }
 ```
 
-**Блокировка**:
+**Blocking**:
 ```rust
 pub fn revoke(&mut self, token_id: &str) {
     if let Some(token) = self.tokens.iter_mut().find(|t| t.id == token_id) {
@@ -153,18 +151,18 @@ pub fn revoke(&mut self, token_id: &str) {
 
 ---
 
-### 2.3 Генератор токенов (Token Worker)
+### 2.3 Token generator (Token Worker)
 
-**Задача**: Сбор хешей, выдача токенов, привязка к агенту.
+**Task**: Hash collection, token issuing, binding to the agent.
 
-**Сбор хешей**:
+**Hash collection**:
 ```rust
 pub fn collect_agent_hashes(&self) -> anyhow::Result<Vec<String>> {
     let mut hashes = Vec::new();
     let agents = list_agents()?;
     
     for agent in agents {
-        // Хеш = SHA256(UUID + CPU_ID + MAC)
+        // Hash = SHA256(UUID + CPU_ID + MAC)
         let hash = compute_agent_hash(&agent.uuid, &agent.cpu_id, &agent.mac)?;
         hashes.push(hash);
     }
@@ -182,12 +180,12 @@ fn compute_agent_hash(uuid: &str, cpu_id: &str, mac: &str) -> anyhow::Result<Str
 }
 ```
 
-**Выдача токена**:
+**Issuing a token**:
 ```rust
 pub fn issue_token(&self, agent_hash: &str) -> anyhow::Result<Token> {
     let token_id = format!("t-dev-{}", uuid::Uuid::new_v4());
     let issued_at = Utc::now();
-    let expires_at = issued_at + Duration::days(30); // TTL 30 дней
+    let expires_at = issued_at + Duration::days(30); // TTL 30 days
 
     let token = Token {
         id: token_id,
@@ -204,11 +202,11 @@ pub fn issue_token(&self, agent_hash: &str) -> anyhow::Result<Token> {
 
 ---
 
-### 2.4 mTLS (клиентские сертификаты)
+### 2.4 mTLS (client certificates)
 
-**Задача**: Защита от маскировки под локального агента.
+**Task**: Protection against spoofing as a local agent.
 
-**Проверка сертификата**:
+**Certificate check**:
 ```rust
 pub fn check_client_cert(cert: Option<&x509::X509>) -> bool {
     cert.map_or(false, |cert| {
@@ -225,16 +223,16 @@ fn is_trusted_ca(cert: &x509::X509) -> bool {
 
 ---
 
-### 2.5 Журнал для юзера
+### 2.5 Journal for the user
 
-**Формат** (journal.jsonl):
+**Format** (journal.jsonl):
 ```jsonl
 {"timestamp": "2026-08-18T14:30:00Z", "event": "agent_connected", "agent": "claurst-main", "token": "t-dev-local-001", "mode": "LOCAL", "status": "allowed", "ip": "192.168.1.100", "mac": "aa:bb:cc:dd:ee:ff"}
 {"timestamp": "2026-08-18T14:35:00Z", "event": "token_rotated", "old_token": "t-dev-abc123", "new_token": "t-dev-def456", "agent": "claurst-main"}
-{"timestamp": "2026-08-18T14:40:00Z", "event": "agent_connected", "agent": "unknown-device", "token": "t-dev-local-001", "mode": "LOCAL", "status": "denied", "ip": "192.168.1.100", "mac": "11:22:33:44:55:66", "reason": "MAC не совпадает"}
+{"timestamp": "2026-08-18T14:40:00Z", "event": "agent_connected", "agent": "unknown-device", "token": "t-dev-local-001", "mode": "LOCAL", "status": "denied", "ip": "192.168.1.100", "mac": "11:22:33:44:55:66", "reason": "MAC mismatch"}
 ```
 
-**Запись в журнал**:
+**Writing to the journal**:
 ```rust
 pub fn log_connection(agent: &str, token: &str, mode: &str, status: &str, ip: &str, mac: &str) -> anyhow::Result<()> {
     let entry = JournalEntry {
@@ -261,9 +259,9 @@ pub fn log_connection(agent: &str, token: &str, mode: &str, status: &str, ip: &s
 
 ---
 
-### 2.6 Логи для дева
+### 2.6 Logs for the dev
 
-**Формат** (gatewayd.log):
+**Format** (gatewayd.log):
 ```
 2026-08-18T14:30:00Z INFO  agent connected: claurst-main
 2026-08-18T14:30:00Z DEBUG token verified: t-dev-local-001
@@ -272,64 +270,64 @@ pub fn log_connection(agent: &str, token: &str, mode: &str, status: &str, ip: &s
 2026-08-18T14:30:00Z DEBUG agent hash matched: sha256=abc123...
 ```
 
-**Уровни логирования**:
-- `ERROR`: Критические ошибки (шлюз не запускается)
-- `WARN`: Предупреждения (токен устарел, апрув нужен)
-- `INFO`: Обычные события (агент подключился)
-- `DEBUG`: Отладка (верификация токена, mTLS)
-- `TRACE`: Детали (IP, MAC, хеши)
+**Logging levels**:
+- `ERROR`: critical errors (the gateway does not start)
+- `WARN`: warnings (token expired, approval needed)
+- `INFO`: regular events (an agent connected)
+- `DEBUG`: debugging (token verification, mTLS)
+- `TRACE`: details (IP, MAC, hashes)
 
 ---
 
-## 3. Сценарии
+## 3. Scenarios
 
-### 3.1 Локальный агент (втыкается сразу)
-
-```
-1. Агент: t-dev-* + локальный IP + mTLS → LOCAL режим
-2. Guard: токен валидный, хеш совпадает → ✓
-3. Журнал: "claurst-main подключён (LOCAL)"
-4. Логи: "token verified, mTLS verified, hash matched"
-```
-
-### 3.2 Удалённый агент (нужен апрув)
+### 3.1 Local agent (plugged in directly)
 
 ```
-1. Агент: t-prod-* + публичный IP → SERVER режим
-2. Guard: токен валидный → ✓
-3. Первый раз? → апрув юзера
-4. Журнал: "agent-xyz подключён (SERVER, y/n)"
-5. Юзер: y → ✓
-6. Логи: "token verified, user approved"
+1. Agent: t-dev-* + local IP + mTLS → LOCAL mode
+2. Guard: token valid, hash matches → ✓
+3. Journal: "claurst-main connected (LOCAL)"
+4. Logs: "token verified, mTLS verified, hash matched"
 ```
 
-### 3.3 Злоумышленник (маскируется)
+### 3.2 Remote agent (approval needed)
 
 ```
-1. Агент: t-dev-* (украден) + локальный IP
-2. mTLS: нет сертификата → ❌
-3. Guard: токен валидный, но нет mTLS → ❌
-4. Журнал: "unknown-device запрещён (нет mTLS)"
-5. Логи: "mTLS certificate missing, connection denied"
+1. Agent: t-prod-* + public IP → SERVER mode
+2. Guard: token valid → ✓
+3. First time? → user approval
+4. Journal: "agent-xyz connected (SERVER, y/n)"
+5. User: y → ✓
+6. Logs: "token verified, user approved"
 ```
 
-### 3.4 Токен устарел
+### 3.3 Attacker (spoofing)
 
 ```
-1. Guard: токен истёк (TTL 30 дней) → ❌
-2. Генератор: выдаёт новый токен
-3. Журнал: "t-dev-abc123 → t-dev-def456 (ротация)"
-4. Логи: "token expired, rotated to t-dev-def456"
-5. Агент: обновляет токен → ✓
+1. Agent: t-dev-* (stolen) + local IP
+2. mTLS: no certificate → ❌
+3. Guard: token valid, but no mTLS → ❌
+4. Journal: "unknown-device denied (no mTLS)"
+5. Logs: "mTLS certificate missing, connection denied"
+```
+
+### 3.4 Token expired
+
+```
+1. Guard: token expired (TTL 30 days) → ❌
+2. Generator: issues a new token
+3. Journal: "t-dev-abc123 → t-dev-def456 (rotation)"
+4. Logs: "token expired, rotated to t-dev-def456"
+5. Agent: updates the token → ✓
 ```
 
 ---
 
-## 4. Безопасность
+## 4. Security
 
-### 4.1 Хранение токенов
+### 4.1 Token storage
 
-**Вариант 1**: Шифрование файла
+**Option 1**: File encryption
 ```rust
 // tokens.json.enc (AES-256-GCM)
 let key = load_encryption_key();
@@ -337,66 +335,66 @@ let ciphertext = aes_gcm_encrypt(&tokens_json, &key)?;
 std::fs::write("tokens.json.enc", ciphertext)?;
 ```
 
-**Вариант 2**: HSM/TEE
+**Option 2**: HSM/TEE
 ```rust
-// Токены хранятся в secure enclave
+// Tokens are stored in a secure enclave
 let tokens = hsm_load_tokens()?;
 ```
 
-### 4.2 Ротация токенов
+### 4.2 Token rotation
 
-- **TTL**: 30 дней (автоматическая ротация)
-- **Ручная**: `gatewayd --revoke-token t-dev-abc123`
-- **Автоматическая**: при подозрительной активности (слишком много попыток)
+- **TTL**: 30 days (automatic rotation)
+- **Manual**: `gatewayd --revoke-token t-dev-abc123`
+- **Automatic**: on suspicious activity (too many attempts)
 
 ### 4.3 mTLS
 
-- **CA**: Внутренний CA (выпускает сертификаты агентам)
-- **Ротация**: 1 год (автоматическая)
-- **Отзыв**: CRL/OCSP (при компрометации)
+- **CA**: internal CA (issues certificates to agents)
+- **Rotation**: 1 year (automatic)
+- **Revocation**: CRL/OCSP (upon compromise)
 
 ---
 
-## 5. Развёртывание
+## 5. Deployment
 
-### 5.1 Локально (персональный юзер)
+### 5.1 Locally (personal user)
 
 ```bash
-# 1. Установка
+# 1. Installation
 $ cargo install gatewayd
 
-# 2. Конфиг
+# 2. Config
 $ cat config.yaml
 agents:
   - name: claurst-main
     url: http://localhost:8348
     token: t-dev-local-001
 
-# 3. Запуск
+# 3. Startup
 $ ./gatewayd config.yaml
 ```
 
-### 5.2 Корпоратив (кластер)
+### 5.2 Enterprise (cluster)
 
 ```bash
-# 1. Установка
+# 1. Installation
 $ helm install gateway ./charts/gateway
 
-# 2. Конфиг (ConfigMap)
+# 2. Config (ConfigMap)
 $ kubectl apply -f gateway-config.yaml
 
-# 3. Запуск
+# 3. Startup
 $ kubectl rollout restart deployment/gatewayd
 
-# 4. Генератор токенов (CronJob)
+# 4. Token generator (CronJob)
 $ kubectl apply -f token-worker-cron.yaml
 ```
 
 ---
 
-## 6. Мониторинг
+## 6. Monitoring
 
-### 6.1 Метрики (Prometheus)
+### 6.1 Metrics (Prometheus)
 
 ```
 gateway_agents_connected_total{mode="local"} 5
@@ -407,7 +405,7 @@ gateway_tokens_revoked_total 1
 gateway_connections_denied_total 2
 ```
 
-### 6.2 Алерты (Alertmanager)
+### 6.2 Alerts (Alertmanager)
 
 ```yaml
 # alertrules.yaml
@@ -420,7 +418,7 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "Много запрещённых подключений"
+          summary: "High number of denied connections"
       
       - alert: TokensExpiringSoon
         expr: gateway_tokens_expiring_in_24h > 5
@@ -428,51 +426,51 @@ groups:
         labels:
           severity: info
         annotations:
-          summary: "Токены истекают через 24 часа"
+          summary: "Tokens expire within 24 hours"
 ```
 
 ---
 
-## 7. Риски и решения
+## 7. Risks and decisions
 
-| Риск | Решение |
+| Risk | Decision |
 |---|---|
-| **Хеш = MAC (подделка)** | Использовать UUID + CPU_ID + MAC |
-| **Генератор требует root** | Запуск от юзера, читать только доступные файлы |
-| **Токены в файле (кража)** | Шифрование (AES-256-GCM) или HSM |
-| **Ротация ломает агентов** | Агенты обновляют токены автоматически (API) |
-| **mTLS + токены (двойная работа)** | mTLS для локальных, токены для удалённых |
-| **Guard = точка отказа** | Redundancy (2+ Guard), кэш токенов |
-| **Юзер не понимает** | Понятные ошибки, документация, UI |
+| **Hash = MAC (spoofable)** | Use UUID + CPU_ID + MAC |
+| **Generator requires root** | Run as the user, read only accessible files |
+| **Tokens in a file (theft)** | Encryption (AES-256-GCM) or HSM |
+| **Rotation breaks agents** | Agents update tokens automatically (API) |
+| **mTLS + tokens (double work)** | mTLS for local, tokens for remote |
+| **Guard = single point of failure** | Redundancy (2+ Guards), token cache |
+| **User does not understand** | Clear errors, documentation, UI |
 
 ---
 
 ## 8. Roadmap
 
-### Фаза 1: Персональные юзеры (сейчас)
+### Phase 1: Personal users (now)
 
-- [ ] Один конфиг (config.yaml)
-- [ ] Токен/ключ/пасс
-- [ ] Апрув (первый раз)
-- [ ] Журнал для юзера (journal.jsonl)
-- [ ] Логи для дева (gatewayd.log)
+- [ ] Single config (config.yaml)
+- [ ] Token/key/password
+- [ ] Approval (first time)
+- [ ] Journal for the user (journal.jsonl)
+- [ ] Logs for the dev (gatewayd.log)
 
-### Фаза 2: Корпоратив (будущее)
+### Phase 2: Enterprise (future)
 
-- [ ] Авто-роутер (LOCAL/SERVER)
-- [ ] Сторож (Guard): верификация, ротация, блокировка
-- [ ] Генератор токенов: хеши, выдача, привязка
-- [ ] mTLS: сертификаты, CA, ротация
-- [ ] Шифрование токенов (AES-256-GCM)
-- [ ] Мониторинг (Prometheus, Grafana)
-- [ ] Алерты (Alertmanager)
+- [ ] Auto-router (LOCAL/SERVER)
+- [ ] Guard: verification, rotation, blocking
+- [ ] Token generator: hashes, issuing, binding
+- [ ] mTLS: certificates, CA, rotation
+- [ ] Token encryption (AES-256-GCM)
+- [ ] Monitoring (Prometheus, Grafana)
+- [ ] Alerts (Alertmanager)
 - [ ] Kubernetes (Helm, ConfigMap, CronJob)
 
 ---
 
-## 9. Приложения
+## 9. Appendices
 
-### 9.1 Структура проекта
+### 9.1 Project structure
 
 ```
 gatewayd/
@@ -491,7 +489,7 @@ gatewayd/
 └── gatewayd.log
 ```
 
-### 9.2 Зависимости (Cargo.toml)
+### 9.2 Dependencies (Cargo.toml)
 
 ```toml
 [dependencies]
@@ -510,4 +508,4 @@ tracing-subscriber = "0.3"
 
 ---
 
-**Конец документа**
+**End of document**

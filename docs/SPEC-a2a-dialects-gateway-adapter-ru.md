@@ -1,9 +1,11 @@
 # ТЗ: Диалекты A2A (SDK/Spec) в шлюзе и адаптере + общий диалект-зонд
 
+
+> **Язык:** русский · [English version](./SPEC-a2a-dialects-gateway-adapter.md)
 - **Статус:** черновик (на утверждение владельца). Код не меняется.
 - **Дата:** 2026-08-17
 - **Продукты:** `ACP-A2A_gateway` (шлюз), `agent-connector` (адаптер-коннектор).
-- **Объединяет:** `ACP-A2A_gateway/docs/TZ-add-adapterd-wire-format.md` (Раздел 1),
+- **Объединяет:** `ACP-A2A_gateway/docs/SPEC-add-adapterd-wire-format-ru.md` (Раздел 1),
   `agent-connector/docs/design/TZ-driver-a2a-wire-format.md` (Раздел 2),
   и диалект-зонд из `A2A-protocol-strategy-2026.md` §9.2 (Раздел 3).
 - **Цель:** базовый диалект A2A — **SDK (v1.0/ProtoJSON)**, fallback — **Spec (pre-1.0)**,

@@ -1,7 +1,9 @@
 # ТЗ: добавить в шлюз `ACP-A2A_gateway` wire-формат adapterd (SDK a2a-rs)
 
+
+> **Язык:** русский · [English version](./SPEC-add-adapterd-wire-format.md)
 > **ЗАМЕНЕНО:** объединено в единое ТЗ
-> `docs/TZ-a2a-dialects-gateway-adapter.md` → Раздел 1. Этот файл сохранён как
+> `docs/SPEC-a2a-dialects-gateway-adapter-ru.md` → Раздел 1. Этот файл сохранён как
 > исходник, правки — в объединённом документе.
 
 - **Статус:** заменено (см. выше). Код не менялся.

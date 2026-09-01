@@ -1,90 +1,92 @@
-# План включения стриминга в ACP-A2A_gateway: от "официально задействовать" до масштабирования
+# Streaming rollout plan for ACP-A2A_gateway: from "officially turn it on" to scaling
 
-Два раздельных этапа, как и запрошено: (1) закрыть архитектурный долг Р-18/TECH_DEBT — реально реализовать
-`Reply::Streaming` в коде; (2) добавить конфигурируемые лимиты масштаба поверх уже работающего механизма.
-Ничего из этого не меняет сигнатуры `Reply<T,U>`, `AcpAgent`, `A2aAgent` — оба этапа укладываются в уже
-принятый seam (`docs/04-architecture-guide-extending.md`, decisions.md Р-18).
+> **Language:** English · [Русская версия](stream-rollout-plan-ru.md)
 
----
-
-## Этап 1 — официально включить стриминг (закрыть Фазу 2)
-
-Цель: `Reply::Streaming` перестаёт быть недостижимым вариантом и начинает реально прокачивать
-`session/update` ↔ `A2aEvent` по обоим конвертирующим направлениям (3 и 4). Направление 2
-(A2A↔A2A reverse-proxy) не трогается — оно уже стримит через SSE passthrough (Р-18).
-
-### 1.1 `core/src/stdio_agent.rs` — перестать сплющивать чанки
-
-Сейчас `UpdatesMap` копит `Vec<ContentBlock>` и целиком отдаёт в `Reply::Complete` после завершения
-хода. Меняется на канал:
-
-- `UpdatesMap` заменяется на `HashMap<SessionId, mpsc::UnboundedSender<SessionUpdate>>` — заводится
-  при входе в `prompt()`, а не заполняется постфактум.
-- `collect_session_update()` перенаправляет каждый разобранный `session/update` сразу в `tx.send(...)`,
-  без накопления в `Vec`.
-- `prompt()` возвращает `Reply::Streaming(rx)` **сразу после отправки `session/prompt` в stdin**, не
-  дожидаясь ответа `call()`. Финальный `PromptResponse` от `call()` домаппливается в последний
-  элемент потока (terminal-событие), закрывающий канал.
-- Важно (из Р-18): при отсутствии потока — `anyhow::Result::Err`, никаких `unreachable!()`/`panic!()`,
-  чтобы одиночная ошибка не рушила весь `tokio`-воркер сетевого сервиса.
-
-### 1.2 `core/src/convert.rs` — реальный маппинг вместо `unreachable!()`
-
-Оба направления получают тело вместо заглушки:
-
-- `AcpAsA2a` (направление 4, A2A-клиент → ACP-агент): `match reply { Reply::Streaming(rx) => { ... } }`
-  читает `SessionUpdate` из `rx` и мапит в `A2aEvent::TaskStatusUpdate`/`TaskArtifactUpdate` —
-  сигнатура почти идентична `map_event()` из `protocol_a2a_mapper.rs` в соседнем проекте (уже есть
-  готовый образец мэппинга `CoreEventKind → A2aStreamEvent`, можно переиспользовать как шаблон
-  1-в-1, адаптировав типы).
-- `A2aAsAcp` (направление 3, ACP-клиент → A2A-агент): обратный маппинг `A2aEvent → SessionUpdate`
-  (`agent_message_chunk` для текстовых чанков, финальный статус — терминальное уведомление).
-- Оба адаптера отдают `Reply::Streaming(rx)` дальше в диспетчер без блокировки — сам конвертер не
-  должен ждать закрытия канала, только переслать его.
-
-### 1.3 `gatewayd/transport_http.rs` — ветка `Reply::Streaming` на HTTP (направление 4)
-
-- `axum` уже в зависимостях (`axum = "0.7"`, `gatewayd/Cargo.toml`) — используется встроенный
-  `axum::response::sse::Sse` + `axum::response::sse::Event`, без новых крейтов.
-  `Sse::new(stream)` оборачивает `tokio_stream::wrappers::UnboundedReceiverStream` (нужно добавить
-  зависимость `tokio-stream`, единственная реально новая зависимость на весь этап 1).
-- Ответ на `tasks/resubscribe` — не JSON, а `text/event-stream`, аналогично тому, как уже раздаётся
-  SSE в направлении 2 (`transport_a2a_passthrough.rs`), только источник данных — не upstream-байты,
-  а `A2aEvent`, сериализованный в SSE-фрейм этим же обработчиком.
-
-### 1.4 `gatewayd/transport_tcp.rs` — ветка `Reply::Streaming` на TCP (направление 3)
-
-- Проще, чем HTTP: TCP-соединение уже построчный JSON-RPC. Каждый элемент из `rx` сериализуется как
-  ACP-нотификация `session/update` и пишется в тот же TCP-сокет клиента newline-delimited — без
-  дополнительных абстракций поверх уже существующего read/write-цикла.
-
-### 1.5 Тесты (обязательная часть этапа, не отдельный этап)
-
-- Юнит-тест на `stdio_agent.rs`: мок-агент шлёт несколько `session/update` до финального ответа —
-  проверяется, что `rx` получает их **по одному**, а не одним батчем в конце (это прямая регрессия
-  против текущего поведения, описанного в Р-18).
-- Интеграционный тест по образцу существующего `docs/06-gateway-guide.md` §7 п.10 (live-прогон для
-  reverse-proxy) — то же самое, но для направления 4: `tasks/resubscribe` действительно получает
-  несколько SSE-событий до `completed`.
-- Negative control (по конвенции проекта из `docs/decisions.md`, раздел "Как это писалось"): откатить
-  фикс и убедиться, что тест реально краснеет, а не тавтологичен.
-
-**Оценка этапа 1**: соответствует уже зафиксированной оценке "+3-4 дня" из
-`docs/FINAL-ARCHITECTURE-minimal-reliable.md` §6 — план не расширяет объём, только детализирует его
-по конкретным файлам.
+Two separate stages, as requested: (1) close the architectural debt P-18/TECH_DEBT — actually implement
+`Reply::Streaming` in code; (2) add configurable scale limits on top of the already-working mechanism.
+None of this changes the signatures of `Reply<T,U>`, `AcpAgent`, `A2aAgent` — both stages fit within the
+already-accepted seam (`docs/04-architecture-guide-extending.md`, decisions.md P-18).
 
 ---
 
-## Этап 2 — масштабирование и контроль через конфиг
+## Stage 1 — officially enable streaming (close Phase 2)
 
-Цель: те же самые лимиты, что обсуждались раньше (per-agent concurrency, разделение таймаутов,
-счётчик активных стримов), но не хардкод, а параметры `config.yaml`, изменяемые без пересборки.
+Goal: `Reply::Streaming` stops being an unreachable variant and actually starts relaying
+`session/update` ↔ `A2aEvent` through both converting directions (3 and 4). Direction 2
+(A2A↔A2A reverse-proxy) is untouched — it already streams via SSE passthrough (P-18).
 
-### 2.1 Новые поля конфига
+### 1.1 `core/src/stdio_agent.rs` — stop flattening chunks
 
-Расширение существующей секции `agents:` в `config.yaml` (не новый файл — по правилу
-"точки расширения" из `docs/04-architecture-guide-extending.md`, где "множественные агенты на токен"
-уже описаны как "только правка YAML, код не меняется"):
+Currently `UpdatesMap` accumulates a `Vec<ContentBlock>` and hands it over wholesale in `Reply::Complete`
+after the turn finishes. It changes to a channel:
+
+- `UpdatesMap` is replaced by `HashMap<SessionId, mpsc::UnboundedSender<SessionUpdate>>` — created upon
+  entry into `prompt()`, not filled in after the fact.
+- `collect_session_update()` forwards each parsed `session/update` straight into `tx.send(...)`,
+  without accumulating into a `Vec`.
+- `prompt()` returns `Reply::Streaming(rx)` **immediately after writing `session/prompt` to stdin**,
+  without waiting for `call()`'s response. The final `PromptResponse` from `call()` is home-mapped into
+  the last element of the stream (terminal event), closing the channel.
+- Important (from P-18): when there is no stream — `anyhow::Result::Err`, no `unreachable!()`/`panic!()`,
+  so that a single error does not take down the whole `tokio` worker of the network service.
+
+### 1.2 `core/src/convert.rs` — real mapping instead of `unreachable!()`
+
+Both directions get a body instead of a stub:
+
+- `AcpAsA2a` (direction 4, A2A client → ACP agent): `match reply { Reply::Streaming(rx) => { ... } }`
+  reads `SessionUpdate` from `rx` and maps it to `A2aEvent::TaskStatusUpdate`/`TaskArtifactUpdate` —
+  the signature is nearly identical to `map_event()` from `protocol_a2a_mapper.rs` in the neighbouring
+  project (there is already a ready mapping example `CoreEventKind → A2aStreamEvent`, reusable as a
+  1-in-1 template with the types adapted).
+- `A2aAsAcp` (direction 3, ACP client → A2A agent): the reverse mapping `A2aEvent → SessionUpdate`
+  (`agent_message_chunk` for text chunks, the final status — a terminal notification).
+- Both adapters pass `Reply::Streaming(rx)` further to the dispatcher without blocking — the converter
+  itself must not wait for the channel to close, only forward it.
+
+### 1.3 `gatewayd/transport_http.rs` — the `Reply::Streaming` branch on HTTP (direction 4)
+
+- `axum` is already in the dependencies (`axum = "0.7"`, `gatewayd/Cargo.toml`) — use the built-in
+  `axum::response::sse::Sse` + `axum::response::sse::Event`, no new crates.
+  `Sse::new(stream)` wraps a `tokio_stream::wrappers::UnboundedReceiverStream` (the `tokio-stream`
+  dependency must be added — the only genuinely new dependency across all of stage 1).
+- The response to `tasks/resubscribe` — not JSON but `text/event-stream`, analogous to how SSE is
+  already served in direction 2 (`transport_a2a_passthrough.rs`), except the data source is not
+  upstream bytes but an `A2aEvent` serialized into an SSE frame by this same handler.
+
+### 1.4 `gatewayd/transport_tcp.rs` — the `Reply::Streaming` branch on TCP (direction 3)
+
+- Simpler than HTTP: the TCP connection is already line-based JSON-RPC. Each item from `rx` is
+  serialized as an ACP `session/update` notification and written to the same client TCP socket
+  newline-delimited — without additional abstractions over the existing read/write loop.
+
+### 1.5 Tests (a mandatory part of the stage, not a separate stage)
+
+- Unit test on `stdio_agent.rs`: a mock agent sends several `session/update`s before the final response —
+  the test checks that `rx` receives them **one at a time**, not in one batch at the end (this is a direct
+  regression against the current behavior described in P-18).
+- Integration test modeled on the existing `docs/06-gateway-guide.md` §7 item 10 (live run for the
+  reverse-proxy) — the same thing, but for direction 4: `tasks/resubscribe` actually receives several
+  SSE events before `completed`.
+- Negative control (per the project convention from `docs/decisions.md`, section "How this was written"):
+  revert the fix and verify that the test really goes red, not that it is tautological.
+
+**Stage 1 estimate**: matches the already-recorded "+3-4 days" estimate from
+`docs/FINAL-ARCHITECTURE-minimal-reliable.md` §6 — the plan does not expand the scope, it only details it
+per concrete files.
+
+---
+
+## Stage 2 — scaling and control via config
+
+Goal: the very same limits discussed earlier (per-agent concurrency, timeout separation,
+active-stream counter), but not hardcoded — parameters in `config.yaml`, changeable without a rebuild.
+
+### 2.1 New config fields
+
+Extension of the existing `agents:` section in `config.yaml` (not a new file — per the "extension
+points" rule from `docs/04-architecture-guide-extending.md`, where "multiple agents per token"
+is already described as "YAML edit only, code does not change"):
 
 ```yaml
 agents:
@@ -92,57 +94,57 @@ agents:
     transport: stdio
     command: ["claurst", "acp"]
     streaming:
-      max_concurrent_streams: 4        # потолок одновременных Reply::Streaming на этого агента
-      first_chunk_timeout_secs: 15     # таймаут ДО первого чанка (эквивалент текущего agent_call_timeout)
-      idle_chunk_timeout_secs: 120     # таймаут МЕЖДУ чанками (не блокирует долгий, но живой стрим)
-      buffer_capacity: 256             # ёмкость mpsc-канала на один стрим (backpressure)
+      max_concurrent_streams: 4        # ceiling of concurrent Reply::Streaming for this agent
+      first_chunk_timeout_secs: 15     # timeout BEFORE the first chunk (equivalent of the current agent_call_timeout)
+      idle_chunk_timeout_secs: 120     # timeout BETWEEN chunks (does not block a long but live stream)
+      buffer_capacity: 256             # mpsc channel capacity per stream (backpressure)
 
 runtime:
-  global_max_concurrent_streams: 64    # общий потолок на процесс gatewayd, защита от исчерпания ресурсов
+  global_max_concurrent_streams: 64    # global ceiling for the gatewayd process, protection against resource exhaustion
 ```
 
-Валидация — по той же конвенции, что уже есть для `{env:VAR}` и пустых токенов (`docs/06-gateway-guide.md`
-§3): отсутствие обязательных полей или лимит `0` — ошибка старта, не тихий дефолт.
+Validation follows the same convention already in place for `{env:VAR}` and empty tokens (`docs/06-gateway-guide.md`
+§3): a missing required field or a limit of `0` — a startup error, not a silent default.
 
 ### 2.2 `gatewayd/src/registry.rs` — `Semaphore` per-agent
 
-- `AgentEntry` получает поле `stream_permits: Arc<tokio::sync::Semaphore>`, инициализируемое из
+- `AgentEntry` gains the field `stream_permits: Arc<tokio::sync::Semaphore>`, initialized from
   `streaming.max_concurrent_streams`.
-- Перед входом в `Reply::Streaming`-ветку диспетчер берёт `try_acquire` — при отказе клиент получает
-  явную ошибку (`503`/`-32000` "agent stream capacity exhausted"), а не тихое зависание. Это тот же
-  fail-closed принцип, что уже применён в `TurnLease` (`docs/decisions.md` — общий стиль проекта:
-  явный отказ лучше тихого прохождения).
-- Общий `global_max_concurrent_streams` — второй `Semaphore` в `main.rs`, общий для всех агентов,
-  проверяется первым (до per-agent), чтобы деградация была предсказуемой при системной перегрузке.
+- Before entering the `Reply::Streaming` branch the dispatcher takes `try_acquire` — on denial the client
+  gets an explicit error (`503`/`-32000` "agent stream capacity exhausted"), not a silent hang. This is
+  the same fail-closed principle already applied in `TurnLease` (`docs/decisions.md` — the project's
+  general style: an explicit refusal is better than silent passage).
+- The shared `global_max_concurrent_streams` — a second `Semaphore` in `main.rs`, common to all agents,
+  checked first (before the per-agent one), so that degradation is predictable under systemic overload.
 
-### 2.3 `core/src/stdio_agent.rs` — раздельные таймауты
+### 2.3 `core/src/stdio_agent.rs` — separate timeouts
 
-- `call_timeout: Duration` (уже существующее поле) остаётся как есть для нестримингового пути.
-- Добавляется `first_chunk_timeout: Duration` и `idle_chunk_timeout: Duration`, читаемые из той же
-  `streaming:` секции конфига через `SpawnConfig` (аналогично тому, как туда уже прокидывается
-  `call_timeout` — `core/src/supervisor.rs::SpawnConfig`).
-- Механика: `tokio::time::timeout(first_chunk_timeout, rx.recv())` для первого элемента,
-  `tokio::time::timeout(idle_chunk_timeout, rx.recv())` для последующих — тот же паттерн, что уже
-  использован в `call()` для нестримингового пути, просто с двумя разными длительностями.
+- `call_timeout: Duration` (an already existing field) stays as is for the non-streaming path.
+- `first_chunk_timeout: Duration` and `idle_chunk_timeout: Duration` are added, read from the same
+  `streaming:` config section via `SpawnConfig` (analogous to how `call_timeout` is already plumbed
+  there — `core/src/supervisor.rs::SpawnConfig`).
+- Mechanics: `tokio::time::timeout(first_chunk_timeout, rx.recv())` for the first element,
+  `tokio::time::timeout(idle_chunk_timeout, rx.recv())` for subsequent ones — the same pattern already
+  used in `call()` for the non-streaming path, just with two different durations.
 
-### 2.4 Наблюдаемость (минимально необходимая, не отдельный этап)
+### 2.4 Observability (minimally necessary, not a separate stage)
 
-- `tracing`-события на: открытие/закрытие стрима, отказ по `Semaphore`, срабатывание
-  `idle_chunk_timeout`. Проект уже логирует переспавны и деградации через `tracing::warn!`
-  (`core/src/supervisor.rs`) — новые события следуют тому же стилю, без отдельной метрической системы.
-- Счётчик активных стримов на агента — не в `TaskStore` (это про завершённые задачи и их retention),
-  а как атомарный счётчик рядом с `Semaphore` в `AgentEntry`, читаемый опционально для будущего
-  health/status-эндпоинта.
+- `tracing` events on: stream open/close, denial by `Semaphore`, `idle_chunk_timeout` firing. The
+  project already logs respawns and degradations via `tracing::warn!` (`core/src/supervisor.rs`) — the
+  new events follow the same style, without a separate metrics system.
+- The active-stream counter per agent — not in `TaskStore` (that is about completed tasks and their
+  retention), but as an atomic counter next to the `Semaphore` in `AgentEntry`, optionally readable for
+  a future health/status endpoint.
 
-**Оценка этапа 2**: 1.5–2 дня — расширение конфига и `Semaphore`-обвязка, без новой бизнес-логики
-маппинга (она уже сделана в этапе 1).
+**Stage 2 estimate**: 1.5–2 days — config extension and `Semaphore` plumbing, with no new business
+mapping logic (that is already done in stage 1).
 
 ---
 
-## Почему именно такой порядок
+## Why exactly this order
 
-Делать масштабирование раньше механизма стриминга бессмысленно — лимитировать нечего, пока
-`Reply::Streaming` возвращает ошибку. Делать оба этапа одним PR — противоречит правилу проекта
-"новая возможность = новый файл/дифф, не смешивать с другим изменением" (`docs/04-architecture-guide-extending.md`,
-раздел "Антипаттерны") и усложнит откат: если в этапе 1 всплывёт баг маппинга, чинить его проще без
-одновременного дебага лимитов конкурентности.
+Doing scaling before the streaming mechanism is pointless — there is nothing to limit while
+`Reply::Streaming` returns an error. Doing both stages in one PR contradicts the project rule
+"new capability = new file/diff, do not mix with another change" (`docs/04-architecture-guide-extending.md`,
+section "Anti-patterns") and would complicate rollback: if a mapping bug surfaces in stage 1, it is easier
+to fix without simultaneously debugging concurrency limits.

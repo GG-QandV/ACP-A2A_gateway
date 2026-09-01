@@ -1,120 +1,122 @@
-# Архитектурный гайд: добавление модулей
+# Architecture guide: adding modules
 
-Правило по умолчанию: **новая возможность = новый файл, а не правка
-существующего**. Если патч требует менять сигнатуру существующего
-публичного типа — это сигнал остановиться и проверить, не сломает ли
-это другие места (см. таблицу точек расширения ниже).
+> **Language:** English · [Русская версия](04-architecture-guide-extending-ru.md)
 
-## Правило "seam" — как устроено расширение без переписывания
+Default rule: **a new feature = a new file, not an edit of an
+existing one**. If a patch requires changing the signature of an existing
+public type — that is a signal to stop and check whether it would
+break other places (see the extension points table below).
 
-Ключевой архитектурный приём во всём проекте: там, где известно, что
-функциональность будет расширяться (стриминг, multi-tenant, rate
-limiting), сигнатура API проектируется заранее так, чтобы новый
-вариант помещался без изменения существующего кода.
+## The "seam" rule — how extension without rewriting works
 
-Пример уже реализованного seam — `enum Reply<T, U>`:
+The key architectural device throughout the project: where functionality is
+known to grow (streaming, multi-tenant, rate
+limiting), the API signature is designed up front so that a new
+variant fits without changing existing code.
+
+An example of an already implemented seam is `enum Reply<T, U>`:
 
 ```rust
 pub enum Reply<T, U> {
-    Complete(T),                                    // Фаза 1: единственный вариант
-    Streaming(tokio::sync::mpsc::UnboundedReceiver<U>), // Фаза 2: добавляется без
-}                                                        // изменения сигнатур trait'ов
+    Complete(T),                                    // Phase 1: the only variant
+    Streaming(tokio::sync::mpsc::UnboundedReceiver<U>), // Phase 2: added without
+}                                                        // changing trait signatures
 ```
 
-Любой новый модуль, добавляющий асинхронное/потоковое поведение, должен
-следовать этому же паттерну — не менять `T` на `Result<T, Streaming>` или
-подобное ad-hoc, а искать, можно ли использовать уже существующий `Reply`.
+Any new module adding asynchronous/streaming behavior must
+follow the same pattern — not change `T` to `Result<T, Streaming>` or
+anything similar ad-hoc, but check whether the existing `Reply` can be used.
 
-## Таблица точек расширения (из финальной архитектуры треда)
+## Extension points table (from the final thread architecture)
 
-| Что добавляется | Новый файл | Существующие файлы — что меняется | Что НЕ трогается |
+| What is added | New file | Existing files — what changes | What is NOT touched |
 |---|---|---|---|
-| Стриминг (session/update, SSE) | — (используются существующие) | `core/convert.rs`: заменить `unreachable!()` на реальный маппинг SessionUpdate↔A2aEvent; `gatewayd/transport_*.rs`: обработать ветку `Reply::Streaming` | Сигнатуры `AcpAgent`/`A2aAgent`, `Reply<T,U>`, `registry.rs` |
-| WS-транспорт | `gatewayd/src/transport_ws.rs` | `main.rs`: добавить `tokio::spawn` для нового сервера | `core/`, `protocol/`, остальные `transport_*.rs` |
-| TLS | — | `transport_tcp.rs`/`transport_http.rs`: обернуть `TcpListener`/`axum::serve` в `rustls`-акцептор | Всё выше транспортного слоя |
-| Rate limiting | `gatewayd/src/rate_limit.rs` | `transport_tcp.rs`/`transport_http.rs`: вызов `rate_limit.check(...)` перед `registry.check_token(...)` | Логика после токена и диспетчеризации |
-| Множественные агенты на токен | — | Только `config.yaml` (`agents:` секция расширяется) | Код не меняется совсем — `Registry` уже поддерживает N агентов |
-| OAuth2 вместо статического токена | `gatewayd/src/auth/oauth2.rs` | `registry.rs`: `check_token` заменяется на trait `TokenValidator` с двумя impl (`StaticToken`, `OAuth2Validator`) | `core/` не знает про способ аутентификации вообще |
-| Multi-tenant роутинг | `gatewayd/src/tenant_router.rs` | `registry.rs`: `Registry` получает поле `tenant_id` в `AgentEntry` | `core/convert.rs` не знает о тенантах — маппинг протоколов tenant-агностичен |
-| Персистентное хранилище задач (Postgres вместо файлов) | `core/src/task_store_pg.rs` | `core/lib.rs`: `pub mod task_store_pg`; вызывающий код (`transport_http.rs`) выбирает реализацию через enum/trait | `TaskStore` (файловая) остаётся как есть — не удаляется, а становится одной из реализаций |
+| Streaming (session/update, SSE) | — (existing files are used) | `core/convert.rs`: replace `unreachable!()` with the real SessionUpdate↔A2aEvent mapping; `gatewayd/transport_*.rs`: handle the `Reply::Streaming` branch | `AcpAgent`/`A2aAgent` signatures, `Reply<T,U>`, `registry.rs` |
+| WS transport | `gatewayd/src/transport_ws.rs` | `main.rs`: add a `tokio::spawn` for the new server | `core/`, `protocol/`, the other `transport_*.rs` |
+| TLS | — | `transport_tcp.rs`/`transport_http.rs`: wrap `TcpListener`/`axum::serve` in a `rustls` acceptor | Everything above the transport layer |
+| Rate limiting | `gatewayd/src/rate_limit.rs` | `transport_tcp.rs`/`transport_http.rs`: call `rate_limit.check(...)` before `registry.check_token(...)` | Logic after the token check and dispatch |
+| Multiple agents per token | — | Only `config.yaml` (the `agents:` section is extended) | Code doesn't change at all — `Registry` already supports N agents |
+| OAuth2 instead of a static token | `gatewayd/src/auth/oauth2.rs` | `registry.rs`: `check_token` is replaced with a `TokenValidator` trait with two impls (`StaticToken`, `OAuth2Validator`) | `core/` knows nothing about the authentication method at all |
+| Multi-tenant routing | `gatewayd/src/tenant_router.rs` | `registry.rs`: `Registry` gains a `tenant_id` field in `AgentEntry` | `core/convert.rs` knows nothing about tenants — the protocol mapping is tenant-agnostic |
+| Persistent task storage (Postgres instead of files) | `core/src/task_store_pg.rs` | `core/lib.rs`: `pub mod task_store_pg`; the calling code (`transport_http.rs`) picks the implementation via enum/trait | `TaskStore` (file-based) stays as is — not removed, it becomes one of the implementations |
 
-### Уже реализованные модули (примеры прошедших расширений)
+### Already implemented modules (examples of past extensions)
 
-| Модуль | Файл | Что добавил | Как встроен |
+| Module | File | What it added | How it's wired in |
 |---|---|---|---|
-| Durable event buffer | `gatewayd/src/event_log.rs` | Персистентный буфер событий стрима с монотонным `seq` по задаче, `events_after(after_seq)` | Фоновый writer-таск через mpsc; `Arc` уходит в `HttpState` → `stream_to_sse`/`dispatch_a2a_method` |
-| Journal + health | `gatewayd/src/journal.rs`, `gatewayd/src/health.rs` | Durable журнал (алерты, обрывы, апрувы) + периодическая сводка размеров БД | Один фоновый writer, самоочистка по retention; просмотр — CLI-модулем |
-| Approvals | `gatewayd/src/approvals.rs` | SQLite-хранилище статусов (pending/approved/rejected), фингерпринт агента | Фильтр в `build_registry(raw, allowed)`; неодобренные исключаются и пишутся в журнал (category `approval`) |
-| Rust CLI | `gatewayd/src/cli.rs` | `--journal`, `--approvals`, `--approve/--reject`, `--setup` — без внешнего sqlite3 | Отдельные ветки в `main.rs` до старта серверов; не трогает транспорт |
+| Durable event buffer | `gatewayd/src/event_log.rs` | Persistent event log of the stream with a monotonic per-task `seq`, `events_after(after_seq)` | Background writer task over mpsc; the `Arc` goes into `HttpState` → `stream_to_sse`/`dispatch_a2a_method` |
+| Journal + health | `gatewayd/src/journal.rs`, `gatewayd/src/health.rs` | Durable journal (alerts, disconnects, approvals) + periodic DB size summary | One background writer, self-cleanup per retention; viewing via the CLI module |
+| Approvals | `gatewayd/src/approvals.rs` | SQLite store of statuses (pending/approved/rejected), agent fingerprint | Filter in `build_registry(raw, allowed)`; non-approved agents are excluded and written to the journal (category `approval`) |
+| Rust CLI | `gatewayd/src/cli.rs` | `--journal`, `--approvals`, `--approve/--reject`, `--setup` — no external sqlite3 | Separate branches in `main.rs` before the servers start; doesn't touch transport |
 
-## Как добавить новый транспорт (пошагово, на примере WS)
+## How to add a new transport (step by step, using WS as an example)
 
-1. Создать `gatewayd/src/transport_ws.rs`.
-2. Транспорт **не должен** сам разбирать JSON-RPC методы заново — если
-   протокол клиента совпадает с уже существующей веткой (например, ACP
-   поверх WS вместо TCP), переиспользовать `dispatch_acp_method`-подобную
-   функцию, вынеся её в `core/` или отдельный `gatewayd/src/dispatch_common.rs`,
-   если она нужна нескольким транспортам одновременно.
-3. В `main.rs` добавить третий `tokio::spawn` рядом с `tcp_server`/`http_server`,
-   объединить через тот же `tokio::select!` (fail-fast: падение любого
-   транспорта останавливает весь gatewayd).
-4. Конфиг: добавить `ws_listen` в `RawConfig`, аналогично `http_listen`.
+1. Create `gatewayd/src/transport_ws.rs`.
+2. The transport **must not** re-parse JSON-RPC methods itself — if the
+   client protocol matches an existing branch (for example, ACP
+   over WS instead of TCP), reuse a `dispatch_acp_method`-like
+   function, moving it into `core/` or a separate `gatewayd/src/dispatch_common.rs`
+   if several transports need it at once.
+3. In `main.rs` add a third `tokio::spawn` next to `tcp_server`/`http_server`,
+   join them through the same `tokio::select!` (fail-fast: any transport
+   going down stops the whole gatewayd).
+4. Config: add `ws_listen` to `RawConfig`, analogous to `http_listen`.
 
-## Как добавить новый протокол трансформации (не ACP/A2A)
+## How to add a new transformation protocol (not ACP/A2A)
 
-Если появится третий протокол (гипотетически — MCP-как-агент-протокол),
-архитектура уже предполагает этот путь:
+If a third protocol appears (hypothetically — MCP-as-agent-protocol),
+the architecture already anticipates this path:
 
-1. `protocol/src/<new_protocol>.rs` — типы нового протокола.
-2. `core/src/agent.rs` — новый trait `NewProtocolAgent`, по аналогии с
+1. `protocol/src/<new_protocol>.rs` — types of the new protocol.
+2. `core/src/agent.rs` — a new trait `NewProtocolAgent`, mirroring
    `AcpAgent`/`A2aAgent`.
-3. `core/src/convert.rs` — два новых адаптера: `AcpAsNewProtocol`,
-   `NewProtocolAsAcp` (и аналогично для A2A, если нужна кросс-трансляция
-   между всеми тремя — тогда до 6 адаптеров, но каждый — независимый
-   файл/структура, не единый God-конвертер).
-4. Существующие `AcpAsA2a`/`A2aAsAcp` не меняются — они ничего не знают
-   о существовании нового протокола.
+3. `core/src/convert.rs` — two new adapters: `AcpAsNewProtocol`,
+   `NewProtocolAsAcp` (and similarly for A2A if cross-translation between
+   all three is needed — up to 6 adapters then, but each one is an
+   independent file/struct, not a single God-converter).
+4. The existing `AcpAsA2a`/`A2aAsAcp` don't change — they know nothing
+   about the new protocol's existence.
 
-## Как добавить durable-хранилище (по образцу journal/approvals/event_log)
+## How to add a durable store (following the journal/approvals/event_log pattern)
 
-1. Создать `gatewayd/src/<name>.rs`: `struct <Name>Store { ... }` с `open(path)`,
-   операциями записи и чтения. Таблица в SQLite (WAL) — через rusqlite, как в
-   существующих модулях. `pub struct ...` + `#[derive(Clone, Debug)]`.
-2. В `gatewayd/src/lib.rs` — `pub mod <name>;`.
-3. Секция конфига: поле в `RawConfig` (config.rs) с `#[serde(default)]`; секция
-   в `--setup` (setup.rs) и в `render()`.
-4. Встраивание: если это фоновая запись — `tokio::spawn` writer-таск с mpsc в
-   `main.rs`; если это фильтр на старте — отдельная ветка в `main()`. Не смешивать
-   с транспортом: хранилище — отдельный модуль, транспорт получает `Arc<Store>`.
-5. Тесты в том же файле: tempdir-хранилище, цикл записи/чтения, retention/cleanup.
+1. Create `gatewayd/src/<name>.rs`: `struct <Name>Store { ... }` with `open(path)`,
+   write and read operations. The SQLite (WAL) table — via rusqlite, as in the
+   existing modules. `pub struct ...` + `#[derive(Clone, Debug)]`.
+2. In `gatewayd/src/lib.rs` — `pub mod <name>;`.
+3. Config section: a field in `RawConfig` (config.rs) with `#[serde(default)]`; a section
+   in `--setup` (setup.rs) and in `render()`.
+4. Wiring: if it's background writing — `tokio::spawn` a writer task with mpsc in
+   `main.rs`; if it's a start-up filter — a separate branch in `main()`. Don't mix it
+   with transport: the store is a separate module, the transport gets an `Arc<Store>`.
+5. Tests in the same file: tempdir store, a write/read cycle, retention/cleanup.
 
-## Как добавить CLI-команду (по образцу cli.rs)
+## How to add a CLI command (following the cli.rs pattern)
 
-1. В `main.rs` — новая ветка разбора аргументов: `--<cmd>` → `cli::run_<cmd>(...)`.
-   CLI-ветки отрабатывают **до** старта TCP/HTTP-серверов.
-2. В `cli.rs` — `pub fn run_<cmd>(args: &[String]) -> anyhow::Result<()>`.
-   Аргументы парсить вручную (`--db PATH`, позиционные), без clap — проект не
-   зависит от clap.
-3. Вывод — ASCII-таблица с `unix_to_utc` (время в UTC) и truncate длинных полей;
-   только английский текст (интерфейс шлюза — English).
-4. Юнит-тесты на парсинг/форматтеры в том же файле; e2e — ручной прогон бинаря
-   против реального SQLite из `/tmp/gateway/`.
+1. In `main.rs` — a new argument-parsing branch: `--<cmd>` → `cli::run_<cmd>(...)`.
+   CLI branches run **before** the TCP/HTTP servers start.
+2. In `cli.rs` — `pub fn run_<cmd>(args: &[String]) -> anyhow::Result<()>`.
+   Parse arguments manually (`--db PATH`, positional), without clap — the project
+   doesn't depend on clap.
+3. Output — an ASCII table with `unix_to_utc` (time in UTC) and truncated long fields;
+   English text only (the gateway interface is in English).
+4. Unit tests for parsing/formatters in the same file; e2e — a manual binary run
+   against a real SQLite from `/tmp/gateway/`.
 
-## Антипаттерны — чего НЕ делать при расширении
+## Anti-patterns — what NOT to do when extending
 
-- **Не добавлять параметры в существующие конструкторы без крайней
-  необходимости.** Пример из практики этого проекта: добавление
-  `lease_timeout` потребовало правки 4 файлов (`convert.rs`, оба
-  `transport_*.rs`, `main.rs`) — это допустимо, потому что параметр
-  действительно должен быть настраиваемым, но каждое такое изменение
-  стоит вызывающего кода. Прежде чем добавлять параметр, проверить,
-  нельзя ли вместо этого создать builder или config-struct.
-- **Не смешивать транспортный код с бизнес-логикой.** Если в
-  `transport_tcp.rs` появляется код, который трансформирует данные
-  протокола (а не просто парсит JSON-RPC конверт), — это сигнал, что
-  логика должна переехать в `core/convert.rs`.
-- **Не создавать общий "Utils" или "Helpers" модуль.** Каждый файл в
-  `core/` уже называется по своей ответственности (`lease.rs`,
-  `task_store.rs`) — если новая функциональность не вписывается ни в
-  одно существующее имя, это повод для нового файла с точным именем,
-  не для добавления в svalka-модуль.
+- **Don't add parameters to existing constructors without a strong
+  need.** A real example from this project: adding
+  `lease_timeout` required touching 4 files (`convert.rs`, both
+  `transport_*.rs`, `main.rs`) — that is acceptable because the parameter
+  genuinely must be configurable, but every such change costs caller code.
+  Before adding a parameter, check whether a builder or config-struct
+  could be created instead.
+- **Don't mix transport code with business logic.** If
+  `transport_tcp.rs` gains code that transforms protocol data
+  (rather than just parsing the JSON-RPC envelope), — that is a signal that
+  the logic should move into `core/convert.rs`.
+- **Don't create a shared "Utils" or "Helpers" module.** Every file in
+  `core/` is already named after its responsibility (`lease.rs`,
+  `task_store.rs`) — if new functionality doesn't fit any existing name,
+  that is a reason for a new file with a precise name,
+  not for adding to a catch-all module.

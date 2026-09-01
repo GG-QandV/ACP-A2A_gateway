@@ -1,69 +1,71 @@
-# Р-23. Финальное code review Фазы 2.0 — реальная реализация vs Р-20/21, и найденный `biased`-риск
+# P-23. Final code review of Phase 2.0 — real implementation vs P-20/21, and the found `biased` risk
 
-Добавляется в `docs/decisions.md` после Р-22. Пишется по факту прочитанного кода (коммиты `af9c9d9`,
-`1ee5574`, `36745ac`, `1e2de5d`, `564ea1e`), не по прогнозу.
+> **Language:** English · [Русская версия](decisions-p23-select-biased-final-review-ru.md)
+
+Added into `docs/decisions.md` after P-22. Written on the fact of code actually read (commits `af9c9d9`,
+`1ee5574`, `36745ac`, `1e2de5d`, `564ea1e`), not on a forecast.
 
 ---
 
-### Р-23. `prompt_streaming()` реализован через `tokio::select!`, не через решение (c) из Р-20
+### P-23. `prompt_streaming()` implemented via `tokio::select!`, not via decision (c) from P-20
 
-Р-20 (черновой патч `convert-streaming-mapping.rs`) предполагал решение (c): канал всегда возвращается
-как `Reply::Streaming`, terminal state по умолчанию `Completed`/`Failed` без явного `StopReason` в
-потоковом пути. Реализация (коммит `36745ac`) выбрала более точный путь — `tokio::select!` между
-`resp_rx` (финальный `PromptResponse`) и `rx.recv()` (первый чанк `SessionUpdate`) в `prompt_streaming()`:
+P-20 (draft patch `convert-streaming-mapping.rs`) assumed decision (c): the channel is always returned
+as `Reply::Streaming`, terminal state defaults to `Completed`/`Failed` without an explicit `StopReason` in
+the streaming path. The implementation (commit `36745ac`) chose the more precise path — `tokio::select!` between
+`resp_rx` (final `PromptResponse`) and `rx.recv()` (first `SessionUpdate` chunk) in `prompt_streaming()`:
 
-- Если первым пришёл финальный ответ (агент не стримил вовсе — 0 чанков) → `Reply::Complete`,
-  сохраняя старое поведение для всех вызывающих кодов, которые не ожидают потока.
-- Если первым пришёл чанк → `Reply::Streaming`, фоновый таск пересылает остаток чанков и в конце
-  — терминальный элемент, собранный из настоящего `PromptResponse` (не синтетический, как
-  предполагалось в решении (c)).
+- If the final response arrived first (the agent did not stream at all — 0 chunks) → `Reply::Complete`,
+  preserving the old behavior for all calling code that does not expect a stream.
+- If a chunk arrived first → `Reply::Streaming`, a background task forwards the remaining chunks and at the end
+  emits a terminal element built from the real `PromptResponse` (not synthetic, as
+  decision (c) assumed).
 
-**Это лучше, чем предполагалось**: реальный `StopReason` доступен в терминальном элементе потока,
-а не теряется. Р-20/21 остаются в силе в части остального (только `AgentMessageChunk` парсится,
-`UsageUpdate` → DEBUG) — меняется только эта деталь.
+**This is better than assumed**: the real `StopReason` is available in the terminal element of the stream,
+and is not lost. P-20/21 remain in force for everything else (only `AgentMessageChunk` is parsed,
+`UsageUpdate` → DEBUG) — only this detail changes.
 
-**Следствие, обязательное к устранению отдельным тикетом**: `select!` без `biased` даёт
-недетерминированный выбор ветки при одновременной готовности обеих (агент прислал единственный чанк
-и почти сразу завершился). Оба исхода семантически валидны (контент не теряется), но создаёт
-flaky-риск для тестов T1/T3/T9 в граничных случаях. Не блокирует релиз Фазы 2.0 — зафиксировано как
-отдельный follow-up:
+**Consequence, mandatory to eliminate as a separate ticket**: `select!` without `biased` gives a
+nondeterministic branch choice when both are ready simultaneously (the agent sent its single chunk
+and completed almost immediately). Both outcomes are semantically valid (content is not lost), but it creates
+a flaky risk for tests T1/T3/T9 in edge cases. Does not block the Phase 2.0 release — recorded as a
+separate follow-up:
 
 ```markdown
-### 2026-08-XX: tokio::select! в prompt_streaming() без biased — недетерминированный путь
-- **Что**: при одновременной готовности resp_rx и первого чанка выбор ветки случайный.
-- **Почему**: оставлено на follow-up — не блокирует корректность (оба исхода валидны), но создаёт
-  риск нестабильных тестов на границе "агент прислал 1 чанк и тут же завершился".
-- **Impact**: low — эстетический/тестовый риск, не функциональный баг.
-- **Fix**: добавить `biased;` с приоритетом chunk-ветки первой в core/src/stdio_agent.rs.
+### 2026-08-XX: tokio::select! in prompt_streaming() without biased — nondeterministic path
+- **What**: when resp_rx and the first chunk are ready simultaneously, the branch choice is random.
+- **Why**: left for follow-up — does not block correctness (both outcomes are valid), but creates
+  a risk of flaky tests at the boundary "agent sent 1 chunk and immediately completed".
+- **Impact**: low — aesthetic/test risk, not a functional bug.
+- **Fix**: add `biased;` with the chunk branch prioritized first in core/src/stdio_agent.rs.
 ```
 
-### Р-24. `StreamCapacityExhausted` не различает "агент не найден" и "лимит исчерпан"
+### P-24. `StreamCapacityExhausted` does not distinguish "agent not found" from "limit exhausted"
 
-При финальном review (`gatewayd/src/registry.rs`) найдено: `try_acquire_stream()` для неизвестного
-`agent_id` возвращает тот же тип ошибки `StreamCapacityExhausted { active_streams: 0, limit: 0 }`,
-что и для реально исчерпанного лимита. Транспортный слой должен вызывать `registry.lookup()` ДО
-`try_acquire_stream()`, чтобы вернуть клиенту правильный HTTP-статус (404 vs 503) — по аналогии с
-уже существующим разделением `AdapterError::UnknownAgent`/`Unavailable` в `transport_http.rs`.
+During the final review (`gatewayd/src/registry.rs`) found: `try_acquire_stream()` for an unknown
+`agent_id` returns the same error type `StreamCapacityExhausted { active_streams: 0, limit: 0 }`
+as for a genuinely exhausted limit. The transport layer must call `registry.lookup()` BEFORE
+`try_acquire_stream()` to return the correct HTTP status to the client (404 vs 503) — by analogy with
+the already existing separation of `AdapterError::UnknownAgent`/`Unavailable` in `transport_http.rs`.
 
-Не найдено регрессии (тест `unknown_agent_stream_acquisition_fails` проходит, потому что проверяет
-только факт ошибки, не её классификацию) — но это архитектурная шероховатость, которую стоит
-проверить точечно: убедиться, что реальный порядок вызовов в `rpc_handler`/`handle_http_target`
-(коммит `36745ac`) — именно `lookup` → `try_acquire_stream`, не наоборот.
+No regression found (test `unknown_agent_stream_acquisition_fails` passes because it checks
+only the fact of an error, not its classification) — but this is an architectural roughness worth
+checking pinpoint: make sure the actual call order in `rpc_handler`/`handle_http_target`
+(commit `36745ac`) is exactly `lookup` → `try_acquire_stream`, not the other way around.
 
-**Не открывается как TECH_DEBT-пункт** — только как заметка в decisions.md, потому что требует
-всего один взгляд на порядок двух строк кода, не отдельной работы.
+**Not opened as a TECH_DEBT item** — only as a note in decisions.md, because it takes
+a single glance at the order of two lines of code, not separate work.
 
 ---
 
-## Итоговый статус Фазы 2.0 (закрытие ревью)
+## Final status of Phase 2.0 (review closure)
 
-Все пять коммитов (`af9c9d9`, `1ee5574`, `36745ac`, `1e2de5d`, `564ea1e`) прочитаны построчно по
-трём ключевым файлам (`registry.rs`, `main.rs`, `stdio_agent.rs`). Найдено:
+All five commits (`af9c9d9`, `1ee5574`, `36745ac`, `1e2de5d`, `564ea1e`) were read line by line across
+the three key files (`registry.rs`, `main.rs`, `stdio_agent.rs`). Found:
 
-- 1 follow-up низкого приоритета (Р-23, `biased` в `select!`) — не блокирует релиз.
-- 1 заметка для точечной проверки (Р-24, порядок `lookup`/`try_acquire_stream`) — не отдельная задача.
-- 0 блокирующих дефектов.
+- 1 low-priority follow-up (P-23, `biased` in `select!`) — does not block the release.
+- 1 note for pinpoint verification (P-24, `lookup`/`try_acquire_stream` order) — not a separate task.
+- 0 blocking defects.
 
-**Фаза 2.0 (базовый стриминг, направления 3 и 4, конфигурируемые лимиты, логирование с ротацией)
-считается закрытой.** T4 (TCP-стрим для A2A→ACP направления через `HttpA2aAgent`) и
-`tasks/resubscribe` корректно остаются в TECH_DEBT как объём Фазы 2.1, без изменений от этого review.
+**Phase 2.0 (basic streaming, directions 3 and 4, configurable limits, logging with rotation)
+is considered closed.** T4 (TCP stream for the A2A→ACP direction via `HttpA2aAgent`) and
+`tasks/resubscribe` correctly remain in TECH_DEBT as the scope of Phase 2.1, unchanged by this review.
