@@ -1,20 +1,20 @@
 //! gatewayd/tests/streaming_load.rs
 //!
-//! T10 (Gate 4 роадмапа стриминга): нагрузочный прогон — 5 мок-агентов,
-//! 20 параллельных стримов на агента (100 одновременных SSE-стримов через
-//! один роутер). Критерии Gate 4:
-//!   - каждый запрос завершается 200 OK (не 503 StreamCapacityExhausted);
-//!   - каждый стрим доходит до terminal (final: true) — permit на агента
-//!     корректно возвращаются, иначе 20-й стрим упал бы в 503.
+//! T10 (Gate 4 of the streaming roadmap): load run — 5 mock agents,
+//! 20 concurrent streams per agent (100 simultaneous SSE streams through
+//! one router). Gate 4 criteria:
+//!   - every request completes with 200 OK (not 503 StreamCapacityExhausted);
+//!   - every stream reaches terminal (final: true) — permits on an agent
+//!     are returned correctly, otherwise the 20th stream would fail with 503.
 //!
-//! Полный 10-минутный прогон на устойчивость памяти — ручной (см.
-//! docs/streaming-roadmap-checklist.md, Gate 4); здесь автоматическая
-//! быстрая версия того же сценария.
+//! The full 10-minute memory-stability run is a manual run (see
+//! docs/streaming-roadmap-checklist.md, Gate 4); here is the automated
+//! fast version of the same scenario.
 //!
-//! Mock-агент шлёт 3 чанка agent_message_chunk (задержка 1ms), затем
-//! финальный PromptResponse. Один процесс mock-агента обрабатывает запросы
-//! последовательно, поэтому параллельность здесь — нагрузка на шлюз:
-//! сессия открывается/закрывается для каждого из 100 стримов.
+//! The mock agent sends 3 agent_message_chunk chunks (1ms delay), then
+//! a final PromptResponse. One mock-agent process handles requests
+//! sequentially, so the concurrency here is load on the gateway:
+//! a session opens/closes for each of the 100 streams.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -87,7 +87,7 @@ fn stream_request(agent_id: &str) -> Request<Body> {
         .unwrap()
 }
 
-/// Gate 4 / T10: 100 параллельных стримов, все 200 + final:true.
+/// Gate 4 / T10: 100 concurrent streams, all 200 + final:true.
 #[tokio::test]
 async fn parallel_load_20_streams_per_agent_all_succeed() {
     let app = build_router();

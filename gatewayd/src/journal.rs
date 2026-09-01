@@ -1,14 +1,14 @@
 //! gatewayd/src/journal.rs
 //!
-//! Durable-журнал событий для пользователя (Фаза 5): health-алерты,
-//! обрывы стримов, апрувы. Пишется одним фоновым writer-таском, который
-//! владеет `rusqlite::Connection` (sync SQLite в async-мире) — та же
-//! модель, что в `event_log.rs`: все операции идут через единый
-//! mpsc-канал и исполняются последовательно, гонок нет.
+//! Durable event journal for the user (Phase 5): health alerts,
+//! stream drops, approvals. Written by a single background writer task that
+//! owns the `rusqlite::Connection` (sync SQLite in the async world) — the same
+//! model as in `event_log.rs`: all operations go through one
+//! mpsc channel and are executed sequentially, so there are no races.
 //!
-//! Очистка: по `retention_days` (удаляются события старше TTL) и по
-//! `max_size_mb` (если размер БД перерос лимит — удаляются старейшие).
-//! 0 = соответствующий лимит отключён.
+//! Cleanup: by `retention_days` (events older than TTL are removed) and by
+//! `max_size_mb` (if the DB size outgrew the limit — the oldest ones are removed).
+//! 0 = the corresponding limit is disabled.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -16,7 +16,7 @@ use std::sync::Arc;
 use rusqlite::Connection;
 use tokio::sync::{mpsc, oneshot};
 
-/// Уровень события журнала — зеркалит уровни tracing.
+/// Journal event level — mirrors the tracing levels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Level {
     Info,
@@ -38,7 +38,7 @@ pub struct Journal {
     tx: mpsc::Sender<Cmd>,
 }
 
-/// Запись журнала. `seq` — монотонный глобальный номер (по журналу в целом).
+/// A journal record. `seq` is a monotonic global number (across the whole journal).
 pub struct JournalRecord {
     pub seq: u64,
     pub ts: String,
@@ -63,8 +63,8 @@ enum Cmd {
 const CHANNEL_CAPACITY: usize = 1024;
 
 impl Journal {
-    /// Открывает БД и поднимает writer-таск. `max_size_mb == 0` и
-    /// `retention_days == 0` — соответствующие лимиты отключены.
+    /// Opens the DB and spins up the writer task. `max_size_mb == 0` and
+    /// `retention_days == 0` — the corresponding limits are disabled.
     pub fn spawn(
         path: PathBuf,
         max_size_mb: u64,
@@ -100,14 +100,14 @@ impl Journal {
             max_size_mb,
             retention_days,
         };
-        // При старте сразу чистим (могло переполниться за время простоя).
+        // On startup, clean up right away (it may have overflowed during downtime).
         writer.cleanup();
         tokio::spawn(writer.run());
         tracing::info!(path = %path.display(), max_size_mb, retention_days, "journal writer запущен");
         Ok(Arc::new(Self { tx }))
     }
 
-    /// Дописывает событие и возвращает его монотонный seq.
+    /// Appends an event and returns its monotonic seq.
     pub async fn append(
         &self,
         level: Level,
@@ -127,7 +127,7 @@ impl Journal {
         rx.await.map_err(|_| anyhow::anyhow!("journal: writer не ответил"))?
     }
 
-    /// Последние N записей, по убыванию seq (для CLI-просмотра).
+    /// The last N records, in descending seq order (for CLI viewing).
     pub async fn recent(&self, limit: u64) -> anyhow::Result<Vec<JournalRecord>> {
         let (reply, rx) = oneshot::channel();
         self.tx
@@ -141,23 +141,23 @@ impl Journal {
     }
 }
 
-/// Фильтры запроса журнала для CLI-просмотра. Все опциональны.
+/// Journal query filters for CLI viewing. All optional.
 #[derive(Debug, Default, Clone)]
 pub struct JournalFilter {
     pub limit: Option<u64>,
     pub level: Option<String>,
     pub category: Option<String>,
-    /// Только записи с ts >= (now - since_secs).
+    /// Only records with ts >= (now - since_secs).
     pub since_secs: Option<u64>,
 }
 
-/// Read-only запрос журнала напрямую из файла БД (не через writer-таск).
-/// Используется CLI-просмотром (`gatewayd --journal`), когда основной
-/// gateway может быть и остановлен. Открывает отдельное соединение.
+/// Read-only journal query straight from the DB file (not through the writer task).
+/// Used by the CLI viewer (`gatewayd --journal`), when the main
+/// gateway may even be stopped. Opens a separate connection.
 pub fn query_recent(path: &Path, filter: &JournalFilter) -> anyhow::Result<Vec<JournalRecord>> {
     let conn = Connection::open(path)
         .map_err(|e| anyhow::anyhow!("journal: открыть {}: {e}", path.display()))?;
-    // Читаем только; никогда не пишем в БД работающего gateway.
+    // Read only; never write into the DB of a running gateway.
     conn.pragma_update(None, "query_only", true)?;
 
     let mut sql = String::from(
@@ -207,7 +207,7 @@ struct Writer {
 
 impl Writer {
     async fn run(mut self) {
-        // Connection не Send — остаётся в этом таске навсегда.
+        // Connection is not Send — it stays in this task forever.
         while let Some(cmd) = self.rx.recv().await {
             match cmd {
                 Cmd::Append {
@@ -238,8 +238,8 @@ impl Writer {
             )
             .map_err(|e| anyhow::anyhow!("journal: insert: {e}"))?;
 
-        // Каждый аппенд после вставки — быстрая проверка лимитов
-        // (2 лёгких запроса; аппенды в журнал редкие: алерты раз в минуты).
+        // Every append after the insert — a quick limits check
+        // (2 lightweight queries; journal appends are rare: alerts once every minutes).
         self.cleanup();
         self.last_seq()
     }
@@ -281,9 +281,9 @@ impl Writer {
             .map_err(|e| anyhow::anyhow!("journal: read: {e}"))
     }
 
-    /// TTL-очистка (retention_days) затем, при переполнении размера —
-    /// удаление старейших. WAL-файлы учитываются: page_count включает
-    /// журнал активных записей.
+    /// TTL cleanup (retention_days) first, then, on size overflow —
+    /// removal of the oldest records. WAL files are counted too: page_count
+    /// includes the write-ahead log.
     fn cleanup(&mut self) {
         if self.retention_days > 0 {
             let cutoff = now_unix() - self.retention_days * 24 * 60 * 60;
@@ -461,8 +461,8 @@ mod tests {
         let db_path = dir.path().join("j.db");
         let journal = Journal::spawn(db_path.clone(), 0, 1).unwrap();
 
-        // Вставляем запись «старше TTL» (2 дня назад) напрямую вторым
-        // соединением — writer один, но WAL позволяет параллельное чтение.
+        // Insert a record "older than TTL" (2 days ago) directly via a second
+        // connection — there is a single writer, but WAL allows parallel reads.
         let old_ts = now_unix() - 2 * 24 * 60 * 60;
         {
             let conn = rusqlite::Connection::open(&db_path).unwrap();
@@ -474,7 +474,7 @@ mod tests {
             .unwrap();
         }
 
-        // Свежая запись — при ней cleanup удаляет старые (retention=1 день).
+        // A fresh record — while handling it, cleanup removes the old ones (retention=1 day).
         journal
             .append(Level::Info, "health", "fresh")
             .await
@@ -488,7 +488,7 @@ mod tests {
     #[tokio::test]
     async fn size_cleanup_removes_oldest_when_over_limit() {
         let dir = tempdir().unwrap();
-        // max_size_mb=1 — набиваем крупными сообщениями до превышения.
+        // max_size_mb=1 — we stuff it with large messages until the limit is exceeded.
         let journal = Journal::spawn(dir.path().join("j.db"), 1, 0).unwrap();
         let big = "x".repeat(8 * 1024);
         for i in 0..300 {

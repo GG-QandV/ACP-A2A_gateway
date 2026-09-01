@@ -1,8 +1,8 @@
-# config.example.yaml — полный пример. Шлюз поднимает два транспорта:
-# TCP (ACP-клиенты, направления 1 и 3) и HTTP (A2A-клиенты, направления 2 и 4).
+# config.example.yaml — full example. The gateway brings up two transports:
+# TCP (ACP clients, directions 1 and 3) and HTTP (A2A clients, directions 2 and 4).
 
-listen: "0.0.0.0:8347"        # TCP: ACP-клиент -> {ACP-агент | A2A-агент}
-http_listen: "0.0.0.0:8348"   # HTTP: A2A-клиент -> {ACP-агент | A2A-агент}
+listen: "0.0.0.0:8347"        # TCP: ACP client -> {ACP agent | A2A agent}
+http_listen: "0.0.0.0:8348"   # HTTP: A2A client -> {ACP agent | A2A agent}
 
 tokens:
   - "t-dev-local-001"
@@ -26,22 +26,22 @@ agents:
     url: "https://ops.internal/a2a"
     push_token: "{env:OPS_AGENT_PUSH_TOKEN}"
 
-# Внешний адрес шлюза — попадает в AgentCard.url (agent.json).
-# Должен быть тем адресом, по которому шлюз виден клиентам снаружи,
-# а не адресом привязки: за reverse-proxy это домен прокси.
+# Gateway external address — goes into AgentCard.url (agent.json).
+# Must be the address where the gateway is visible to clients from outside,
+# not the bind address: behind a reverse-proxy this is the proxy's domain.
 public_url: "https://gateway.example.com"
 
-# Часть 4 роадмапа стриминга: логирование и ротация.
-#   level:  info | debug | trace | warn | error | off  (off = аварийный клапан,
-#           полностью отключает фильтр; диагностика по логам будет недоступна)
+# Streaming roadmap Part 4: logging and rotation.
+#   level:  info | debug | trace | warn | error | off  (off = emergency valve,
+#           disables the filter entirely; log-based diagnostics become unavailable)
 #   output: stdout | file | both
-#   debug_ttl_minutes: время жизни временно расширенного уровня (debug|trace)
-#           через POST /debug/level — по истечении автокат к "info".
-#           Проверка токена: тот же Authorization: Bearer <token>, что у RPC.
-#   file:   пути и ротация (актуально для output: file|both).
-#           max_total_size_mb — потолок каталога; монитор раз в час реально
-#           сжимает gzip и удаляет старейшие файлы при превышении.
-#           compress_rotated: true — сжимать ротированные файлы при чистке.
+#   debug_ttl_minutes: lifetime of a temporarily raised level (debug|trace)
+#           via POST /debug/level — auto-returns to "info" on expiry.
+#           Token check: same Authorization: Bearer <token> as the RPC.
+#   file:   paths and rotation (relevant for output: file|both).
+#           max_total_size_mb — directory ceiling; the monitor hourly actually
+#           gzip-compresses and deletes the oldest files when it is exceeded.
+#           compress_rotated: true — compress rotated files during cleanup.
 logging:
   level: "info"
   output: "stdout"
@@ -54,61 +54,61 @@ logging:
     compress_rotated: true
 
 task_store_dir: "/tmp/gateway/tasks"
-task_retention_days: 7        # завершённые задачи убираются фоном раз в час
+task_retention_days: 7        # completed tasks are reaped in the background hourly
 turn_lease_timeout_secs: 30
-agent_call_timeout_secs: 120   # ДОБАВЛЕНО (аудит P2-11): было захардкожено 60s в stdio_agent.rs
+agent_call_timeout_secs: 120   # ADDED (audit P2-11): was hardcoded to 60s in stdio_agent.rs
 
-# Использование (после запуска gatewayd config.yaml):
+# Usage (after starting gatewayd config.yaml):
 #
-# 1) ACP-клиент -> claurst-main (ACP, passthrough):
-#    tcp connect 0.0.0.0:8347, первая строка:
+# 1) ACP client -> claurst-main (ACP, passthrough):
+#    tcp connect 0.0.0.0:8347, first line:
 #    {"token":"t-dev-local-001","agent_id":"claurst-main"}
 #
-# 2) ACP-клиент -> ops-agent (A2A, через конвертер):
-#    tcp connect 0.0.0.0:8347, первая строка:
+# 2) ACP client -> ops-agent (A2A, via converter):
+#    tcp connect 0.0.0.0:8347, first line:
 #    {"token":"t-dev-local-001","agent_id":"ops-agent"}
-#    далее обычный ACP JSON-RPC (initialize/session/new/session/prompt).
+#    then regular ACP JSON-RPC (initialize/session/new/session/prompt).
 #
-# 3) A2A-клиент -> claurst-main (ACP, через конвертер):
+# 3) A2A client -> claurst-main (ACP, via converter):
 #    GET  http://0.0.0.0:8348/agents/claurst-main/.well-known/agent.json
 #    POST http://0.0.0.0:8348/agents/claurst-main/rpc
 #    Authorization: Bearer t-dev-local-001
 #    {"jsonrpc":"2.0","id":1,"method":"message/send","params":{"message":{...}}}
 #
-# 4) A2A-клиент -> ops-agent (A2A, reverse-proxy без конвертера):
+# 4) A2A client -> ops-agent (A2A, reverse-proxy without converter):
 #    POST http://0.0.0.0:8348/a2a-proxy/ops-agent/rpc
 #    Authorization: Bearer t-dev-local-001
-#    Тело и query-строка уходят upstream как есть (включая SSE-стрим).
-#    Для stdio-агента через /a2a-proxy вернётся 400.
+#    Body and query string go upstream as-is (including the SSE stream).
+#    For a stdio agent via /a2a-proxy this returns 400.
 #
-# Разговоры (contextId):
-#   Ответ на message/send содержит contextId. Переслав его в следующем
-#   запросе, клиент продолжает тот же разговор; без него начинается новый.
-#   Разговор закреплён за токеном: чужой contextId отклоняется.
-#   Простаивающие разговоры выселяются через 24 часа.
+# Conversations (contextId):
+#   The message/send response contains contextId. Resending it in the next
+#   request, the client continues the same conversation; without it a new one starts.
+#   A conversation is bound to a token: another token's contextId is rejected.
+#   Idle conversations are evicted after 24 hours.
 #
-# Перезапуск агента:
-#   Если процесс агента умирает, шлюз поднимает новый (не чаще раза в 5
-#   секунд). Разговоры, начатые до перезапуска, теряются: обращение к
-#   такому contextId возвращает JSON-RPC error с кодом -32010 и HTTP 409.
-#   Получив его, клиент должен начать разговор заново — повторный запрос
-#   с тем же contextId уже создаст свежую сессию.
+# Agent restart:
+#   If the agent process dies, the gateway spawns a new one (at most once per 5
+#   seconds). Conversations started before the restart are lost: accessing
+#   such a contextId returns a JSON-RPC error with code -32010 and HTTP 409.
+#   On receiving it, the client must start the conversation over — a repeat request
+#   with the same contextId will create a fresh session.
 #
-# Коды ответов при проблемах с агентом:
-#   404 / -32601  — такого agent_id нет в реестре (опечатка, повтор не поможет)
-#   400 / -32602  — agent_id настроен как http/A2A, для него нужен /a2a-proxy
-#   503 / -32020  — агент настроен, но не поднимается; запрос имеет смысл повторить
-#   409 / -32010  — контекст потерян (агент был перезапущен), начните разговор заново
+# Response codes when the agent has problems:
+#   404 / -32601  — no such agent_id in the registry (typo; retrying won't help)
+#   400 / -32602  — agent_id is configured as http/A2A, it needs /a2a-proxy
+#   503 / -32020  — agent is configured but won't come up; the request is worth retrying
+#   409 / -32010  — context lost (agent was restarted), start the conversation over
 #
-# ACP-клиенты (TCP, направление 3):
-#   session/prompt требует sessionId, заведённого через session/new —
-#   произвольный идентификатор отклоняется. Закрывайте сессии через
-#   session/cancel; незакрытые выселяются через 24 часа, потолок — 256
-#   одновременных сессий на соединение.
+# ACP clients (TCP, direction 3):
+#   session/prompt requires a sessionId created via session/new —
+#   an arbitrary identifier is rejected. Close sessions via
+#   session/cancel; unclosed ones are evicted after 24 hours, the ceiling is 256
+#   concurrent sessions per connection.
 #
 # TLS:
-#   Шлюз слушает по HTTP и не терминирует TLS сам — это сознательно.
-#   Выставлять его напрямую в недоверенную сеть нельзя: токены пойдут
-#   открытым текстом. Ставьте перед ним reverse-proxy (nginx, Caddy,
-#   Traefik) с сертификатами и, при необходимости, rate limiting —
-#   их шлюз тоже не реализует.
+#   The gateway listens over HTTP and does not terminate TLS itself — this is deliberate.
+#   It must not be exposed directly to an untrusted network: tokens would travel
+#   in cleartext. Put a reverse-proxy (nginx, Caddy,
+#   Traefik) with certificates and, if needed, rate limiting —
+#   the gateway does not implement those either.

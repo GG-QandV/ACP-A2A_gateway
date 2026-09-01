@@ -1,22 +1,22 @@
 //! core/src/reply.rs
 //!
-//! Единственный "шов" (seam) архитектуры. Все методы агентов, которые
-//! в перспективе могут стать потоковыми, возвращают Reply<T, U>, а не T
-//! напрямую. В Фазе 1 заполнен только Complete — Streaming существует
-//! как вариант enum, но ни один агент его не возвращает.
+//! The single "seam" of the architecture. All agent methods that
+//! may become streaming in the future return Reply<T, U>, not T
+//! directly. In Phase 1 only Complete is populated — Streaming exists
+//! as an enum variant, but no agent returns it.
 //!
-//! Почему это важно: когда в Фазе 2 появится реальный стриминг, меняется
-//! ТОЛЬКО тело конкретных impl AcpAgent/A2aAgent (они начинают возвращать
-//! Reply::Streaming). Сигнатуры trait'ов, диспетчер и конвертер (convert.rs)
-//! НЕ переписываются — они уже сегодня обрабатывают оба варианта match.
+//! Why this matters: when real streaming appears in Phase 2, only the
+//! bodies of specific AcpAgent/A2aAgent impls change (they start returning
+//! Reply::Streaming). Trait signatures, the dispatcher and the converter (convert.rs)
+//! are NOT rewritten — they already handle both match variants today.
 
 use tokio::sync::mpsc::UnboundedReceiver;
 
-/// T — тип финального (нестримингового) ответа.
-/// U — тип элемента потока событий (используется только в Фазе 2).
+/// T — type of the final (non-streaming) reply.
+/// U — type of an event-stream item (used only in Phase 2).
 pub enum Reply<T, U> {
-    /// Единственный вариант, который реально возвращается в Фазе 1.
+    /// The only variant actually returned in Phase 1.
     Complete(T),
-    /// Появится в Фазе 2. Место уже зарезервировано в сигнатурах.
+    /// Appears in Phase 2. The place is already reserved in the signatures.
     Streaming(UnboundedReceiver<U>),
 }

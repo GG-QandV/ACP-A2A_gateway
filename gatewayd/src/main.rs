@@ -1,7 +1,7 @@
 //! gatewayd/src/main.rs
-//! Читает config.yaml, строит Registry, поднимает TCP и HTTP параллельно.
-//! Направления 1 и 3 (ACP-клиент как входящая сторона) — TCP.
-//! Направления 2 и 4 (A2A-клиент как входящая сторона) — HTTP.
+//! Reads config.yaml, builds the Registry, brings up TCP and HTTP in parallel.
+//! Directions 1 and 3 (ACP client as incoming side) — TCP.
+//! Directions 2 and 4 (A2A client as incoming side) — HTTP.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -31,59 +31,59 @@ struct RawConfig {
     agents: HashMap<String, RawAgentEntry>,
     task_store_dir: PathBuf,
     turn_lease_timeout_secs: u64,
-    /// ДОБАВЛЕНО (аудит P2-11): таймаут одного JSON-RPC вызова к
-    /// stdio-агенту. Был захардкожен как 60s в core/src/stdio_agent.rs.
+    /// ADDED (audit P2-11): timeout of one JSON-RPC call to a
+    /// stdio agent. It was hardcoded as 60s in core/src/stdio_agent.rs.
     #[serde(default = "default_agent_call_timeout_secs")]
     agent_call_timeout_secs: u64,
-    /// ДОБАВЛЕНО (аудит P2-12): внешний адрес шлюза. Уходит в
-    /// AgentCard.url, который раньше был пустым — карточка невалидна по
-    /// A2A-спеке, а agent.json это первое, что читает внешний клиент.
+    /// ADDED (audit P2-12): external address of the gateway. Goes into
+    /// AgentCard.url, which used to be empty — the card is invalid per the
+    /// A2A spec, and agent.json is the first thing an external client reads.
     #[serde(default = "default_public_url")]
     public_url: String,
-    /// ДОБАВЛЕНО: сколько дней хранить завершённые задачи. Раньше
-    /// TaskStore::delete не вызывался ниоткуда, и файлы копились
-    /// бесконечно.
+    /// ADDED: how many days to keep completed tasks. Previously
+    /// TaskStore::delete was never called from anywhere, and files
+    /// accumulated indefinitely.
     #[serde(default = "default_task_retention_days")]
     task_retention_days: u64,
-    /// ДОБАВЛЕНО (Часть 4 роадмапа стриминга): конфигурация логирования
-    /// и ротации. Отсутствие секции = дефолт "stdout" (прежнее поведение).
+    /// ADDED (streaming roadmap Part 4): logging and rotation config.
+    /// Missing section = default "stdout" (previous behavior).
     #[serde(default)]
     logging: LoggingConfig,
-    /// ДОБАВЛЕНО (Фаза 1 буферного конфига): durable-буфер событий стрима
-    /// (источник истины для tasks/resubscribe, T4). Отсутствие секции =
-    /// выключено (прежнее поведение).
+    /// ADDED (buffer-config Phase 1): durable buffer of stream events
+    /// (source of truth for tasks/resubscribe, T4). Missing section =
+    /// disabled (previous behavior).
     #[serde(default)]
     event_log: EventLogConfig,
-    /// ДОБАВЛЕНО (Фаза 1 буферного конфига): durable-хранилище задач.
-    /// Отсутствие секции = прежнее файловое хранилище.
+    /// ADDED (buffer-config Phase 1): durable task store.
+    /// Missing section = previous file-based storage.
     #[serde(default)]
     task_store: TaskStoreConfig,
-    /// ДОБАВЛЕНО (Фаза 5): durable-журнал событий для пользователя
-    /// (health-алерты, обрывы стримов, апрувы). Отсутствие секции = выключено.
+    /// ADDED (Phase 5): durable event journal for the user
+    /// (health alerts, stream drops, approvals). Missing section = disabled.
     #[serde(default)]
     journal: JournalConfig,
-    /// ДОБАВЛЕНО (Фаза 5): health-мониторинг — периодическая проверка
-    /// размеров БД и занятости стримов. Отсутствие секции = выключено.
+    /// ADDED (Phase 5): health monitoring — periodic check
+    /// of DB sizes and stream occupancy. Missing section = disabled.
     #[serde(default)]
     health: HealthConfig,
-    /// ДОБАВЛЕНО (Фаза 7, approvals): человеческий апрув агентов через CLI.
-    /// Отсутствие секции = выключено (все агенты допускаются).
+    /// ADDED (Phase 7, approvals): human agent approval via CLI.
+    /// Missing section = disabled (all agents are allowed).
     #[serde(default)]
     approvals: ApprovalsConfig,
 }
 
-/// Часть 4 роадмапа стриминга: логирование. `level: "off"` полностью
-/// отключает фильтр (аварийный клапан) — стартовое сообщение при этом
-/// печатается в stderr напрямую, до отключения.
+/// Streaming roadmap Part 4: logging. `level: "off"` disables the filter
+/// entirely (emergency valve) — the startup message is still printed to
+/// stderr directly, before the shutdown.
 #[derive(Debug, Deserialize)]
 struct LoggingConfig {
     #[serde(default = "default_log_level")]
     level: String,
     #[serde(default = "default_log_output")]
     output: String,
-    /// ДОБАВЛЕНО (Часть 4.6): время жизни временно расширенного уровня.
-    /// POST /debug/level c level: debug|trace держит его максимум
-    /// столько минут, затем автоматический откат к "info". 0 = без отката.
+    /// ADDED (Part 4.6): lifetime of the temporarily raised level.
+    /// POST /debug/level c level: debug|trace keeps it for at most
+    /// this many minutes, then automatic rollback to "info". 0 = no rollback.
     #[serde(default = "default_debug_ttl_minutes")]
     debug_ttl_minutes: u64,
     #[serde(default)]
@@ -111,8 +111,8 @@ struct LogFileConfig {
     max_files: usize,
     #[serde(default = "default_max_total_size_mb")]
     max_total_size_mb: u64,
-    /// ДОБАВЛЕНО (Часть 4.4): сжимать ротированные файлы gzip (файл ->
-    /// файл.gz), когда монитор чистки срабатывает из-за max_total_size_mb.
+    /// ADDED (Part 4.4): compress rotated files with gzip (file ->
+    /// file.gz) when the cleanup monitor triggers due to max_total_size_mb.
     #[serde(default = "default_compress_rotated")]
     compress_rotated: bool,
 }
@@ -173,8 +173,8 @@ fn default_task_retention_days() -> u64 {
     7
 }
 
-/// Как часто прогонять уборку. Час — компромисс: диск не ждёт сутки,
-/// но и обход каталога не становится фоновой нагрузкой.
+/// How often to run the cleanup. One hour is a compromise: the disk does not
+/// wait a full day, and the directory walk does not become a background load.
 const TASK_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
 fn default_http_listen() -> String {
@@ -200,9 +200,9 @@ enum RawAgentEntry {
     },
 }
 
-/// ДОБАВЛЕНО (Часть 2 роадмапа стриминга): секция `streaming:` на агента.
-/// Дефолты — безопасный минимум (1 стрим на stdio-агента, таймауты по
-/// умолчанию), чтобы конфиг без секции не паниковал и не менял поведение.
+/// ADDED (streaming roadmap Part 2): per-agent `streaming:` section.
+/// Defaults are the safe minimum (1 stream per stdio agent, default timeouts)
+/// so a config without the section neither panics nor changes behavior.
 #[derive(Debug, Deserialize)]
 struct StreamingConfig {
     #[serde(default = "default_max_concurrent_streams")]
@@ -214,10 +214,10 @@ struct StreamingConfig {
 }
 
 impl Default for StreamingConfig {
-    /// Пустая секция / отсутствующая — безопасный минимум. Важно: per-field
-    /// `#[serde(default = "fn")]` при `#[serde(default)]` на поле НЕ
-    /// применяется (serde зовёт `StreamingConfig::default()`), поэтому
-    /// Default реализован вручную с теми же значениями.
+    /// Empty section / missing — safe minimum. Important: per-field
+    /// `#[serde(default = "fn")]` under `#[serde(default)]` on the field is NOT
+    /// applied (serde calls `StreamingConfig::default()`), so
+    /// Default is implemented manually with the same values.
     fn default() -> Self {
         Self {
             max_concurrent_streams: default_max_concurrent_streams(),
@@ -239,9 +239,9 @@ fn default_idle_chunk_timeout_secs() -> u64 {
     120
 }
 
-/// ИСПРАВЛЕНО (аудит P1-10): было unwrap_or_default() — отсутствующая
-/// переменная молча становилась пустым ключом/токеном, и шлюз стартовал
-/// с нерабочей авторизацией. Теперь это ошибка конфигурации на старте.
+/// FIXED (audit P1-10): it used to be unwrap_or_default() — a missing
+/// variable silently became an empty key/token, and the gateway started
+/// with broken auth. Now it is a configuration error at startup.
 fn resolve_env_placeholders(value: &str) -> anyhow::Result<String> {
     match value
         .strip_prefix("{env:")
@@ -258,8 +258,8 @@ fn build_registry(
     raw: &RawConfig,
     allowed: &std::collections::HashSet<String>,
 ) -> anyhow::Result<(Registry, Vec<String>)> {
-    // ДОБАВЛЕНО (аудит P1-10): пустой токен в списке = открытый вход для
-    // клиента, приславшего "". Ловим на старте, а не в проде.
+    // ADDED (audit P1-10): an empty token in the list = open door for a
+    // client sending "". Catch it at startup, not in prod.
     if raw.tokens.is_empty() || raw.tokens.iter().any(|t| t.trim().is_empty()) {
         anyhow::bail!("config.tokens: список пуст или содержит пустой токен");
     }
@@ -341,12 +341,12 @@ fn agent_fingerprint(entry: &RawAgentEntry) -> String {
     }
 }
 
-/// Обходит подкаталоги хранилища (по одному на agent_id) и убирает
-/// просроченные задачи в каждом.
+/// Walks storage subdirectories (one per agent_id) and removes
+/// expired tasks in each.
 async fn sweep_all_agents(base_dir: &PathBuf, ttl: std::time::Duration) -> anyhow::Result<usize> {
     let mut dir = match tokio::fs::read_dir(base_dir).await {
         Ok(dir) => dir,
-        // До первой задачи каталога нет — это не ошибка.
+        // Before the first task the directory does not exist — not an error.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
         Err(e) => return Err(e.into()),
     };
@@ -362,11 +362,11 @@ async fn sweep_all_agents(base_dir: &PathBuf, ttl: std::time::Duration) -> anyho
     Ok(removed)
 }
 
-/// ДОБАВЛЕНО (Фаза 1 буферного конфига): инициализация durable-БД
-/// (event_log, task_store) на старте. Создаёт каталог и файл sqlite;
-/// пустую схему наполняет Фаза 2 (EventLog). Отключённая секция — no-op.
-/// Ошибка здесь фатальна: включённый в конфиге буфер, который не смог
-/// подняться, не должен тихо молчать.
+/// ADDED (buffer-config Phase 1): initialize durable DBs
+/// (event_log, task_store) at startup. Creates the directory and the sqlite
+/// file; the empty schema is filled by Phase 2 (EventLog). A disabled section
+/// is a no-op. An error here is fatal: a buffer enabled in config that failed
+/// to come up must not stay silently quiet.
 fn init_buffer_dbs(event_log: &EventLogConfig, task_store: &TaskStoreConfig) -> anyhow::Result<()> {
     if let Some(cfg) = event_log.enabled.then_some(event_log) {
         init_sqlite_db(&cfg.storage_path, "event_log")?;
@@ -404,9 +404,9 @@ async fn main() -> anyhow::Result<()> {
         .next()
         .unwrap_or_else(|| "config.yaml".to_string());
 
-    // Фаза 6: интерактивный мастер настройки для пользователя.
-    // `gatewayd --setup [file.yaml]` генерирует весь конфиг с дефолтами;
-    // дев правит YAML напрямую.
+    // Phase 6: interactive setup wizard for the user.
+    // `gatewayd --setup [file.yaml]` generates the whole config with defaults;
+    // dev edits the YAML directly.
     if config_path == "--setup" {
         return setup::run(args.next());
     }
@@ -430,8 +430,8 @@ async fn main() -> anyhow::Result<()> {
 
     let reload_handle = tracing_subscriber_init(&raw_config.logging);
 
-    // ДОБАВЛЕНО (Фаза 1 буферного конфига): поднять durable-БД до запуска
-    // транспортов — стримы, стартовавшие сразу, должны иметь куда писать.
+    // ADDED (buffer-config Phase 1): bring up durable DBs before starting
+    // the transports — streams that start immediately must have somewhere to write.
     init_buffer_dbs(&raw_config.event_log, &raw_config.task_store)?;
 
     let tcp_listen = raw_config.listen.clone();
@@ -478,9 +478,9 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let http_registry = registry.clone();
-    // ДОБАВЛЕНО (Фаза 2/3): поднять writer-таск event_log, если секция
-    // включена в конфиге. Arc уходит в router -> HttpState -> stream_to_sse
-    // и dispatch_a2a_method (tasks/resubscribe, tasks/get-last-seq).
+    // ADDED (Phase 2/3): start the event_log writer task if the section is
+    // enabled in config. The Arc goes into the router -> HttpState -> stream_to_sse
+    // and dispatch_a2a_method (tasks/resubscribe, tasks/get-last-seq).
     let event_log = match raw_config.event_log.enabled {
         true => Some(gatewayd::event_log::EventLog::spawn(
             raw_config.event_log.storage_path.clone(),
@@ -489,8 +489,8 @@ async fn main() -> anyhow::Result<()> {
         false => None,
     };
 
-    // ДОБАВЛЕНО (Фаза 5): durable-журнал событий для пользователя.
-    // Arc уходит в health-монитор (алерты) и (позже) в relay/CLI.
+    // ADDED (Phase 5): durable event journal for the user.
+    // The Arc goes into the health monitor (alerts) and (later) into relay/CLI.
     let journal = match raw_config.journal.enabled {
         true => Some(Journal::spawn(
             raw_config.journal.storage_path.clone(),
@@ -512,8 +512,8 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // ДОБАВЛЕНО (Фаза 5): health-мониторинг. Цели проверки — только
-    // включённые durable-БД (event_log, task_store, journal).
+    // ADDED (Phase 5): health monitoring. Check targets are only the
+    // enabled durable DBs (event_log, task_store, journal).
     let mut health_targets = Vec::new();
     if raw_config.event_log.enabled {
         health_targets.push(DbTarget {
@@ -538,8 +538,8 @@ async fn main() -> anyhow::Result<()> {
     }
     let health_monitor =
         gatewayd::health::spawn(registry.clone(), journal.clone(), &raw_config.health, health_targets);
-    // Выключенный монитор = вечная заглушка, чтобы select не выходил
-    // преждевременно (тот же приём, что у log_monitor выше).
+    // A disabled monitor = an eternal stub so that select does not exit
+    // prematurely (same trick as log_monitor above).
     let health_task = match health_monitor {
         Some(h) => h,
         None => tokio::spawn(async { std::future::pending::<()>().await }),
@@ -556,9 +556,9 @@ async fn main() -> anyhow::Result<()> {
         );
         let direction_2 = transport_a2a_passthrough::router(http_registry);
         let mut app = direction_4.merge(direction_2);
-        // Часть 4.6: смена уровня логирования «на лету» через /debug/level.
-        // Роутер отдельный (не в transport_http::router — сигнатура последнего
-        // зафиксирована интеграционными тестами), мержим в общий app.
+        // Part 4.6: log-level change «on the fly» via /debug/level.
+        // Separate router (not in transport_http::router — the latter's signature is
+        // pinned by integration tests), merged into the shared app.
         if let Some(handle) = reload_handle {
             let debug_tokens: std::collections::HashSet<String> = raw_config
                 .tokens
@@ -579,9 +579,9 @@ async fn main() -> anyhow::Result<()> {
             .map_err(anyhow::Error::from)
     });
 
-    // Фоновая уборка задач. Ходит по каталогам агентов на диске, а не
-    // по живым адаптерам: задачи остановленного агента тоже надо
-    // убирать, а его адаптера в памяти уже нет.
+    // Background task sweeper. It walks agent directories on disk, not
+    // live adapters: tasks of a stopped agent must also be removed, and its
+    // adapter is no longer in memory.
     let sweeper = tokio::spawn(async move {
         loop {
             tokio::time::sleep(TASK_SWEEP_INTERVAL).await;
@@ -593,10 +593,10 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // ДОБАВЛЕНО (Часть 4.4 роадмапа стриминга): монитор размера
-    // лог-каталога — защита от расхождения между max_files (N файлов)
-    // и max_total_size_mb (N мегабайт) при резком скачке размера файла.
-    // Ходит раз в час, как sweeper.
+    // ADDED (streaming roadmap Part 4.4): log-directory size monitor —
+    // protection against divergence between max_files (N files)
+    // and max_total_size_mb (N megabytes) on a sharp file-size spike.
+    // Runs once an hour, like the sweeper.
     let log_monitor = if raw_config.logging.output == "file" || raw_config.logging.output == "both"
     {
         let log_dir = raw_config
@@ -614,8 +614,8 @@ async fn main() -> anyhow::Result<()> {
                 tokio::time::sleep(TASK_SWEEP_INTERVAL).await;
                 let current_mb = dir_size_mb(&log_dir).await;
                 let largest_file_mb = largest_file_size_mb(&log_dir).await;
-                // Отдельный порог: один файл перерос max_file_size_mb —
-                // ротация по числу файлов могла не сработать на размер.
+                // Separate threshold: one file outgrew max_file_size_mb —
+                // rotation by file count may have missed the size.
                 if max_file_size_mb > 0 && largest_file_mb > max_file_size_mb {
                     tracing::warn!(
                         current_size_mb = current_mb,
@@ -635,9 +635,9 @@ async fn main() -> anyhow::Result<()> {
                         limit_mb,
                         "лог-каталог превысил max_total_size_mb — принудительное удаление старейших файлов"
                     );
-                    // Часть 4.4: не только предупредить, а реально урезать.
-                    // gzip-сжатие ротированных (если включено), затем удаление
-                    // старейших, пока суммарный размер не вернётся к лимиту.
+                    // Part 4.4: not only warn, actually prune.
+                    // gzip-compress rotated files (if enabled), then delete
+                    // the oldest ones until total size returns to the limit.
                     let removed = prune_log_dir(&log_dir, limit_mb, compress_rotated).await;
                     tracing::warn!(removed, "лог-каталог урезан до max_total_size_mb");
                 } else if pct >= 80 {
@@ -664,7 +664,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Суммарный размер каталога (в МБ) — для монитора лог-ротации.
+/// Total directory size (in MB) — for the log-rotation monitor.
 async fn dir_size_mb(dir: &str) -> u64 {
     let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
         return 0;
@@ -680,8 +680,8 @@ async fn dir_size_mb(dir: &str) -> u64 {
     total_bytes / (1024 * 1024)
 }
 
-/// Размер самого крупного файла в каталоге (в МБ) — для монитора
-/// max_file_size_mb.
+/// Size of the largest file in the directory (in MB) — for the
+/// max_file_size_mb monitor.
 async fn largest_file_size_mb(dir: &str) -> u64 {
     let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
         return 0;
@@ -697,7 +697,7 @@ async fn largest_file_size_mb(dir: &str) -> u64 {
     largest / (1024 * 1024)
 }
 
-/// Список файлов каталога с mtime и размером — для чистки лог-каталога.
+/// List of directory files with mtime and size — for log-directory cleanup.
 async fn collect_log_files(
     dir: &str,
 ) -> Vec<(std::path::PathBuf, std::time::SystemTime, u64)> {
@@ -717,7 +717,7 @@ async fn collect_log_files(
     files
 }
 
-/// gzip-сжатие файла на месте: файл -> файл.gz, оригинал удаляется.
+/// In-place gzip compression of a file: file -> file.gz, original removed.
 async fn gzip_file(path: &std::path::Path) -> bool {
     use std::io::Write;
 
@@ -738,11 +738,11 @@ async fn gzip_file(path: &std::path::Path) -> bool {
     tokio::fs::remove_file(path).await.is_ok()
 }
 
-/// Часть 4.4: реальная чистка лог-каталога при превышении
-/// max_total_size_mb. Сначала gzip-сжимает ротированные (не активные)
-/// файлы, затем удаляет старейшие, пока суммарный размер не опустится
-/// ниже лимита. Активный (самый свежий) файл не трогается. Возвращает
-/// число обработанных файлов.
+/// Part 4.4: actual log-directory cleanup when max_total_size_mb is
+/// exceeded. First gzip-compresses rotated (non-active) files, then
+/// deletes the oldest ones until the total size drops below the limit.
+/// The active (newest) file is left untouched. Returns
+/// the number of files processed.
 async fn prune_log_dir(dir: &str, limit_mb: u64, compress: bool) -> usize {
     if limit_mb == 0 {
         return 0;
@@ -757,7 +757,7 @@ async fn prune_log_dir(dir: &str, limit_mb: u64, compress: bool) -> usize {
     files.sort_by_key(|(_, mtime, _)| *mtime);
     let active = files.last().map(|(path, _, _)| path.clone());
 
-    // 1) gzip-компрессия старых ротированных файлов.
+    // 1) gzip compression of old rotated files.
     if compress {
         for (path, _, _) in &files {
             if Some(path) == active.as_ref() {
@@ -772,7 +772,7 @@ async fn prune_log_dir(dir: &str, limit_mb: u64, compress: bool) -> usize {
         }
     }
 
-    // 2) Удаление старейших, пока суммарный размер выше лимита.
+    // 2) Delete the oldest files while total size is above the limit.
     loop {
         let files = collect_log_files(dir).await;
         if files.len() <= 1 {
@@ -799,15 +799,15 @@ async fn prune_log_dir(dir: &str, limit_mb: u64, compress: bool) -> usize {
     handled
 }
 
-/// Часть 4.6: reload-фильтр. Возвращает handle для смены уровня «на
-/// лету» через POST /debug/level; None — когда level: "off" (клапан).
+/// Part 4.6: reload filter. Returns a handle for changing the level «on the
+/// fly» via POST /debug/level; None — when level: "off" (the valve).
 fn tracing_subscriber_init(
     logging: &LoggingConfig,
 ) -> Option<reload::Handle<EnvFilter, tracing_subscriber::Registry>> {
-    // Аварийный клапан (Часть 4.5): level: "off" полностью отключает
-    // фильтр. Стартовое сообщение печатается в stderr ДО отключения —
-    // иначе оператор не отличит "не пишет логи по конфигу" от "не
-    // запустился".
+    // Emergency valve (Part 4.5): level: "off" disables the filter
+    // entirely. The startup message is printed to stderr BEFORE the shutdown —
+    // otherwise the operator cannot tell "not logging by config" from
+    // "did not start".
     if logging.level == "off" {
         eprintln!(
             "[gatewayd] ВНИМАНИЕ: логирование полностью отключено (logging.level: off) — диагностика по логам будет недоступна"
@@ -818,10 +818,10 @@ fn tracing_subscriber_init(
         return None;
     }
 
-    // Единая цепочка registry() + reload-слой, чтобы фильтр был меняемым.
-    // Обёртка reload::Layer не пишет сама — рядом кладём fmt-слой(и) под
-    // output: stdout|file|both, как было. Ветки раздельные, потому что
-    // каждый .with() меняет тип Layered — переприсваивание не скомпилилось бы.
+    // Single registry() + reload-layer chain so the filter is changeable.
+    // The reload::Layer wrapper does not write by itself — put fmt layer(s) next
+    // to it under output: stdout|file|both, as before. The branches are separate
+    // because each .with() changes the Layered type — reassignment would not compile.
     let (filter, handle) = reload::Layer::new(EnvFilter::new(&logging.level));
     let output_stdout = logging.output == "stdout" || logging.output == "both";
     let output_file = logging.output == "file" || logging.output == "both";
@@ -856,7 +856,7 @@ fn tracing_subscriber_init(
     Some(handle)
 }
 
-/// Состояние debug-эндпоинта смены уровня логирования (Часть 4.6).
+/// State of the debug endpoint for changing the log level (Part 4.6).
 #[derive(Clone)]
 struct DebugLevelState {
     handle: reload::Handle<EnvFilter, tracing_subscriber::Registry>,
@@ -865,10 +865,10 @@ struct DebugLevelState {
     current: std::sync::Arc<tokio::sync::RwLock<String>>,
 }
 
-/// Часть 4.6: эндпоинт /debug/level — смена уровня логирования «на лету».
-///   GET  /debug/level            -> текущий уровень
-///   POST /debug/level            -> body {"level":"debug"} + Bearer-токен
-/// Уровни debug|trace включают автокат к "info" через debug_ttl_minutes.
+/// Part 4.6: /debug/level endpoint — log-level change «on the fly».
+///   GET  /debug/level            -> current level
+///   POST /debug/level            -> body {"level":"debug"} + Bearer token
+/// Levels debug|trace enable auto-rollback to "info" after debug_ttl_minutes.
 fn debug_router(
     handle: reload::Handle<EnvFilter, tracing_subscriber::Registry>,
     tokens: std::collections::HashSet<String>,
@@ -970,8 +970,8 @@ async fn set_debug_level(
 mod config_tests {
     use super::*;
 
-    /// T8: конфиг без секции streaming: использует дефолты
-    /// (max_concurrent_streams=1, first=15, idle=120), не паникует.
+    /// T8: a config without a streaming: section uses the defaults
+    /// (max_concurrent_streams=1, first=15, idle=120), does not panic.
     #[test]
     fn agent_without_streaming_section_gets_defaults() {
         let yaml = r#"
@@ -995,8 +995,8 @@ turn_lease_timeout_secs: 30
         assert_eq!(streaming.idle_chunk_timeout_secs, 120);
     }
 
-    /// T8: max_concurrent_streams == 0 -> ошибка старта (fail-closed),
-    /// по конвенции проекта (пустой токен уже так падает).
+    /// T8: max_concurrent_streams == 0 -> startup error (fail-closed),
+    /// per project convention (an empty token already fails this way).
     #[test]
     fn max_concurrent_streams_zero_fails_startup() {
         let yaml = r#"
@@ -1022,7 +1022,7 @@ turn_lease_timeout_secs: 30
         );
     }
 
-    /// T8: явная секция streaming: переопределяет дефолты.
+    /// T8: an explicit streaming: section overrides the defaults.
     #[test]
     fn agent_with_explicit_streaming_section_overrides_defaults() {
         let yaml = r#"

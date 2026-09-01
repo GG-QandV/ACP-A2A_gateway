@@ -1,7 +1,7 @@
-//! core/src/convert.rs — финальная версия. lease_timeout передаётся через
-//! конструктор, хардкода Duration::from_secs(30) нигде нет — таймаут
-//! настраивается вызывающим кодом (main.rs -> transport_*.rs), который
-//! читает его из config.yaml (turn_lease_timeout_secs).
+// core/src/convert.rs — final version. lease_timeout is passed through
+// the constructor; there is no hardcoded Duration::from_secs(30) anywhere — the timeout
+// is configured by the calling code (main.rs -> transport_*.rs), which
+// reads it from config.yaml (turn_lease_timeout_secs).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -51,8 +51,8 @@ pub fn content_block_to_part(cb: ContentBlock) -> Part {
 pub fn part_to_content_block(p: Part) -> ContentBlock {
     match p {
         Part::Text { text } => ContentBlock::Text { text },
-        // ИСПРАВЛЕНО (аудит P2-13): раньше ЛЮБОЙ File становился Image,
-        // включая аудио и PDF. Тип выбирается по mime.
+        // FIXED (audit P2-13): previously ANY File became an Image,
+        // including audio and PDF. The type is chosen by mime.
         Part::File { file } => {
             let mime = file.mime_type.unwrap_or_else(|| "application/octet-stream".into());
             let data = file.bytes.unwrap_or_default();
@@ -83,7 +83,7 @@ fn prompt_to_message(p: PromptRequest) -> Message {
 }
 
 // =========================================================================
-// 2. TaskState <-> StopReason — НЕ биекция, задокументировано явно.
+// 2. TaskState <-> StopReason - not a bijection; documented explicitly.
 // =========================================================================
 
 fn task_state_to_stop_reason(state: TaskState) -> anyhow::Result<StopReason> {
@@ -91,9 +91,9 @@ fn task_state_to_stop_reason(state: TaskState) -> anyhow::Result<StopReason> {
         TaskState::Completed => Ok(StopReason::EndTurn),
         TaskState::Canceled => Ok(StopReason::Cancelled),
         TaskState::Failed | TaskState::Rejected => Ok(StopReason::Refusal),
-        // ИСПРАВЛЕНО (аудит P2-6): было bail! — весь prompt падал на
-        // штатном сценарии "агент просит ввод". Это нормальное завершение
-        // хода: управление возвращается клиенту, он шлёт следующий prompt.
+        // FIXED (audit P2-6): was bail! — the whole prompt died on
+        // the routine 'agent requests input' scenario. This is a normal turn end:
+        // control returns to the client, which sends the next prompt.
         TaskState::InputRequired | TaskState::AuthRequired => Ok(StopReason::EndTurn),
         TaskState::Submitted | TaskState::Working | TaskState::Unspecified => {
             anyhow::bail!("task ещё не завершена (state={state:?}), StopReason недоступен")
@@ -110,22 +110,22 @@ fn stop_reason_to_task_state(sr: StopReason) -> TaskState {
 }
 
 // =========================================================================
-// 3. AcpAsA2a — A2A-клиент видит ACP-агента.
+// 3. AcpAsA2a - an A2A client sees an ACP agent.
 // =========================================================================
 
 struct SessionEntry {
     session_id: SessionId,
     owner: Owner,
     last_used: std::time::Instant,
-    /// ДОБАВЛЕНО (аудит P2-10): поколение процесса агента, в котором
-    /// эта ACP-сессия была заведена. Если процесс с тех пор
-    /// перезапускался, сессии больше нет — и клиент должен узнать об
-    /// этом явно, а не продолжать разговор в пустоту.
+    /// ADDED (audit P2-10): the agent-process generation in which
+    /// this ACP session was created. If the process has been
+    /// restarted since, the session no longer exists — and the client should learn
+    /// about it explicitly, not keep talking into the void.
     generation: u64,
 }
 
-/// Потолок числа одновременных разговоров на одного агента. Без него
-/// клиент с валидным токеном может создавать контексты бесконечно.
+/// Cap on the number of concurrent conversations per agent. Without it
+/// a client with a valid token could create contexts indefinitely.
 const MAX_SESSIONS_PER_AGENT: usize = 256;
 
 pub struct AcpAsA2a<T: AcpAgent> {
@@ -133,18 +133,18 @@ pub struct AcpAsA2a<T: AcpAgent> {
     lease: TurnLease,
     lease_timeout: Duration,
     default_cwd: String,
-    /// ДОБАВЛЕНО (аудит P2-12): внешний адрес, по которому этого агента
-    /// видно снаружи. Раньше в AgentCard уходил пустой url — карточка
-    /// невалидна по A2A-спеке, а agent.json это точка входа для внешних
-    /// клиентов, то есть первое, что они читают.
+    /// ADDED (audit P2-12): the external address at which this agent
+    /// is visible from outside. Previously the AgentCard carried an empty url — the card
+    /// is invalid per the A2A spec, and agent.json is the entry point for external
+    /// clients, i.e. the first thing they read.
     public_url: String,
-    /// ИСПРАВЛЕНО (аудит P1-1): было `Mutex<Option<SessionId>>` — ОДНА
-    /// ACP-сессия на всех клиентов агента, то есть любые два A2A-клиента
-    /// оказывались в одном разговоре и видели контекст друг друга.
-    /// Теперь сессия заводится на A2A contextId и принадлежит клиенту.
+    /// FIXED (audit P1-1): was `Mutex<Option<SessionId>>` — ONE
+    /// ACP session shared by all of the agent's clients, i.e. any two A2A clients
+    /// ended up in the same conversation and saw each other's context.
+    /// Now a session is created per A2A contextId and belongs to the client.
     sessions: tokio::sync::Mutex<HashMap<ContextId, SessionEntry>>,
-    /// Простаивающие сессии выселяются, иначе HashMap растёт без предела
-    /// (тот же дефект, что P2-8 у TurnLease).
+    /// Idle sessions are evicted, otherwise the HashMap grows without bound
+    /// (the same defect as P2-8 in TurnLease).
     session_ttl: Duration,
     tasks: TaskStore,
 }
@@ -188,9 +188,9 @@ impl<T: AcpAgent> AcpAsA2a<T> {
         }
     }
 
-    /// Сессия для конкретного разговора. Первое обращение с новым
-    /// contextId заводит новую ACP-сессию на том же процессе агента —
-    /// плодить процессы не требуется, sessionId для того и существует.
+    /// Session for a specific conversation. The first request with a new
+    /// contextId spawns a fresh ACP session on the same agent process —
+    /// no need to multiply processes, that is what sessionId exists for.
     async fn ensure_session(
         &self,
         context: &ContextId,
@@ -207,31 +207,31 @@ impl<T: AcpAgent> AcpAsA2a<T> {
             .collect();
         for ctx in expired {
             if let Some(entry) = sessions.remove(&ctx) {
-                // Освобождаем и запись в TurnLease, иначе выселение
-                // сессии оставляло бы там мусор.
+                // Also release the TurnLease entry, otherwise evicting the
+                // session would leave garbage there.
                 self.lease.forget(&entry.session_id).await;
             }
         }
 
-        // ИСПРАВЛЕНО (найдено live-тестом): сначала приводим агента в
-        // рабочее состояние (при необходимости — с перезапуском), и
-        // только потом читаем поколение. Иначе сверка шла со старым
-        // номером, промпт уходил в свежий процесс со старым sessionId,
-        // и клиент получал «Invalid params» от агента вместо ContextLost.
+        // FIXED (found by live test): first bring the agent to
+        // a ready state (with a restart if needed), and
+        // only then read the generation. Otherwise the comparison used the old
+        // number, the prompt went to the fresh process with the old sessionId,
+        // and the client got 'Invalid params' from the agent instead of ContextLost.
         self.inner.ensure_ready().await?;
         let generation = self.inner.generation().await;
 
         if let Some(entry) = sessions.get(context) {
-            // Владелец разговора зафиксирован при создании: чужой
-            // contextId не даёт подключиться к чужой сессии.
+            // The conversation owner is fixed at creation: a foreign
+            // contextId does not allow attaching to someone else's session.
             if entry.owner != owner {
                 anyhow::bail!("contextId принадлежит другому клиенту");
             }
 
-            // ИСПРАВЛЕНО (аудит P2-10): пережившая перезапуск агента
-            // запись указывает на несуществующую ACP-сессию. Сообщаем
-            // о потере контекста и убираем запись — повторный запрос
-            // с тем же contextId начнёт разговор заново.
+            // FIXED (audit P2-10): an entry that survived an agent restart
+            // points at a nonexistent ACP session. Report the context loss
+            // and drop the entry — a repeated request
+            // with the same contextId starts the conversation anew.
             if entry.generation != generation {
                 let previous = entry.generation;
                 let stale = sessions.remove(context).expect("запись только что читалась");
@@ -271,8 +271,8 @@ impl<T: AcpAgent> AcpAsA2a<T> {
         Ok(resp.session_id)
     }
 
-    /// Сессия существующего разговора без создания новой. Используется
-    /// отменой: отменять нечего, если разговора не было.
+    /// Session of an existing conversation without creating a new one. Used
+    /// by cancel: there is nothing to cancel if the conversation never existed.
     async fn lookup_session(
         &self,
         context: &ContextId,
@@ -288,31 +288,31 @@ impl<T: AcpAgent> AcpAsA2a<T> {
         Ok(entry.session_id.clone())
     }
 
-    /// Число живых разговоров — для тестов и диагностики.
+    /// Number of live conversations — for tests and diagnostics.
     pub async fn active_sessions(&self) -> usize {
         self.sessions.lock().await.len()
     }
 
-    /// Чтение задачи с проверкой владельца её разговора.
+    /// Read a task with a check of its conversation's owner.
     ///
-    /// ЧАСТИЧНО закрывает аудит P1-2 (IDOR): чужую задачу не отдадим,
-    /// пока её разговор жив. После выселения сессии по TTL владелец
-    /// неизвестен — полное решение требует поля владельца в TaskStore
-    /// и вынесено в отдельный пункт.
+    /// PARTIALLY closes audit P1-2 (IDOR): a foreign task is not handed out
+    /// while its conversation is alive. After TTL session eviction the
+    /// owner is unknown — the full fix requires an owner field in TaskStore
+    /// and is tracked as a separate item.
     pub async fn get_task_as(&self, owner: Owner, id: TaskId) -> anyhow::Result<Task> {
         let stored = self.tasks.load_owned(&id).await?;
         assert_owner_matches(&stored, owner)?;
-        // Второй рубеж: если задача из старого формата (владелец не
-        // записан), но её разговор ещё жив — спрашиваем у реестра сессий.
+        // Second line of defense: if the task is in the old format (owner not
+        // recorded) but its conversation is still alive — ask the session registry.
         self.assert_owns(&stored.task.context_id, owner).await?;
         Ok(stored.task)
     }
 
-    /// Отмена с проверкой владельца. Отменяется сессия того разговора,
-    /// которому принадлежит задача, а не «текущая» сессия адаптера.
+    /// Cancel with an owner check. The session of the conversation that owns
+    /// the task is cancelled, not the adapter's 'current' session.
     pub async fn cancel_task_as(&self, owner: Owner, id: TaskId) -> anyhow::Result<Task> {
-        // ИСПРАВЛЕНО (аудит P2-4): возвращалась пустышка с пустым
-        // context_id, а сохранённая задача затиралась ею же.
+        // FIXED (audit P2-4): it returned a stub with an empty
+        // context_id, and the stored task was overwritten by that stub.
         let stored = self.tasks.load_owned(&id).await?;
         assert_owner_matches(&stored, owner)?;
         let mut result = stored.task;
@@ -327,11 +327,11 @@ impl<T: AcpAgent> AcpAsA2a<T> {
         Ok(result)
     }
 
-    /// Разговор либо принадлежит этому владельцу, либо уже забыт
-    /// (выселен по TTL). Раньше «забыт» означало «пропускаем» — это и
-    /// была дыра P1-2. Теперь основную проверку делает атрибуция в
-    /// хранилище, а эта остаётся вторым рубежом для записей старого
-    /// формата, у которых владелец не записан.
+    /// A conversation either belongs to this owner or has already been forgotten
+    /// (evicted by TTL). Previously 'forgotten' meant 'let it through' — that
+    /// was the P1-2 hole. Now the main check is done by attribution in
+    /// the task store, and this remains a second line of defense for old-format
+    /// entries whose owner is not recorded.
     async fn assert_owns(&self, context: &ContextId, owner: Owner) -> anyhow::Result<()> {
         let sessions = self.sessions.lock().await;
         match sessions.get(context) {
@@ -342,9 +342,9 @@ impl<T: AcpAgent> AcpAsA2a<T> {
         }
     }
 
-    /// Отправка с указанием владельца разговора. Транспорт, который
-    /// знает токен клиента, должен звать именно этот метод — трейтовый
-    /// `send_task` владельца не несёт и работает как Anonymous.
+    /// Send with the conversation owner specified. A transport that
+    /// knows the client token must call exactly this method — the trait-level
+    /// `send_task` carries no owner and behaves as Anonymous.
     pub async fn send_task_as(
         &self,
         owner: Owner,
@@ -361,16 +361,16 @@ impl<T: AcpAgent> AcpAsA2a<T> {
             .ok_or_else(|| anyhow::anyhow!("task.status.message обязателен для send_task в MVP"))?;
         let prompt_req = message_to_prompt(session.clone(), incoming_message);
 
-        // ДОБАВЛЕНО (Р-20): send_task_as использует prompt_streaming() —
-        // вызывающий транспортный слой (gatewayd, направление 4) готов
-        // обработать Reply::Streaming и рендерить его в SSE.
+        // ADDED (P-20): send_task_as uses prompt_streaming() —
+        // the calling transport layer (gatewayd, direction 4) is ready
+        // to handle Reply::Streaming and render it as SSE.
         match self.inner.prompt_streaming(prompt_req).await? {
             Reply::Complete(resp) => {
                 let state = stop_reason_to_task_state(resp.stop_reason);
-                // ИСПРАВЛЕНО (аудит P2-1): ответ агента выбрасывался, и
-                // A2A-клиент получал Task вообще без Part'ов. Теперь
-                // PromptResponse.content уходит в artifacts и в
-                // status.message с ролью Agent.
+                // FIXED (audit P2-1): the agent reply was thrown away, and
+                // the A2A client got a Task with no Parts at all. Now
+                // PromptResponse.content goes into artifacts and into
+                // status.message with role Agent.
                 let parts: Vec<Part> =
                     resp.content.into_iter().map(content_block_to_part).collect();
                 let agent_message = (!parts.is_empty()).then(|| Message {
@@ -398,12 +398,12 @@ impl<T: AcpAgent> AcpAsA2a<T> {
                 self.tasks.save(&result, owner).await?;
                 Ok(Reply::Complete(result))
             }
-            // ИСПРАВЛЕНО (аудит P2-7): unreachable! = паника воркер-таска
-            // в сетевом сервисе. Теперь обычная ошибка.
-            // ДОБАВЛЕНО (Р-20, дифф convert-streaming-mapping.rs): реальный
-            // стрим — SessionUpdate -> A2aEvent транслируется фоновым
-            // таском, пока канал не закроется; терминальное событие
-            // (final: true) отправляется в конце.
+            // FIXED (audit P2-7): unreachable! = worker-task panic
+            // in a network service. Now a regular error.
+            // ADDED (P-20, diff convert-streaming-mapping.rs): the real
+            // stream — SessionUpdate -> A2aEvent is translated by a background
+            // task until the channel closes; the terminal event
+            // (final: true) is sent at the end.
             Reply::Streaming(mut in_rx) => {
                 let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel::<a2a::A2aEvent>();
                 let task_id = task.id.clone();
@@ -415,7 +415,7 @@ impl<T: AcpAgent> AcpAsA2a<T> {
                         chunk_count += 1;
                         if let Some(event) = session_update_to_a2a_event(update, &task_id) {
                             if out_tx.send(event).is_err() {
-                                // ЛОГ-ЛОВУШКА (WARN, по умолчанию включена):
+                                // LOG-TRAP (WARN, enabled by default):
                                 tracing::warn!(
                                     task_id = %task_id.0,
                                     "получатель A2aEvent отключился до terminal event — задача продолжает выполняться в фоне"
@@ -425,8 +425,8 @@ impl<T: AcpAgent> AcpAsA2a<T> {
                         }
                     }
 
-                    // ЛОГ-ЛОВУШКА (WARN, по умолчанию включена): 0 чанков —
-                    // не баг сам по себе, но диагностический сигнал.
+                    // LOG-TRAP (WARN, enabled by default): 0 chunks —
+                    // not a bug per se, but a diagnostic signal.
                     if chunk_count == 0 {
                         tracing::warn!(
                             task_id = %task_id.0,
@@ -434,12 +434,12 @@ impl<T: AcpAgent> AcpAsA2a<T> {
                         );
                     }
 
-                    // Терминальное событие (точка интеграции G<->convert,
-                    // решение (c) из convert-streaming-mapping.rs): terminal
-                    // state всегда Completed, если канал закрылся без ошибки.
-                    // Различие Cancelled/Refusal теряется в потоковом пути —
-                    // сознательный компромисс ради сохранения seam (в
-                    // Complete-пути это различие есть через
+                    // Terminal event (integration point G<->convert,
+                    // decision (c) from convert-streaming-mapping.rs): terminal
+                    // state is always Completed if the channel closed without error.
+                    // The Cancelled/Refusal distinction is lost on the streaming path —
+                    // a deliberate trade-off to preserve the seam (on the
+                    // Complete path the distinction exists via
                     // stop_reason_to_task_state).
                     let _ = out_tx.send(a2a::A2aEvent::TaskStatusUpdate {
                         task_id: task_id.clone(),
@@ -459,18 +459,18 @@ impl<T: AcpAgent> AcpAsA2a<T> {
 
 }
 
-/// ДОБАВЛЕНО (Р-21, дифф convert-streaming-mapping.rs, senior-уровень):
-/// разбор вариантов SessionUpdate -> A2aEvent. Маппинг всех 5 вариантов
-/// написан, но при текущем фильтре collect_session_update() (только
-/// agent_message_chunk) достижим только AgentMessageChunk — остальные
-/// варианты готовность к следующей итерации парсинга.
+/// ADDED (P-21, diff convert-streaming-mapping.rs, senior-level):
+/// mapping of SessionUpdate -> A2aEvent variants. The mapping of all 5 variants
+/// is written, but with the current collect_session_update() filter (only
+/// agent_message_chunk) only AgentMessageChunk is reachable — the other
+/// variants are readiness for the next parsing iteration.
 ///
-/// РЕШЕНИЯ ПО КАЖДОМУ ВАРИАНТУ:
+/// DECISIONS FOR EACH VARIANT:
 /// 1. AgentMessageChunk -> TaskStatusUpdate(state: Working, final: false).
-/// 2. ToolCall/ToolCallUpdate -> TaskStatusUpdate с текстовым описанием
-///    (нет прямого эквивалента в A2A; текстовый след лучше потери сигнала).
-/// 3. Plan -> TaskStatusUpdate с нумерованным текстовым списком.
-/// 4. UsageUpdate -> НЕ эмитится клиенту (нет поля в A2A), только DEBUG-лог.
+/// 2. ToolCall/ToolCallUpdate -> TaskStatusUpdate with a textual description
+///    (no direct equivalent in A2A; a textual trace beats losing the signal).
+/// 3. Plan -> TaskStatusUpdate with a numbered text list.
+/// 4. UsageUpdate -> NOT emitted to the client (no field in A2A), DEBUG log only.
 fn session_update_to_a2a_event(update: SessionUpdate, task_id: &TaskId) -> Option<a2a::A2aEvent> {
     match update {
         SessionUpdate::AgentMessageChunk { content, .. } => {
@@ -530,8 +530,8 @@ fn session_update_to_a2a_event(update: SessionUpdate, task_id: &TaskId) -> Optio
             })
         }
 
-        // РЕШЕНИЕ: не имеет эквивалента в A2A-протоколе. Не эмитим событие
-        // клиенту, только наблюдаемость.
+        // DECISION: no equivalent in the A2A protocol. Do not emit an event
+        // to the client, observability only.
         SessionUpdate::UsageUpdate { used, size, cost } => {
             tracing::debug!(
                 used,
@@ -552,7 +552,7 @@ fn text_status_message(text: &str) -> Message {
     }
 }
 
-/// Сутки простоя: разговор живёт между сообщениями клиента, но не вечно.
+/// One day of idleness: a conversation lives between client messages, but not forever.
 pub const DEFAULT_SESSION_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[async_trait]
@@ -569,7 +569,7 @@ impl<T: AcpAgent + Send + Sync> A2aAgent for AcpAsA2a<T> {
         Ok(a2a::AgentCard {
             name: init.agent_info.as_ref().map(|i| i.name.clone()).unwrap_or_default(),
             description: None,
-            // A2A AgentCard.version — строка, ACP protocolVersion — число.
+            // A2A AgentCard.version is a string, ACP protocolVersion is a number.
             version: init.protocol_version.to_string(),
             url: self.public_url.clone(),
             capabilities: a2a::AgentCardCapabilities { streaming: false, push_notifications: false },
@@ -591,27 +591,27 @@ impl<T: AcpAgent + Send + Sync> A2aAgent for AcpAsA2a<T> {
 }
 
 // =========================================================================
-// 4. A2aAsAcp — ACP-клиент видит A2A-агента.
+// 4. A2aAsAcp - an ACP client sees an A2A agent.
 // =========================================================================
 
-/// Потолок сессий на одно ACP-соединение. Второй рубеж после проверки
-/// «сессия заведена через session/new»: даже добросовестный клиент не
-/// должен уметь открыть их неограниченно.
+/// Session cap per ACP connection. A second line of defense after the
+/// 'session created via session/new' check: even a well-intentioned client
+/// must not be able to open an unlimited number of them.
 const MAX_SESSIONS_PER_CONNECTION: usize = 256;
 
 pub struct A2aAsAcp<T: A2aAgent> {
     inner: T,
     lease: TurnLease,
     lease_timeout: Duration,
-    /// ИСПРАВЛЕНО (аудит P2-8): раньше сессий как понятия здесь не было
-    /// вовсе. `prompt` брал sessionId прямо из запроса клиента и
-    /// ключевал им TurnLease, а `forget` не вызывался нигде — то есть
-    /// любой sessionId, присланный клиентом, навсегда добавлял запись
-    /// в HashMap лиза. Это не только утечка: клиент с валидным токеном
-    /// мог забивать память шлюза, генерируя идентификаторы на лету.
+    /// FIXED (audit P2-8): previously there was no notion of sessions here
+    /// at all. `prompt` took sessionId straight from the client request and
+    /// keyed TurnLease by it, and `forget` was never called — i.e. any
+    /// sessionId sent by a client permanently added an entry
+    /// to the lease HashMap. This is not just a leak: a client with a valid token
+    /// could stuff the gateway's memory by generating identifiers on the fly.
     ///
-    /// Теперь сессия существует, только если заведена через session/new,
-    /// и удаляется при session/cancel вместе с записью в лизе.
+    /// Now a session exists only if created via session/new,
+    /// and is removed on session/cancel together with the lease entry.
     sessions: tokio::sync::Mutex<HashMap<SessionId, std::time::Instant>>,
     session_ttl: Duration,
 }
@@ -631,7 +631,7 @@ impl<T: A2aAgent> A2aAsAcp<T> {
         }
     }
 
-    /// Регистрирует сессию, заведённую через session/new.
+    /// Registers a session created via session/new.
     async fn register_session(&self, session: SessionId) -> anyhow::Result<()> {
         let mut sessions = self.sessions.lock().await;
         self.evict_expired(&mut sessions).await;
@@ -647,11 +647,11 @@ impl<T: A2aAgent> A2aAsAcp<T> {
         Ok(())
     }
 
-    /// Проверяет, что сессия заведена, и продлевает её.
+    /// Checks that the session exists and extends it.
     ///
-    /// По ACP клиент обязан вызвать session/new до session/prompt.
-    /// Раньше это не проверялось, и произвольный sessionId считался
-    /// валидным — что и было корнем утечки.
+    /// Per ACP the client must call session/new before session/prompt.
+    /// This was not checked, and an arbitrary sessionId was considered
+    /// valid — which was the root of the leak.
     async fn touch_session(&self, session: &SessionId) -> anyhow::Result<()> {
         let mut sessions = self.sessions.lock().await;
         self.evict_expired(&mut sessions).await;
@@ -668,7 +668,7 @@ impl<T: A2aAgent> A2aAsAcp<T> {
         }
     }
 
-    /// Забывает сессию и освобождает её запись в лизе.
+    /// Forgets a session and releases its lease entry.
     async fn drop_session(&self, session: &SessionId) {
         self.sessions.lock().await.remove(session);
         self.lease.forget(session).await;
@@ -688,19 +688,19 @@ impl<T: A2aAgent> A2aAsAcp<T> {
 
         for session in expired {
             sessions.remove(&session);
-            // Без этого запись оставалась бы в TurnLease навсегда —
-            // ровно та утечка, ради которой всё и делается.
+            // Without this the entry would stay in TurnLease forever —
+            // exactly the leak this is all meant to fix.
             self.lease.forget(&session).await;
         }
     }
 
-    /// Число живых сессий — для тестов и диагностики.
+    /// Number of live sessions — for tests and diagnostics.
     pub async fn active_sessions(&self) -> usize {
         self.sessions.lock().await.len()
     }
 
-    /// Сколько сессий числится за TurnLease. Должно совпадать с числом
-    /// живых сессий: расхождение и есть утечка.
+    /// How many sessions are tracked by TurnLease. Should match the number
+    /// of live sessions: a mismatch is the leak.
     pub async fn leased_sessions(&self) -> usize {
         self.lease.tracked_sessions().await
     }
@@ -712,9 +712,9 @@ impl<T: A2aAgent + Send + Sync> AcpAgent for A2aAsAcp<T> {
     async fn initialize(&self, _req: acp::InitializeRequest) -> anyhow::Result<acp::InitializeResponse> {
         let card = self.inner.card().await?;
         Ok(acp::InitializeResponse {
-            // Обратное преобразование: строка карточки A2A -> число ACP.
-            // Невнятная версия не должна ронять рукопожатие — берём
-            // мажорную часть, при неудаче значение по умолчанию.
+            // Reverse conversion: A2A card string -> ACP number.
+            // A bogus version must not kill the handshake — take
+            // the major part, fall back to the default on failure.
             protocol_version: card
                 .version
                 .split('.')
@@ -739,17 +739,17 @@ impl<T: A2aAgent + Send + Sync> AcpAgent for A2aAsAcp<T> {
     }
 
     async fn prompt(&self, req: PromptRequest) -> anyhow::Result<Reply<PromptResponse, SessionUpdate>> {
-        // Проверка ДО acquire: иначе неизвестный sessionId успевал
-        // создать запись в лизе прежде, чем был отвергнут.
+        // Check BEFORE acquire: otherwise an unknown sessionId managed
+        // to create a lease entry before it was rejected.
         self.touch_session(&req.session_id).await?;
 
         let _guard = self.lease.acquire(&req.session_id, self.lease_timeout).await?;
 
         let message = prompt_to_message(req.clone());
-        // ИСПРАВЛЕНО (аудит P2-5): TaskId брался равным session_id, из-за
-        // чего все ходы одной сессии имели один id — перезапись в store и
-        // отказ upstream на дубликат. Уникальный id на ход, контекст
-        // остаётся сессионным.
+        // FIXED (audit P2-5): TaskId was set equal to session_id, so
+        // all turns of one session shared one id — overwrite in the store and
+        // upstream duplicate rejection. A unique id per turn, the context
+        // stays session-scoped.
         let task = Task {
             id: TaskId(format!("{}-{}", req.session_id.0, unique_suffix())),
             context_id: ContextId(req.session_id.0),
@@ -762,8 +762,8 @@ impl<T: A2aAgent + Send + Sync> AcpAgent for A2aAsAcp<T> {
         match self.inner.send_task(task).await? {
             Reply::Complete(t) => {
                 let stop_reason = task_state_to_stop_reason(t.status.state)?;
-                // ИСПРАВЛЕНО (аудит P2-2): контент Task выбрасывался,
-                // ACP-клиент получал только stop_reason без текста.
+                // FIXED (audit P2-2): the Task content was thrown away,
+                // the ACP client got only stop_reason without text.
                 let mut content: Vec<ContentBlock> = Vec::new();
                 if let Some(msg) = t.status.message {
                     content.extend(msg.parts.into_iter().map(part_to_content_block));
@@ -773,9 +773,9 @@ impl<T: A2aAgent + Send + Sync> AcpAgent for A2aAsAcp<T> {
                 }
                 Ok(Reply::Complete(PromptResponse { stop_reason, content }))
             }
-            // ДОБАВЛЕНО (Р-20, дифф convert-streaming-mapping.rs): A2aEvent
-            // -> SessionUpdate транслируется фоновым таском, пока не придёт
-            // терминальное событие (final: true) — оно закрывает поток.
+            // ADDED (P-20, diff convert-streaming-mapping.rs): A2aEvent
+            // -> SessionUpdate is translated by a background task until the terminal
+            // event (final: true) arrives — it closes the stream.
             Reply::Streaming(mut in_rx) => {
                 let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel::<SessionUpdate>();
 
@@ -796,7 +796,7 @@ impl<T: A2aAgent + Send + Sync> AcpAgent for A2aAsAcp<T> {
                             }
                         }
                         if is_final {
-                            break; // терминал закрывает поток
+                            break; // terminal closes the stream
                         }
                     }
                     if chunk_count == 0 {
@@ -814,31 +814,31 @@ impl<T: A2aAgent + Send + Sync> AcpAgent for A2aAsAcp<T> {
     async fn cancel(&self, session: SessionId) -> anyhow::Result<()> {
         let result = self.inner.cancel_task(TaskId(session.0.clone())).await;
 
-        // Сессия забывается независимо от исхода отмены на стороне
-        // агента: клиент считает её закрытой в любом случае, и держать
-        // за неё запись в лизе не за чем.
+        // The session is forgotten regardless of the cancel outcome on the
+        // agent side: the client considers it closed anyway, and there is no reason
+        // to keep its lease entry.
         self.drop_session(&session).await;
 
         result.map(|_| ())
     }
 }
 
-/// ДОБАВЛЕНО (Р-20, дифф convert-streaming-mapping.rs): разбор вариантов
-/// A2aEvent -> SessionUpdate для направления 3 (A2A-агент -> ACP-клиент).
+/// ADDED (P-20, diff convert-streaming-mapping.rs): mapping of
+/// A2aEvent -> SessionUpdate variants for direction 3 (A2A agent -> ACP client).
 ///
-/// РЕШЕНИЯ:
-/// 1. TaskStatusUpdate { final: false } — если message содержит текст,
-///    эмитится AgentMessageChunk по одному на Part; пустой статус — DEBUG.
-/// 2. TaskStatusUpdate { final: true } — терминальное событие, НЕ мапится
-///    в SessionUpdate (обрабатывается отдельно как сигнал закрытия).
-/// 3. TaskArtifactUpdate — AgentMessageChunk по одному на Part.
-/// 4. Message(_) — AgentMessageChunk по одному на Part.
+/// DECISIONS:
+/// 1. TaskStatusUpdate { final: false } — if message contains text,
+///    emit AgentMessageChunk, one per Part; empty status — DEBUG.
+/// 2. TaskStatusUpdate { final: true } — terminal event, NOT mapped
+///    into SessionUpdate (handled separately as a close signal).
+/// 3. TaskArtifactUpdate — AgentMessageChunk, one per Part.
+/// 4. Message(_) — AgentMessageChunk, one per Part.
 fn a2a_event_to_session_update(event: a2a::A2aEvent) -> Vec<SessionUpdate> {
     match event {
         a2a::A2aEvent::TaskStatusUpdate { status, r#final, .. } => {
             if r#final {
-                // Терминальное событие обрабатывается отдельно вызывающим
-                // кодом — здесь не эмитим ничего.
+                // The terminal event is handled separately by the calling
+                // code — nothing is emitted here.
                 return Vec::new();
             }
             match status.message {
@@ -877,12 +877,12 @@ fn a2a_event_to_session_update(event: a2a::A2aEvent) -> Vec<SessionUpdate> {
     }
 }
 
-/// ИСПРАВЛЕНО (аудит P1-2): владелец берётся из хранилища, поэтому
-/// проверка переживает выселение сессии по TTL и рестарт шлюза.
+/// FIXED (audit P1-2): the owner is taken from the task store, so the
+/// check survives TTL session eviction and gateway restart.
 ///
-/// Задачи без записанного владельца (созданы до введения конвертов)
-/// не отклоняются по этому рубежу — иначе обновление шлюза сделало бы
-/// уже накопленные задачи недоступными их же владельцам.
+/// Tasks with no recorded owner (created before envelopes were introduced)
+/// are not rejected by this line — otherwise a gateway upgrade would make
+/// already accumulated tasks unavailable to their own owners.
 fn assert_owner_matches(stored: &OwnedTask, owner: Owner) -> anyhow::Result<()> {
     match stored.owner {
         Some(recorded) if recorded != owner => {
@@ -900,9 +900,9 @@ fn new_session_id() -> String {
     format!("sess-{}", unique_suffix())
 }
 
-/// ИСПРАВЛЕНО (аудит P1-3): был голый наносекундный таймстамп —
-/// предсказуемый, перечислимый и коллизионный при конкурентных вызовах,
-/// плюс unwrap() на системном времени. Теперь время + 96 бит энтропии.
+/// FIXED (audit P1-3): was a bare nanosecond timestamp —
+/// predictable, enumerable, collision-prone under concurrent calls,
+/// plus unwrap() on system time. Now time + 96 bits of entropy.
 pub(crate) fn unique_suffix() -> String {
     use std::io::Read;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -917,7 +917,7 @@ pub(crate) fn unique_suffix() -> String {
         .and_then(|mut f| f.read_exact(&mut buf))
         .is_ok();
     if !filled {
-        // Деградация без паники: монотонный счётчик вместо энтропии.
+        // Degradation without panic: a monotonic counter instead of entropy.
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         buf[..8].copy_from_slice(&n.to_le_bytes());
@@ -931,10 +931,10 @@ mod tests {
     use super::*;
     use protocol::acp::{InitializeResponse, NewSessionResponse, PlanEntry, ToolCallStatus};
 
-    /// T2 (Часть 3 роадмапа стриминга): каждый вариант SessionUpdate
-    /// маппится в A2aEvent без паники и без молчаливого дропа сигнала.
-    /// session_update_to_a2a_event — чистая функция, тестируется на всех
-    /// 5 вариантах напрямую (по Р-21 задел на будущий парсинг).
+    /// T2 (Part 3 of the streaming roadmap): each SessionUpdate variant
+    /// maps to an A2aEvent without panic and without silently dropping a signal.
+    /// session_update_to_a2a_event is a pure function, tested directly on all
+    /// 5 variants (per P-21, a stake in future parsing).
     #[test]
     fn agent_message_chunk_maps_to_working_status() {
         let update = SessionUpdate::AgentMessageChunk {
@@ -1060,19 +1060,19 @@ mod tests {
     }
 
 
-    /// Фейковый ACP-агент: отвечает фиксированным текстом и считает,
-    /// сколько ACP-сессий у него запросили.
+    /// Fake ACP agent: replies with fixed text and counts
+    /// how many ACP sessions were requested of it.
     #[derive(Default)]
     struct EchoAcpAgent {
         sessions_created: std::sync::atomic::AtomicUsize,
         last_prompt_session: std::sync::Mutex<Option<SessionId>>,
-        /// Имитация перезапуска процесса: поколение растёт, как у
-        /// SupervisedStdioAgent после респавна.
+        /// Simulated process restart: the generation grows, as in
+        /// SupervisedStdioAgent after a respawn.
         generation: std::sync::atomic::AtomicU64,
-        /// Процесс убит и ждёт ленивого перезапуска в ensure_ready().
+        /// Process is killed and waits for a lazy restart in ensure_ready().
         dead: std::sync::atomic::AtomicBool,
-        /// Было ли рукопожатие. Протокол-строгий агент обязан требовать
-        /// initialize до session/new — фейк это имитирует.
+        /// Whether the handshake happened. A protocol-strict agent must require
+        /// initialize before session/new — the fake imitates this.
         initialized: std::sync::atomic::AtomicBool,
         initialize_calls: std::sync::atomic::AtomicUsize,
     }
@@ -1082,9 +1082,9 @@ mod tests {
             self.generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
 
-        /// Процесс убит, но перезапуска ещё не было — поколение
-        /// поднимется только внутри ensure_ready(), как у настоящего
-        /// SupervisedStdioAgent с ленивым респавном.
+        /// Process killed but not restarted yet — the generation
+        /// bumps only inside ensure_ready(), like a real
+        /// SupervisedStdioAgent with lazy respawn.
         fn simulate_kill(&self) {
             self.dead.store(true, std::sync::atomic::Ordering::SeqCst);
         }
@@ -1110,8 +1110,8 @@ mod tests {
             if !self.initialized.load(std::sync::atomic::Ordering::SeqCst) {
                 anyhow::bail!("session/new без предшествующего initialize");
             }
-            // Счётчик: каждая новая сессия получает свой id — иначе
-            // изоляцию разговоров нечем отличить от её отсутствия.
+            // Counter: each new session gets its own id — otherwise
+            // conversation isolation is indistinguishable from its absence.
             let n = self.sessions_created.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(NewSessionResponse { session_id: SessionId(format!("sess-{n}")) })
         }
@@ -1131,13 +1131,13 @@ mod tests {
             Ok(())
         }
 
-        /// Ленивый респавн ровно как у супервизора: смерть процесса
-        /// обнаруживается здесь, и здесь же растёт поколение.
+        /// Lazy respawn exactly as in the supervisor: process death
+        /// is detected here, and the generation grows here too.
         async fn ensure_ready(&self) -> anyhow::Result<()> {
             if self.dead.swap(false, std::sync::atomic::Ordering::SeqCst) {
                 self.generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                // Свежий процесс не инициализирован: рукопожатие входит
-                // в подъём процесса, как в SupervisedStdioAgent.
+                // A fresh process is uninitialized: the handshake is part
+                // of the process bring-up, as in SupervisedStdioAgent.
                 self.initialized.store(false, std::sync::atomic::Ordering::SeqCst);
             }
             if !self.initialized.load(std::sync::atomic::Ordering::SeqCst) {
@@ -1179,8 +1179,8 @@ mod tests {
         }
     }
 
-    /// Регрессия на аудит P2-1: ответ агента раньше выбрасывался и
-    /// A2A-клиент получал Task вообще без Part'ов.
+    /// Regression for audit P2-1: the agent reply was previously discarded and
+    /// the A2A client got a Task with no Parts at all.
     #[tokio::test]
     async fn send_task_carries_agent_content_back() {
         let dir = tempfile::tempdir().unwrap();
@@ -1205,8 +1205,8 @@ mod tests {
         assert!(matches!(message.role, MessageRole::Agent));
     }
 
-    /// Регрессия на аудит P2-4: cancel_task возвращал пустышку с пустым
-    /// context_id и затирал сохранённую задачу.
+    /// Regression for audit P2-4: cancel_task returned a stub with an empty
+    /// context_id and wiped the stored task.
     #[tokio::test]
     async fn cancel_task_preserves_original_task() {
         let dir = tempfile::tempdir().unwrap();
@@ -1225,7 +1225,7 @@ mod tests {
         assert_eq!(canceled.context_id.0, "ctx", "context_id не должен теряться");
     }
 
-    /// Регрессия на аудит P2-13: любой File превращался в Image.
+    /// Regression for audit P2-13: any File was turned into an Image.
     #[test]
     fn non_image_file_part_is_not_forced_to_image() {
         let pdf = Part::File {
@@ -1247,14 +1247,14 @@ mod tests {
         assert!(matches!(part_to_content_block(wav), ContentBlock::Audio { .. }));
     }
 
-    /// Регрессия на аудит P2-6: input-required ронял весь ход.
+    /// Regression for audit P2-6: input-required took down the whole turn.
     #[test]
     fn input_required_does_not_fail_the_turn() {
         assert!(task_state_to_stop_reason(TaskState::InputRequired).is_ok());
         assert!(task_state_to_stop_reason(TaskState::AuthRequired).is_ok());
     }
 
-    /// Регрессия на аудит P1-3: id больше не голый таймстамп.
+    /// Regression for audit P1-3: the id is no longer a bare timestamp.
     #[test]
     fn unique_suffix_is_unique_and_not_bare_timestamp() {
         let a = unique_suffix();
@@ -1265,7 +1265,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // Регрессии на аудит P1-1: изоляция разговоров
+    // Regressions for audit P1-1: conversation isolation
     // ---------------------------------------------------------------
 
     fn adapter_for_test(dir: &std::path::Path) -> AcpAsA2a<EchoAcpAgent> {
@@ -1278,8 +1278,8 @@ mod tests {
         )
     }
 
-    /// Главная регрессия: раньше `session` была одна на весь адаптер,
-    /// и два клиента разговаривали в общей ACP-сессии.
+    /// Main regression: previously `session` was single for the whole adapter,
+    /// and two clients talked in one shared ACP session.
     #[tokio::test]
     async fn different_contexts_get_different_acp_sessions() {
         let dir = tempfile::tempdir().unwrap();
@@ -1298,8 +1298,8 @@ mod tests {
         assert_eq!(adapter.active_sessions().await, 2);
     }
 
-    /// Тот же контекст того же клиента — та же сессия, разговор
-    /// продолжается, а не начинается заново на каждое сообщение.
+    /// Same context of the same client — same session; the conversation
+    /// continues rather than restarting on every message.
     #[tokio::test]
     async fn same_context_reuses_session() {
         let dir = tempfile::tempdir().unwrap();
@@ -1317,7 +1317,7 @@ mod tests {
         assert_eq!(adapter.inner.sessions_created.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
-    /// Угаданный чужой contextId не подключает к чужому разговору.
+    /// A guessed foreign contextId does not attach to someone else's conversation.
     #[tokio::test]
     async fn foreign_owner_cannot_join_context() {
         let dir = tempfile::tempdir().unwrap();
@@ -1334,7 +1334,7 @@ mod tests {
         assert!(attempt.is_err(), "чужой contextId должен отклоняться");
     }
 
-    /// Чужую задачу нельзя прочитать, пока её разговор жив.
+    /// Someone else's task cannot be read while its conversation is alive.
     #[tokio::test]
     async fn foreign_owner_cannot_read_task() {
         let dir = tempfile::tempdir().unwrap();
@@ -1350,8 +1350,8 @@ mod tests {
         assert!(adapter.cancel_task_as(mallory, TaskId("t-1".into())).await.is_err());
     }
 
-    /// Анонимные вызовы (голый трейт) — своя корзина, не сливаются
-    /// с разговорами токенных клиентов.
+    /// Anonymous calls (bare trait) — a separate bucket, not merged
+    /// with conversations of token clients.
     #[tokio::test]
     async fn anonymous_is_isolated_from_token_owners() {
         let dir = tempfile::tempdir().unwrap();
@@ -1364,7 +1364,7 @@ mod tests {
         assert!(via_trait.is_err());
     }
 
-    /// Простаивающие разговоры выселяются, иначе HashMap растёт вечно.
+    /// Idle conversations are evicted, otherwise the HashMap grows forever.
     #[tokio::test]
     async fn idle_sessions_are_evicted_by_ttl() {
         let dir = tempfile::tempdir().unwrap();
@@ -1383,12 +1383,12 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(80)).await;
 
-        // Обращение с другим контекстом заодно прогоняет выселение.
+        // A request with another context also runs the eviction pass.
         adapter.send_task_as(owner, task_in_context("t-2", "ctx-new", "два")).await.unwrap();
         assert_eq!(adapter.active_sessions().await, 1, "просроченный разговор должен быть выселен");
     }
 
-    /// Отмена работает по разговору задачи, а не по «текущей» сессии.
+    /// Cancel works by the task's conversation, not by the 'current' session.
     #[tokio::test]
     async fn cancel_resolves_session_by_task_context() {
         let dir = tempfile::tempdir().unwrap();
@@ -1404,12 +1404,12 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // Регрессии на аудит P1-2: атрибуция переживает жизнь сессии
+    // Regressions for audit P1-2: attribution survives the session's lifetime
     // ---------------------------------------------------------------
 
-    /// Главная регрессия P1-2: раньше проверка владельца держалась
-    /// только на живом реестре сессий, поэтому после выселения по TTL
-    /// чужая задача снова становилась доступна любому токену.
+    /// Main P1-2 regression: previously the owner check relied
+    /// only on the live session registry, so after TTL eviction
+    /// someone else's task became available to any token again.
     #[tokio::test]
     async fn foreign_owner_denied_after_session_eviction() {
         let dir = tempfile::tempdir().unwrap();
@@ -1427,11 +1427,11 @@ mod tests {
 
         adapter.send_task_as(alice, task_in_context("t-1", "ctx-secret", "тайна")).await.unwrap();
 
-        // Выселяем разговор: обращение с другим контекстом прогоняет TTL.
+        // Evict the conversation: a request with another context runs the TTL pass.
         tokio::time::sleep(Duration::from_millis(80)).await;
         adapter.send_task_as(mallory, task_in_context("t-2", "ctx-other", "своё")).await.unwrap();
 
-        // Сессия alice забыта, но атрибуция задачи осталась в хранилище.
+        // Alice's session is forgotten, but the task attribution remained in the store.
         assert!(
             adapter.get_task_as(mallory, TaskId("t-1".into())).await.is_err(),
             "чужая задача не должна открываться после выселения сессии"
@@ -1439,8 +1439,8 @@ mod tests {
         assert!(adapter.get_task_as(alice, TaskId("t-1".into())).await.is_ok());
     }
 
-    /// Атрибуция переживает рестарт процесса: новый адаптер над тем же
-    /// каталогом хранилища по-прежнему различает владельцев.
+    /// Attribution survives a process restart: a new adapter over the same
+    /// task-store directory still distinguishes owners.
     #[tokio::test]
     async fn ownership_survives_restart() {
         let dir = tempfile::tempdir().unwrap();
@@ -1452,7 +1452,7 @@ mod tests {
             adapter.send_task_as(alice, task_in_context("t-1", "ctx-1", "привет")).await.unwrap();
         }
 
-        // Новый адаптер = пустой реестр сессий, как после рестарта.
+        // New adapter = empty session registry, as after a restart.
         let restarted = adapter_for_test(dir.path());
         assert_eq!(restarted.active_sessions().await, 0);
 
@@ -1460,7 +1460,7 @@ mod tests {
         assert!(restarted.get_task_as(alice, TaskId("t-1".into())).await.is_ok());
     }
 
-    /// Анонимный вызов не должен вскрывать задачи токенных клиентов.
+    /// An anonymous call must not expose tasks owned by token clients.
     #[tokio::test]
     async fn anonymous_cannot_read_token_owned_task() {
         let dir = tempfile::tempdir().unwrap();
@@ -1473,12 +1473,12 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // Регрессии на аудит P2-10: перезапуск агента помечает разговоры
+    // Regressions for audit P2-10: agent restart marks conversations
     // ---------------------------------------------------------------
 
-    /// Главная регрессия: после перезапуска агента обращение к старому
-    /// разговору должно дать явную ошибку потери контекста, а не тихо
-    /// продолжиться в пустой сессии, где агент ничего не помнит.
+    /// Main regression: after an agent restart, a request to an old
+    /// conversation must give an explicit context-lost error, not silently
+    /// continue in an empty session where the agent remembers nothing.
     #[tokio::test]
     async fn restart_marks_old_context_as_lost() {
         let dir = tempfile::tempdir().unwrap();
@@ -1501,8 +1501,8 @@ mod tests {
         );
     }
 
-    /// Пометка одноразовая: клиент узнал о потере — следующий запрос с
-    /// тем же contextId начинает разговор заново и работает.
+    /// The mark is one-shot: the client learned about the loss — the next request
+    /// with the same contextId starts the conversation anew and works.
     #[tokio::test]
     async fn context_recovers_after_lost_notice() {
         let dir = tempfile::tempdir().unwrap();
@@ -1517,13 +1517,13 @@ mod tests {
             .await
             .is_err());
 
-        // Второе обращение уже создаёт свежую сессию нового поколения.
+        // The second call already creates a fresh session of the new generation.
         adapter.send_task_as(owner, task_in_context("t-3", "ctx-1", "три")).await.unwrap();
         assert_eq!(adapter.active_sessions().await, 1);
     }
 
-    /// Перезапуск не должен превращаться в дыру: чужой contextId
-    /// отклоняется по владельцу раньше, чем сработает пометка.
+    /// The restart must not turn into a hole: a foreign contextId
+    /// is rejected by owner before the mark kicks in.
     #[tokio::test]
     async fn restart_does_not_bypass_ownership_check() {
         let dir = tempfile::tempdir().unwrap();
@@ -1546,7 +1546,7 @@ mod tests {
         );
     }
 
-    /// Разговоры, заведённые уже после перезапуска, не помечаются.
+    /// Conversations created after the restart are not marked.
     #[tokio::test]
     async fn new_contexts_after_restart_are_not_marked() {
         let dir = tempfile::tempdir().unwrap();
@@ -1561,16 +1561,16 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // Регрессии на дефекты, найденные live-тестом на claurst
+    // Regressions for defects found by the live test on claurst
     // ---------------------------------------------------------------
 
-    /// Дефект 1 из live-теста: при ленивом респавне поколение читалось
-    /// ДО перезапуска, сверка проходила, промпт уходил в свежий процесс
-    /// со старым sessionId, и клиент получал «Invalid params» от агента.
-    /// ContextLost срабатывал только со второго обращения.
+    /// Defect 1 from the live test: on lazy respawn the generation was read
+    /// BEFORE the restart, the comparison passed, the prompt went to the fresh
+    /// process with the old sessionId, and the client got 'Invalid params' from the agent.
+    /// ContextLost triggered only on the second request.
     ///
-    /// Здесь агент убит, но ещё не перезапущен — ровно то состояние,
-    /// в котором приходит ПЕРВЫЙ запрос после kill.
+    /// Here the agent is killed but not yet restarted — exactly the state
+    /// in which the FIRST request after kill arrives.
     #[tokio::test]
     async fn first_request_after_kill_reports_context_lost() {
         let dir = tempfile::tempdir().unwrap();
@@ -1579,7 +1579,7 @@ mod tests {
 
         adapter.send_task_as(owner, task_in_context("t-1", "ctx-1", "запомни 42")).await.unwrap();
 
-        // Процесс убит; перезапуск произойдёт лениво, внутри вызова.
+        // Process killed; restart will happen lazily, inside the call.
         adapter.inner.simulate_kill();
 
         let err = adapter
@@ -1594,8 +1594,8 @@ mod tests {
         );
     }
 
-    /// И сразу после пометки разговор восстанавливается — одного
-    /// уведомления клиенту достаточно.
+    /// And right after the mark the conversation recovers — one
+    /// notification is enough for the client.
     #[tokio::test]
     async fn context_recovers_right_after_kill_notice() {
         let dir = tempfile::tempdir().unwrap();
@@ -1614,23 +1614,23 @@ mod tests {
         assert_eq!(adapter.active_sessions().await, 1);
     }
 
-    /// Регрессия на дефект, найденный при разборе live-теста: initialize
-    /// звался только из card(), поэтому клиент, идущий сразу в
-    /// message/send, доводил агента до session/new без рукопожатия.
+    /// Regression for a defect found while dissecting the live test: initialize
+    /// was called only from card(), so a client going straight to
+    /// message/send drove the agent to session/new without a handshake.
     #[tokio::test]
     async fn handshake_precedes_first_session() {
         let dir = tempfile::tempdir().unwrap();
         let adapter = adapter_for_test(dir.path());
         let owner = Owner::from_token("token-alice");
 
-        // card() не вызывался — путь ровно как у message/send.
+        // card() was not called — the path is exactly as in message/send.
         adapter.send_task_as(owner, task_in_context("t-1", "ctx-1", "привет")).await.unwrap();
 
         assert!(adapter.inner.initialized.load(std::sync::atomic::Ordering::SeqCst));
     }
 
-    /// И, что важнее, после перезапуска свежий процесс тоже получает
-    /// рукопожатие — раньше он не получал его никогда.
+    /// And, more importantly, after a restart the fresh process also gets
+    /// the handshake — previously it never got one.
     #[tokio::test]
     async fn handshake_repeats_after_restart() {
         let dir = tempfile::tempdir().unwrap();
@@ -1641,12 +1641,12 @@ mod tests {
         let before = adapter.inner.initialize_calls.load(std::sync::atomic::Ordering::SeqCst);
 
         adapter.inner.simulate_kill();
-        // Первое обращение сообщает о потере контекста...
+        // The first call reports context loss...
         assert!(adapter
             .send_task_as(owner, task_in_context("t-2", "ctx-1", "два"))
             .await
             .is_err());
-        // ...но рукопожатие с новым процессом уже состоялось.
+        // ...but the handshake with the new process has already happened.
         let after = adapter.inner.initialize_calls.load(std::sync::atomic::Ordering::SeqCst);
         assert!(after > before, "свежий процесс должен получить initialize");
 
@@ -1654,10 +1654,10 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // Регрессии на аудит P2-8: утечка TurnLease по клиентским sessionId
+    // Regressions for audit P2-8: TurnLease leak via client sessionIds
     // ---------------------------------------------------------------
 
-    /// Фейковый A2A-агент для проверки ACP-стороны конвертера.
+    /// Fake A2A agent to check the ACP side of the converter.
     struct StubA2aAgent;
 
     #[async_trait]
@@ -1714,9 +1714,9 @@ mod tests {
         }
     }
 
-    /// Главная регрессия: раньше prompt принимал ЛЮБОЙ sessionId и
-    /// заводил под него запись в лизе. Клиент с валидным токеном мог
-    /// забивать память шлюза, генерируя идентификаторы на лету.
+    /// Main regression: previously prompt accepted ANY sessionId and
+    /// created a lease entry for it. A client with a valid token could
+    /// stuff the gateway's memory by generating identifiers on the fly.
     #[tokio::test]
     async fn prompt_with_unknown_session_is_rejected() {
         let adapter = A2aAsAcp::new(StubA2aAgent, Duration::from_secs(5));
@@ -1736,7 +1736,7 @@ mod tests {
         );
     }
 
-    /// session/cancel освобождает и сессию, и запись в лизе.
+    /// session/cancel frees both the session and the lease entry.
     #[tokio::test]
     async fn cancel_releases_lease_entry() {
         let adapter = A2aAsAcp::new(StubA2aAgent, Duration::from_secs(5));
@@ -1753,7 +1753,7 @@ mod tests {
         assert_eq!(adapter.leased_sessions().await, 0, "лиз должен быть освобождён");
     }
 
-    /// Долгое соединение с множеством закрытых сессий не копит записи.
+    /// A long connection with many closed sessions does not accumulate entries.
     #[tokio::test]
     async fn long_connection_does_not_accumulate_lease_entries() {
         let adapter = A2aAsAcp::new(StubA2aAgent, Duration::from_secs(5));
@@ -1769,8 +1769,8 @@ mod tests {
         assert_eq!(adapter.leased_sessions().await, 0);
     }
 
-    /// Клиент, который не закрывает сессии, упирается в потолок, а не
-    /// в память шлюза.
+    /// A client that does not close sessions hits the cap, not
+    /// the gateway's memory.
     #[tokio::test]
     async fn open_sessions_hit_the_cap() {
         let adapter = A2aAsAcp::new(StubA2aAgent, Duration::from_secs(5));
@@ -1785,7 +1785,7 @@ mod tests {
         );
     }
 
-    /// Простаивающие сессии выселяются вместе с записями в лизе.
+    /// Idle sessions are evicted together with their lease entries.
     #[tokio::test]
     async fn idle_sessions_release_lease_entries() {
         let adapter = A2aAsAcp::with_session_ttl(
@@ -1800,16 +1800,16 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(80)).await;
 
-        // Любое обращение прогоняет выселение.
+        // Any request runs the eviction pass.
         adapter.new_session(new_session_req()).await.unwrap();
 
         assert_eq!(adapter.active_sessions().await, 1, "остаётся только свежая сессия");
         assert_eq!(adapter.leased_sessions().await, 0, "лиз просроченной сессии освобождён");
     }
 
-    /// Регрессия на аудит P2-12: AgentCard.url был пустым, из-за чего
-    /// карточка невалидна по A2A-спеке — а agent.json это первое, что
-    /// читает внешний клиент.
+    /// Regression for audit P2-12: AgentCard.url was empty, making the
+    /// card invalid per the A2A spec — and agent.json is the first thing
+    /// an external client reads.
     #[tokio::test]
     async fn agent_card_carries_public_url() {
         let dir = tempfile::tempdir().unwrap();

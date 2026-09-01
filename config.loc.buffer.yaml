@@ -1,10 +1,10 @@
-# config.loc.buffer.yaml — локальный конфиг буфера (Фаза 1).
-# Рабочий конфиг шлюза для разработки/локального запуска стриминга
-# с durable-буфером событий. Плюс к базовым секциям (как config.example.yaml)
-# включает event_log + task_store на SQLite.
+# config.loc.buffer.yaml — local buffer config (Phase 1).
+# Working gateway config for development/local launch of streaming
+# with a durable event buffer. On top of the base sections (like config.example.yaml)
+# it includes event_log + task_store on SQLite.
 #
-# Запуск: gatewayd config.loc.buffer.yaml
-# Проверка после старта: ls -la /tmp/gateway/ → event_log.db, task_store.db
+# Run: gatewayd config.loc.buffer.yaml
+# Post-start check: ls -la /tmp/gateway/ → event_log.db, task_store.db
 
 listen: "0.0.0.0:8347"
 http_listen: "0.0.0.0:8348"
@@ -34,29 +34,29 @@ turn_lease_timeout_secs: 30
 agent_call_timeout_secs: 120
 
 
-# --- Буферный конфиг (Фаза 1) ---
+# --- Buffer config (Phase 1) ---
 
-# Durable-буфер событий стрима: источник истины для tasks/resubscribe (T4).
-# Каждое A2aEvent/StreamEvent пишется с монотонным seq (по задаче) в sqlite.
+# Durable stream-event buffer: source of truth for tasks/resubscribe (T4).
+# Each A2aEvent/StreamEvent is written with a monotonic seq (per task) into sqlite.
 event_log:
   enabled: true
   storage_backend: sqlite
   storage_path: /tmp/gateway/event_log.db
   max_size_mb: 100
 
-# Durable-хранилище задач. enabled: true переключает с файлового
-# TaskStore (core/src/task_store.rs) на sqlite.
+# Durable task storage. enabled: true switches from the file-based
+# TaskStore (core/src/task_store.rs) to sqlite.
 task_store:
   enabled: true
   storage_backend: sqlite
   storage_path: /tmp/gateway/task_store.db
   max_size_mb: 500
 
-# --- Фаза 5: журнал + health-мониторинг ---
+# --- Phase 5: journal + health monitoring ---
 
-# Durable-журнал событий для пользователя: health-алерты, обрывы стримов,
-# апрувы. Один фоновый writer-таск, самоочистка по retention_days и
-# max_size_mb. Просмотр — позже CLI-модулем (не через внешний sqlite3).
+# Durable event journal for the user: health alerts, stream drops,
+# approvals. One background writer task, self-cleanup by retention_days and
+# max_size_mb. Viewing — later via a CLI module (not through external sqlite3).
 journal:
   enabled: true
   storage_backend: sqlite
@@ -64,22 +64,22 @@ journal:
   max_size_mb: 100
   retention_days: 30
 
-# Health-мониторинг: периодическая сводка размеров БД (event_log,
-# task_store, journal) и занятости слотов стримов. Алерты по занятости
-# БД пишутся в журнал + tracing; сводка — каждые check_interval_secs.
+# Health monitoring: periodic summary of DB sizes (event_log,
+# task_store, journal) and stream slot occupancy. Alerts on DB
+# occupancy are written to the journal + tracing; summary — every check_interval_secs.
 health:
   enabled: true
   check_interval_secs: 300
   db_size_warn_pct: 80
 
-# --- Фаза 7: апрув агентов через CLI ---
+# --- Phase 7: agent approvals via CLI ---
 
-# Человеческий контроль над тем, кого гейтвей обслуживает. Новый агент из
-# config.yaml попадает в статус pending и НЕ запускается, пока не одобрен:
-#   gatewayd --approvals          # список статусов
-#   gatewayd --approve <name>     # одобрить
-#   gatewayd --reject <name>      # отклонить
-# Если command/cwd/url агента меняется — нужен повторный апрув.
+# Human control over whom the gateway serves. A new agent from
+# config.yaml lands in pending status and is NOT started until approved:
+#   gatewayd --approvals          # list statuses
+#   gatewayd --approve <name>     # approve
+#   gatewayd --reject <name>      # reject
+# If the agent's command/cwd/url changes — re-approval is required.
 approvals:
   enabled: true
   storage_path: /tmp/gateway/approvals.db

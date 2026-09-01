@@ -1,8 +1,8 @@
 //! core/src/task_store.rs
 //!
-//! Файловое хранилище задач: закрывает get_task в AcpAsA2a (см. §5.3 ТЗ).
-//! Один JSON-файл на задачу, atomic write через tmp+rename, переживает
-//! рестарт процесса (но не обязательно reboot машины, если base_dir = /tmp).
+//! File-backed task store: backs get_task in AcpAsA2a (see §5.3 of the spec).
+//! One JSON file per task, atomic write via tmp+rename, survives
+//! a process restart (but not necessarily a machine reboot if base_dir = /tmp).
 
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
@@ -13,13 +13,13 @@ use tokio::fs;
 
 use crate::owner::Owner;
 
-/// ИСПРАВЛЕНО (аудит P1-2): раньше на диск ложился голый Task, и понять,
-/// чья это задача, было невозможно — tasks/get отдавал любую задачу
-/// любому предъявителю валидного токена. Теперь задача обёрнута
-/// конвертом с владельцем.
+/// FIXED (audit P1-2): previously a bare Task was written to disk, and telling
+/// whose task it was was impossible — tasks/get served any task
+/// to anyone presenting a valid token. Now the task is wrapped
+/// in an envelope carrying the owner.
 ///
-/// Владелец в конверте, а не в Task.metadata, намеренно: metadata видна
-/// клиенту в ответе, а внутренняя атрибуция туда не относится.
+/// The owner is in the envelope, not in Task.metadata, on purpose: metadata is visible
+/// to the client in the response, and internal attribution does not belong there.
 #[derive(Debug, Serialize, Deserialize)]
 struct StoredTask {
     #[serde(default)]
@@ -27,8 +27,8 @@ struct StoredTask {
     task: Task,
 }
 
-/// Прочитанная задача вместе с атрибуцией. `owner == None` означает
-/// запись, сделанную до введения конвертов (старый формат файла).
+/// A loaded task together with its attribution. `owner == None` means
+/// a record written before envelopes were introduced (old file format).
 #[derive(Debug)]
 pub struct OwnedTask {
     pub task: Task,
@@ -39,15 +39,15 @@ pub struct TaskStore {
     base_dir: PathBuf,
 }
 
-/// Сколько задача живёт в хранилище после последней записи.
+/// How long a task lives in the task store after its last write.
 ///
-/// ДОБАВЛЕНО: `delete` существовал, но не вызывался ниоткуда — в коде
-/// это было помечено как «оставлено на Фазу 1.1». В проде такой файл на
-/// задачу копится бесконечно и заполняет диск за недели, поэтому уборка
-/// нужна сразу, а не в следующей фазе.
+/// ADDED: `delete` existed but was never called from anywhere — the code
+/// marked that as "left for Phase 1.1". In production such a file per
+/// task accumulates forever and fills the disk within weeks, so cleanup
+/// is needed right away, not in the next phase.
 ///
-/// Неделя, а не часы: клиент имеет право забрать результат через
-/// tasks/get спустя долгое время после завершения задачи.
+/// A week, not hours: the client is entitled to fetch the result via
+/// tasks/get long after the task has completed.
 pub const DEFAULT_TASK_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 impl TaskStore {
@@ -70,7 +70,7 @@ impl TaskStore {
         let json = serde_json::to_vec_pretty(&stored)?;
         fs::write(&tmp_path, &json).await?;
 
-        // Atomic rename: читатель никогда не увидит недописанный файл.
+        // Atomic rename: a reader will never see a partially written file.
         fs::rename(&tmp_path, &final_path).await?;
         Ok(())
     }
@@ -79,9 +79,9 @@ impl TaskStore {
         Ok(self.load_owned(id).await?.task)
     }
 
-    /// Задача вместе с владельцем. Файлы старого формата (голый Task,
-    /// без конверта) читаются как `owner: None` — иначе обновление
-    /// шлюза обесценило бы уже накопленное хранилище.
+    /// The task together with its owner. Old-format files (bare Task,
+    /// without an envelope) are read as `owner: None` — otherwise a gateway
+    /// update would invalidate the already accumulated task store.
     pub async fn load_owned(&self, id: &TaskId) -> anyhow::Result<OwnedTask> {
         let path = self.path_for(id);
         let bytes = fs::read(&path).await.map_err(|e| {
@@ -91,7 +91,7 @@ impl TaskStore {
         match serde_json::from_slice::<StoredTask>(&bytes) {
             Ok(stored) => Ok(OwnedTask { task: stored.task, owner: stored.owner }),
             Err(envelope_err) => {
-                // Старый формат: файл содержит Task напрямую.
+                // Old format: the file contains a Task directly.
                 let task: Task = serde_json::from_slice(&bytes).map_err(|legacy_err| {
                     anyhow::anyhow!(
                         "task {id:?}: не разобрать ни как конверт ({envelope_err}), \
@@ -109,15 +109,15 @@ impl TaskStore {
         Ok(())
     }
 
-    /// Удаляет задачи, не обновлявшиеся дольше ttl. Возвращает число
-    /// удалённых файлов.
+    /// Deletes tasks not updated for longer than ttl. Returns the number
+    /// of deleted files.
     ///
-    /// Возраст берётся по mtime файла, а не по timestamp внутри задачи:
-    /// mtime обновляется атомарной записью и не зависит от того, что
-    /// агент положил в поле времени (а положить он может что угодно
-    /// или ничего).
+    /// Age is taken from the file mtime, not from the timestamp inside the task:
+    /// mtime is refreshed by the atomic write and does not depend on what
+    /// the agent put into the time field (and it may put anything
+    /// or nothing at all).
     ///
-    /// Отсутствие каталога — не ошибка: до первой задачи его нет.
+    /// A missing directory is not an error: it does not exist before the first task.
     pub async fn sweep_expired(&self, ttl: Duration) -> anyhow::Result<usize> {
         let mut dir = match fs::read_dir(&self.base_dir).await {
             Ok(dir) => dir,
@@ -131,8 +131,8 @@ impl TaskStore {
         while let Some(entry) = dir.next_entry().await? {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                // .json.tmp — недописанный файл чужой атомарной записи,
-                // трогать его нельзя.
+                // .json.tmp — a half-written file from someone else's atomic write;
+                // it must not be touched.
                 continue;
             }
 
@@ -191,12 +191,12 @@ mod tests {
 
 
 
-    /// НАЙДЕНО тестом: sanitize_task_id вырезает все не-ASCII символы,
-    /// поэтому два разных не-ASCII идентификатора дают ОДНО имя файла и
-    /// затирают друг друга. Сейчас невоспроизводимо снаружи — id
-    /// генерирует сам шлюз и они ASCII, — но фиксируем поведение, чтобы
-    /// оно не стало дырой, если id когда-нибудь начнут принимать от
-    /// клиента.
+    /// FOUND by test: sanitize_task_id strips all non-ASCII characters,
+    /// so two different non-ASCII identifiers yield ONE file name and
+    /// overwrite each other. Currently not reproducible from the outside — ids
+    /// are generated by the gateway itself and they are ASCII — but we pin the
+    /// behavior so it does not become a hole if ids ever start being accepted
+    /// from the client.
     #[test]
     fn non_ascii_ids_collapse_to_same_name() {
         assert_eq!(sanitize_task_id("задача"), sanitize_task_id("другая"));
@@ -212,7 +212,7 @@ mod tests {
         store.save(&sample_task("task-fresh"), owner).await.unwrap();
         store.save(&sample_task("task-stale"), owner).await.unwrap();
 
-        // Состариваем один файл, сдвигая его mtime в прошлое.
+        // Age one file by shifting its mtime into the past.
         let old_path = dir.path().join("task-stale.json");
         let long_ago = std::time::SystemTime::now() - Duration::from_secs(60 * 60 * 24 * 30);
         filetime::set_file_mtime(&old_path, filetime::FileTime::from_system_time(long_ago))
@@ -225,7 +225,7 @@ mod tests {
         assert!(store.load(&TaskId("task-stale".into())).await.is_err());
     }
 
-    /// Недописанные файлы чужой атомарной записи трогать нельзя.
+    /// Half-written files from someone else's atomic write must not be touched.
     #[tokio::test]
     async fn sweep_ignores_tmp_files() {
         let dir = tempfile::tempdir().unwrap();
@@ -242,7 +242,7 @@ mod tests {
         assert!(tmp.exists(), ".json.tmp не должен убираться");
     }
 
-    /// До первой задачи каталога нет — это не ошибка.
+    /// Before the first task the directory does not exist — that is not an error.
     #[tokio::test]
     async fn sweep_on_missing_dir_is_not_an_error() {
         let store = TaskStore::new("/tmp/точно-нет-такого-каталога-gateway");
@@ -262,14 +262,14 @@ mod tests {
         assert_eq!(loaded.task.id.0, "task-owned");
     }
 
-    /// Файлы, записанные до введения конвертов, должны читаться —
-    /// иначе обновление шлюза обесценивает накопленное хранилище.
+    /// Files written before envelopes were introduced must stay readable —
+    /// otherwise a gateway update invalidates the accumulated task store.
     #[tokio::test]
     async fn legacy_bare_task_file_is_still_readable() {
         let dir = tempfile::tempdir().unwrap();
         let store = TaskStore::new(dir.path());
 
-        // Пишем в старом формате: голый Task, без конверта.
+        // Write in the old format: bare Task, without an envelope.
         let task = sample_task("task-legacy");
         let path = dir.path().join("task-legacy.json");
         tokio::fs::write(&path, serde_json::to_vec_pretty(&task).unwrap()).await.unwrap();

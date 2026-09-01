@@ -1,13 +1,13 @@
 //! gatewayd/tests/streaming_tcp.rs
 //!
-//! T4 (Часть 3 роадмапа стриминга): TCP-клиент направления 3 получает
-//! построчные session/update-нотификации от A2A-агента, отвечающего SSE.
+//! T4 (Part 3 of the streaming roadmap): a TCP client of direction 3 receives
+//! line-by-line session/update notifications from an A2A agent answering with SSE.
 //!
-//! Цепочка: TCP-клиент -> gatewayd (transport_tcp, A2aAsAcp) ->
-//! HttpA2aAgent (SSE-клиент, core/src/http_agent.rs) -> mock A2A-сервер
-//! (text/event-stream). HttpA2aAgent::send_task возвращает Reply::Streaming,
-//! A2aAsAcp::prompt транслирует A2aEvent -> SessionUpdate, transport_tcp
-//! пишет построчно в TCP-сокет как session/update нотификации.
+//! Chain: TCP client -> gatewayd (transport_tcp, A2aAsAcp) ->
+//! HttpA2aAgent (SSE client, core/src/http_agent.rs) -> mock A2A server
+//! (text/event-stream). HttpA2aAgent::send_task returns Reply::Streaming,
+//! A2aAsAcp::prompt translates A2aEvent -> SessionUpdate, transport_tcp
+//! writes line by line to the TCP socket as session/update notifications.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -19,13 +19,13 @@ use axum::Router;
 use gatewayd::registry::{AgentEntry, Registry, Transport};
 use protocol::a2a::{A2aEvent, Message, MessageRole, Part, TaskId, TaskState, TaskStatus};
 
-/// Mock A2A-сервер: message/send отвечает SSE-потоком из двух A2aEvent
-/// (working, затем completed). ВАЖНО: события сериализуются через
-/// serde_json::to_string(&A2aEvent) — ТОЧНО так же, как это делает
-/// прод stream_to_sse (gatewayd/src/transport_http.rs). Никакого ручного
-/// JSON-хардкода: формат (snake_case task_id, kebab-case state, lowercase
-/// role) берётся из serde-атрибутов реальных типов и не может
-/// рассинхронизироваться.
+/// Mock A2A server: message/send replies with an SSE stream of two A2aEvent
+/// items (working, then completed). IMPORTANT: events are serialized via
+/// serde_json::to_string(&A2aEvent) — EXACTLY the same way production
+/// stream_to_sse does (gatewayd/src/transport_http.rs). No manual
+/// JSON hardcoding: the format (snake_case task_id, kebab-case state, lowercase
+/// role) comes from the serde attributes of the real types and cannot
+/// drift out of sync.
 async fn spawn_mock_sse_server() -> String {
     let app = Router::new().route(
         "/a2a",
@@ -67,7 +67,7 @@ async fn spawn_mock_sse_server() -> String {
     format!("http://{addr}/a2a")
 }
 
-/// Поднимает transport_tcp::serve с Http-агентом (ведущим на mock SSE-сервер).
+/// Spins up transport_tcp::serve with an Http agent (pointing at the mock SSE server).
 async fn spawn_tcp_gateway(a2a_url: String) -> String {
     let tokens: HashSet<String> = ["t-test".to_string()].into_iter().collect();
     let mut agents = HashMap::new();
@@ -85,7 +85,7 @@ async fn spawn_tcp_gateway(a2a_url: String) -> String {
     );
     let registry = std::sync::Arc::new(Registry::new(tokens, agents));
 
-    // Узнаём свободный порт: bind на 0, читаем адрес, освобождаем.
+    // Learn a free port: bind on 0, read the address, release.
     let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = probe.local_addr().unwrap().to_string();
     drop(probe);
@@ -104,7 +104,7 @@ async fn spawn_tcp_gateway(a2a_url: String) -> String {
         .await;
     });
 
-    // Даём шлюзу мгновение на bind.
+    // Give the gateway a moment to bind.
     tokio::time::sleep(Duration::from_millis(50)).await;
     addr
 }
@@ -122,7 +122,7 @@ async fn tcp_client_receives_session_update_notifications() {
         .expect("TCP-шлюз принимает");
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-    // Handshake: ACP-клиент представляется.
+    // Handshake: the ACP client introduces itself.
     socket
         .write_all(b"{\"token\":\"t-test\",\"agent_id\":\"a2a-stream\"}\n")
         .await
@@ -135,7 +135,7 @@ async fn tcp_client_receives_session_update_notifications() {
 
     let mut reader = BufReader::new(socket);
 
-    // Читаем ответ session/new — берём настоящий sessionId.
+    // Read the session/new response — take the real sessionId.
     let mut line = String::new();
     let n = tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
         .await
@@ -152,7 +152,7 @@ async fn tcp_client_receives_session_update_notifications() {
         .expect("sessionId присутствует")
         .to_string();
 
-    // session/prompt с реальным sessionId.
+    // session/prompt with the real sessionId.
     let prompt = format!(
         "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session/prompt\",\"params\":{{\"sessionId\":\"{session_id}\",\"prompt\":[{{\"type\":\"text\",\"text\":\"hi\"}}]}}}}\n"
     );
@@ -160,11 +160,11 @@ async fn tcp_client_receives_session_update_notifications() {
 
     let mut notifications = 0usize;
     let mut lines = 0usize;
-    // Читаем, пока не получим минимум 1 session/update и не наступит
-    // пауза в данных (стрим завершился после терминала). Стрим-путь
-    // направления 3 не шлёт финальный PromptResponse — только нотификации,
-    // затем тишина (канал закрыт, соединение продолжает обслуживать
-    // следующие запросы клиента).
+    // Keep reading until we get at least 1 session/update and a
+    // pause in data occurs (the stream ended after the terminal). The stream path
+    // of direction 3 does not send a final PromptResponse — only notifications,
+    // then silence (the channel is closed, the connection keeps serving
+    // the client's next requests).
     loop {
         let n = tokio::time::timeout(Duration::from_secs(2), reader.read_line(&mut line))
             .await

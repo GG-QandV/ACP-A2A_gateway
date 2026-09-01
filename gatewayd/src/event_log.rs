@@ -1,20 +1,20 @@
 //! gatewayd/src/event_log.rs
 //!
-//! Durable-буфер событий стрима (Фаза 2, закрытие T4/resubscribe).
+//! Durable event log buffer for the stream (Phase 2, closing T4/resubscribe).
 //!
-//! Модель — «источник истины = durable history» (как в agent-connector
-//! `driver_http_sse.rs`, решения Р-22/Р-23): каждое A2aEvent, ушедшее
-//! клиенту, дополнительно персистится с монотонным seq (по задаче).
-//! После разрыва соединения клиент может спросить последний обработанный
-//! seq и запросить `events_after(after_seq)` — продолжение стрима.
+//! The model is "source of truth = durable history" (as in agent-connector
+//! `driver_http_sse.rs`, decisions P-22/P-23): every A2aEvent sent
+//! to the client is additionally persisted with a monotonic seq (per task).
+//! After a connection drop the client can ask for the last processed
+//! seq and request `events_after(after_seq)` — stream continuation.
 //!
-//! Реализация — один фоновый writer-таск, который ВЛАДЕЕТ
-//! `rusqlite::Connection` (sync SQLite в async-мире): все операции
-//! (append/events_after/last_seq/cleanup) идут через единый mpsc-канал и
-//! исполняются последовательно. Гонок нет в принципе, write_guard не нужен.
+//! Implementation — a single background writer task that OWNS the
+//! `rusqlite::Connection` (sync SQLite in the async world): all operations
+//! (append/events_after/last_seq/cleanup) go through a single mpsc channel and
+//! are executed sequentially. There are no races by design, no write_guard needed.
 //!
-//! Самоочистка: writer проверяет размер БД (page_count * page_size) и при
-//! превышении `max_size_mb` удаляет старейшие события по seq. 0 = без лимита.
+//! Self-cleanup: the writer checks the DB size (page_count * page_size) and on
+//! exceeding `max_size_mb` removes the oldest events by seq. 0 = no limit.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -51,11 +51,11 @@ enum Cmd {
 }
 
 const CHANNEL_CAPACITY: usize = 1024;
-/// Проверка размера БД после каждых N аппендов (дёшево, page_count — 1 запрос).
+/// DB size check after every N appends (cheap, page_count is 1 query).
 const SIZE_CHECK_EVERY_N_APPENDS: u64 = 64;
 
 impl EventLog {
-    /// Открывает БД и поднимает writer-таск. `max_size_mb == 0` = без лимита.
+    /// Opens the DB and spins up the writer task. `max_size_mb == 0` = no limit.
     pub fn spawn(
         path: PathBuf,
         max_size_mb: u64,
@@ -95,7 +95,7 @@ impl EventLog {
         Ok(Arc::new(Self { tx }))
     }
 
-    /// Дописывает событие и возвращает его монотонный seq по задаче.
+    /// Appends an event and returns its monotonic seq for the task.
     pub async fn append(&self, task_id: &str, event_json: &str) -> anyhow::Result<u64> {
         let (reply, rx) = oneshot::channel();
         self.tx
@@ -109,7 +109,7 @@ impl EventLog {
         rx.await.map_err(|_| anyhow::anyhow!("event_log: writer не ответил"))?
     }
 
-    /// Возвращает события с seq > after_seq, по возрастанию seq.
+    /// Returns events with seq > after_seq, in ascending seq order.
     pub async fn events_after(
         &self,
         task_id: &str,
@@ -129,8 +129,8 @@ impl EventLog {
         rx.await.map_err(|_| anyhow::anyhow!("event_log: writer не ответил"))?
     }
 
-    /// Последний seq по задаче (0, если событий нет). Клиент спрашивает
-    /// «какой последний маркер» перед reconnect.
+    /// The last seq for a task (0 if there are no events). The client asks
+    /// "what is the last marker" before reconnect.
     pub async fn last_seq(&self, task_id: &str) -> anyhow::Result<u64> {
         let (reply, rx) = oneshot::channel();
         self.tx
@@ -153,7 +153,7 @@ struct Writer {
 
 impl Writer {
     async fn run(mut self) {
-        // Connection не Send — оставляем его в этом таске навсегда.
+        // Connection is not Send — we keep it in this task forever.
         while let Some(cmd) = self.rx.recv().await {
             match cmd {
                 Cmd::Append {
@@ -258,9 +258,9 @@ impl Writer {
         Ok(seq as u64)
     }
 
-    /// Если БД переросла лимит — удаляем старейшие события (по seq), пока
-    /// размер не вернётся под порог. WAL-файлы считаются тоже: page_count
-    /// включает журнал активных записей.
+    /// If the DB outgrew the limit — remove the oldest events (by seq) until the
+    /// size drops back under the threshold. WAL files are counted too: page_count
+    /// includes the write-ahead log.
     fn cleanup_if_oversized(&mut self) {
         let size_bytes: i64 = self
             .conn
@@ -294,15 +294,15 @@ impl Writer {
 }
 
 fn now_iso8601() -> String {
-    // Время как в core/src/util: локальное время без внешних крэтов.
+    // Time as in core/src/util: local time without external crates.
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
     format!("{}", now.as_secs())
 }
 
-/// Возвращает истину, когда между событиями больше нет гэпа — нужна ли
-/// клиенту дедупликация. Вспомогательная утилита для Фазы 3 (catch-up).
+/// Returns true when there is no longer a gap between events — whether the
+/// client needs deduplication. Helper utility for Phase 3 (catch-up).
 pub fn is_contiguous(prev: u64, next: u64) -> bool {
     prev == 0 || next == prev + 1
 }
@@ -322,7 +322,7 @@ mod tests {
         let s3 = log.append("task-1", r#"{"k":3}"#).await.unwrap();
         assert_eq!((s1, s2, s3), (1, 2, 3));
 
-        // seq нумеруются независимо для другой задачи.
+        // seqs are numbered independently for another task.
         let other = log.append("task-2", r#"{"k":1}"#).await.unwrap();
         assert_eq!(other, 1);
 
@@ -354,22 +354,22 @@ mod tests {
     #[tokio::test]
     async fn cleanup_removes_oldest_events_when_over_limit() {
         let dir = tempdir().unwrap();
-        // max_size_mb=1 — порог в 1 МБ; набиваем достаточно событий,
-        // чтобы размер БД превысил его.
+        // max_size_mb=1 — a 1 MB threshold; we append enough events
+        // for the DB size to exceed it.
         let log = EventLog::spawn(dir.path().join("ev.db"), 1).unwrap();
         let big = format!(r#"{{"payload":"{}"}}"#, "x".repeat(8 * 1024));
         for _i in 1..=300 {
             log.append("t", &big).await.unwrap();
         }
 
-        // После cleanup в БД не должно остаться всех 300 событий.
+        // After cleanup, not all 300 events should remain in the DB.
         let all = log.events_after("t", 0, 10_000).await.unwrap();
         assert!(
             all.len() < 300,
             "самоочистка должна была удалить старейшие, осталось {}",
             all.len()
         );
-        // Порядок сохраняется: seq строго возрастает от пережитого минимума.
+        // Order is preserved: seq strictly increases from the surviving minimum.
         let seqs: Vec<u64> = all.iter().map(|e| e.seq).collect();
         assert!(seqs.windows(2).all(|w| w[1] == w[0] + 1));
     }

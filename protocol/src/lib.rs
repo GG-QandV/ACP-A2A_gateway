@@ -1,6 +1,6 @@
 //! protocol/src/lib.rs
-//! Типы и (de)serialize для ACP и A2A. Не знает о Reply<T>, о стриминге,
-//! о конвертации — только протокольные структуры "как в каноне".
+//! Types and (de)serialization for ACP and A2A. Knows nothing about Reply<T>,
+//! streaming or conversion — protocol structures only, "as in the canon".
 
 pub mod acp;
 pub mod a2a;
@@ -13,7 +13,7 @@ pub use a2a::*;
 mod tests {
     use crate::acp::{ContentBlock, InitializeResponse as PromptResponseless, PromptResponse, StopReason};
 
-    /// Тест из docs/03-dev-guide-testing.md — в репо отсутствовал.
+    /// Test from docs/03-dev-guide-testing.md — missing in the repo.
     #[test]
     fn content_block_roundtrip() {
         let cb = ContentBlock::Text { text: "hello".into() };
@@ -23,15 +23,15 @@ mod tests {
     }
 
 
-    /// Регрессия на live-баг: claurst отвечает protocolVersion числом.
-    /// Раньше поле было String и рукопожатие падало на каждом спавне.
+    /// Regression for a live bug: claurst answers protocolVersion as a number.
+    /// The field used to be String, and the handshake failed on every spawn.
     #[test]
     fn protocol_version_accepts_number() {
         let resp: PromptResponseless = serde_json::from_str(r#"{"protocolVersion":1}"#).unwrap();
         assert_eq!(resp.protocol_version, 1);
     }
 
-    /// Встречаются реализации со строкой — принимаем и её.
+    /// Some implementations use a string — accept that form too.
     #[test]
     fn protocol_version_accepts_string_forms() {
         let a: PromptResponseless = serde_json::from_str(r#"{"protocolVersion":"1"}"#).unwrap();
@@ -41,14 +41,14 @@ mod tests {
         assert_eq!(b.protocol_version, 2, "берётся мажорная часть");
     }
 
-    /// Отсутствующее поле — значение по умолчанию, а не ошибка.
+    /// A missing field — default value, not an error.
     #[test]
     fn protocol_version_defaults_when_absent() {
         let resp: PromptResponseless = serde_json::from_str("{}").unwrap();
         assert_eq!(resp.protocol_version, crate::acp::DEFAULT_PROTOCOL_VERSION);
     }
 
-    /// Мусор отклоняется на границе, а не доезжает до логики.
+    /// Garbage is rejected at the boundary, not let through to the logic.
     #[test]
     fn protocol_version_rejects_garbage() {
         let parsed: Result<PromptResponseless, _> =
@@ -56,8 +56,8 @@ mod tests {
         assert!(parsed.is_err());
     }
 
-    /// Строго на выходе: шлюз всегда отправляет число, независимо от
-    /// того, в каком виде версию прислал агент.
+    /// Strict on output: the gateway always sends a number, regardless of
+    /// what form the agent sent the version in.
     #[test]
     fn protocol_version_always_serializes_as_number() {
         let req = crate::acp::InitializeRequest {
@@ -70,8 +70,8 @@ mod tests {
         assert!(!json.contains(r#""protocolVersion":"1""#));
     }
 
-    /// Новое поле content опционально: ответы старых агентов без него
-    /// продолжают десериализоваться.
+    /// The new content field is optional: replies of old agents without it
+    /// still deserialize.
     #[test]
     fn prompt_response_content_is_optional() {
         let resp: PromptResponse = serde_json::from_str(r#"{"stopReason":"end_turn"}"#).unwrap();

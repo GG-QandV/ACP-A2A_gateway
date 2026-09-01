@@ -1,13 +1,13 @@
 //! core/src/owner.rs
 //!
-//! Владелец разговора и задачи. Вынесен из convert.rs в отдельный
-//! модуль, потому что после закрытия аудита P1-2 им пользуется ещё и
-//! task_store: владелец должен переживать выселение сессии, иначе
-//! проверка «чья задача?» работает только пока разговор жив.
+//! Owner of a conversation and a task. Extracted from convert.rs into a
+//! separate module because after closing audit P1-2 it is used by task_store
+//! as well: the owner must survive session eviction, otherwise the
+//! "whose task?" check works only while the conversation is alive.
 //!
-//! Хранится хеш токена, а не сам токен: для ответа на вопрос «тот же
-//! клиент?» достаточно равенства, а держать секрет в памяти и на диске
-//! дольше необходимого незачем.
+//! The token hash is stored, not the token itself: equality is enough to
+//! answer the "same client?" question, and there is no reason to keep a
+//! secret in memory and on disk longer than necessary.
 
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
@@ -15,15 +15,15 @@ use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// Дефолтный ключ — ТОЛЬКО для локальной разработки. В проде
-/// обязательно задать GATEWAY_HMAC_KEY через окружение.
+/// Default key — ONLY for local development. In prod, setting
+/// GATEWAY_HMAC_KEY via the environment is mandatory.
 const DEFAULT_DEV_KEY: &str = "default-dev-key-do-not-use-in-prod";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum Owner {
-    /// Вызовы через голый трейт `A2aAgent`, без транспортного контекста.
-    /// Отдельная корзина: анонимные вызовы изолированы от токенных.
+    /// Calls through the bare `A2aAgent` trait, without transport context.
+    /// A separate bucket: anonymous calls are isolated from token-bearing ones.
     Anonymous,
     Token {
         hash: u64,
@@ -32,11 +32,11 @@ pub enum Owner {
 
 impl Owner {
     pub fn from_token(token: &str) -> Self {
-        // ИСПРАВЛЕНО (TECH_DEBT: хеш токена — HMAC): RandomState заменён
-        // на HMAC-SHA256 с ключом из {env:GATEWAY_HMAC_KEY}. Это
-        // криптографический хеш, а не просто SipHash с случайным seed.
-        // Первые 8 байт HMAC идут в hash: u64 — формат Owner::Token не
-        // изменился, StoredTask без миграции.
+        // FIXED (TECH_DEBT: token hash — HMAC): RandomState replaced
+        // with HMAC-SHA256 keyed from {env:GATEWAY_HMAC_KEY}. This is
+        // a cryptographic hash, not just SipHash with a random seed.
+        // The first 8 HMAC bytes go into hash: u64 — the Owner::Token format
+        // is unchanged, StoredTask requires no migration.
         let key = std::env::var("GATEWAY_HMAC_KEY").unwrap_or_else(|_| DEFAULT_DEV_KEY.to_string());
         let mut mac =
             HmacSha256::new_from_slice(key.as_bytes()).expect("HMAC accepts any key length");
@@ -48,15 +48,15 @@ impl Owner {
         }
     }
 
-    /// Хеш не является криптографическим и предназначен только для
-    /// сравнения на равенство. Восстановить токен по нему нельзя,
-    /// но и полагаться на него как на секрет не следует.
+    /// The hash is not cryptographic and is intended only for
+    /// equality comparison. The token cannot be recovered from it,
+    /// but it should not be relied upon as a secret either.
     pub fn is_anonymous(&self) -> bool {
         matches!(self, Owner::Anonymous)
     }
 
-    /// Возвращает true, если токен даёт тот же Owner, что и этот.
-    /// Нужно для тестов, чтобы проверить, что HMAC детерминирован.
+    /// Returns true if the token yields the same Owner as this one.
+    /// Needed for tests to verify that HMAC is deterministic.
     #[cfg(test)]
     pub fn same_token_as(&self, token: &str) -> bool {
         *self == Owner::from_token(token)
@@ -70,20 +70,20 @@ mod tests {
     #[test]
     fn same_token_gives_same_owner() {
         assert_eq!(Owner::from_token("t-1"), Owner::from_token("t-1"));
-        // С HMAC это остаётся верным: один токен → один хеш (детерминизм).
+        // With HMAC this remains true: one token → one hash (determinism).
     }
 
     #[test]
     fn different_tokens_give_different_owners() {
         assert_ne!(Owner::from_token("t-1"), Owner::from_token("t-2"));
-        // С HMAC это тоже остаётся верным: разные токены → разные хеши.
+        // With HMAC this also remains true: different tokens → different hashes.
     }
 
     #[test]
     fn hmac_is_deterministic_for_same_token() {
-        // Проверяем, что from_token детерминирован (один токен → один Owner)
-        // даже с HMAC. Это не тест на криптографическую стойкость — только
-        // на корректность реализации.
+        // Check that from_token is deterministic (one token → one Owner)
+        // even with HMAC. This is not a test of cryptographic strength — only
+        // of implementation correctness.
         let owner = Owner::from_token("test-token");
         assert!(owner.same_token_as("test-token"));
         assert!(!owner.same_token_as("other-token"));

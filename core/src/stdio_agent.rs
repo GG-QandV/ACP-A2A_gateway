@@ -1,8 +1,8 @@
 //! core/src/stdio_agent.rs
 //!
-//! StdioAcpAgent — реальная реализация AcpAgent через spawn процесса.
-//! Модель: один процесс на инстанс, запросы коррелируются по JSON-RPC id
-//! через oneshot-канал. session/cancel — notification (без id).
+//! StdioAcpAgent — real AcpAgent implementation via process spawn.
+//! Model: one process per instance, requests correlated by JSON-RPC id
+//! through a oneshot channel. session/cancel is a notification (no id).
 
 use std::collections::HashMap;
 use std::process::Stdio;
@@ -23,30 +23,30 @@ use crate::agent::AcpAgent;
 use crate::reply::Reply;
 
 type PendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>;
-/// ДОБАВЛЕНО (Часть 1 роадмапа стриминга, задача G): накопитель чанков
-/// заменён на канал. Раньше AgentMessageChunk копился в Vec и отдавался
-/// целиком в Reply::Complete после завершения хода — клиент не видел
-/// промежуточных чанков. Теперь каждый session/update уходит в
-/// mpsc-канал сразу, а prompt() возвращает Reply::Streaming(rx).
+/// ADDED (streaming roadmap Part 1, task G): the chunk accumulator was
+/// replaced by a channel. Previously AgentMessageChunk was collected into a
+/// Vec and delivered whole in Reply::Complete after the turn finished — the
+/// client never saw intermediate chunks. Now each session/update goes to an
+/// mpsc channel immediately, and prompt() returns Reply::Streaming(rx).
 type UpdatesMap = Arc<Mutex<HashMap<String, mpsc::UnboundedSender<SessionUpdate>>>>;
 
 pub struct StdioAcpAgent {
     child: Mutex<Child>,
-    /// Arc, потому что писать в stdin должен теперь и reader-таск:
-    /// на запросы агента к клиенту обязан приходить ответ.
+    /// Arc because the reader task now also needs to write to stdin:
+    /// agent-to-client requests must always get a response.
     stdin: Arc<Mutex<tokio::process::ChildStdin>>,
     next_id: AtomicU64,
     pending: PendingMap,
     updates: UpdatesMap,
-    /// ДОБАВЛЕНО (аудит P2-11): было захардкожено `from_secs(60)`,
-    /// что противоречило настраиваемому turn_lease_timeout_secs.
+    /// ADDED (audit P2-11): it was hardcoded as `from_secs(60)`,
+    /// contradicting the configurable turn_lease_timeout_secs.
     call_timeout: std::time::Duration,
-    /// ДОБАВЛЕНО (Часть 2 роадмапа стриминга): таймаут ДО первого чанка
-    /// стрима. Прокидывается из конфига (streaming.first_chunk_timeout_secs)
-    /// через SpawnConfig; применяется в стрим-цикле prompt_streaming.
+    /// ADDED (streaming roadmap Part 2): timeout BEFORE the first chunk
+    /// of the stream. Wired from config (streaming.first_chunk_timeout_secs)
+    /// via SpawnConfig; applied in the stream loop of prompt_streaming.
     first_chunk_timeout: std::time::Duration,
-    /// ДОБАВЛЕНО (Часть 2 роадмапа стриминга): таймаут МЕЖДУ чанками.
-    /// Аналогично first_chunk_timeout — применяется в стрим-цикле.
+    /// ADDED (streaming roadmap Part 2): timeout BETWEEN chunks.
+    /// Same as first_chunk_timeout — applied in the stream loop.
     idle_chunk_timeout: std::time::Duration,
 }
 
@@ -72,8 +72,8 @@ impl StdioAcpAgent {
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::inherit());
-        // ИСПРАВЛЕНО (аудит P2-9): без этого процесс агента переживал
-        // адаптер и оставался сиротой (пустой impl Drop ничего не делал).
+        // FIXED (audit P2-9): without this, the agent process outlived the
+        // adapter and stayed orphaned (empty impl Drop did nothing).
         cmd.kill_on_drop(true);
 
         let mut child = cmd.spawn()?;
@@ -108,7 +108,7 @@ impl StdioAcpAgent {
         })
     }
 
-    /// Публичная проверка живости — нужна супервизору и кэшу адаптеров.
+    /// Public liveness check — needed by the supervisor and adapter cache.
     pub async fn is_alive(&self) -> bool {
         matches!(self.child.lock().await.try_wait(), Ok(None))
     }
@@ -145,8 +145,8 @@ impl StdioAcpAgent {
 
         let waited = tokio::time::timeout(self.call_timeout, rx).await;
 
-        // ИСПРАВЛЕНО (аудит P2-14): при таймауте запись оставалась в
-        // pending навсегда — утечка на каждый истёкший запрос.
+        // FIXED (audit P2-14): on timeout the entry stayed in
+        // pending forever — a leak on every expired request.
         let Ok(received) = waited else {
             self.pending.lock().await.remove(&id);
             anyhow::bail!(
@@ -196,29 +196,29 @@ fn spawn_reader_task(
                 Err(_) => continue,
             };
 
-            // ИСПРАВЛЕНО (найдено live-тестом): раньше ответом считалась
-            // ЛЮБАЯ строка с числовым id. Но ACP — двусторонний JSON-RPC:
-            // агент сам шлёт клиенту запросы (session/request_permission,
-            // fs/read_text_file), и нумерация их id начинается с 1, то есть
-            // сталкивается с нашей. Такой запрос агента съедал запись из
-            // pending, наш настоящий ответ разрешать было уже некому — и
-            // вызов висел до таймаута. Именно это давало стабильный
-            // «agent did not respond to session/prompt within 60s» при
-            // продолжении разговора: на втором ходу агент успевал о
-            // чём-нибудь спросить.
+            // FIXED (found by live test): previously any line with a numeric
+            // id was treated as a response. But ACP is bidirectional JSON-RPC:
+            // the agent itself sends requests to the client (session/request_permission,
+            // fs/read_text_file), and their id numbering starts at 1, i.e. it
+            // collides with ours. Such an agent request consumed the pending
+            // entry, leaving nobody to resolve our real response — and the
+            // call hung until timeout. That is exactly what produced the stable
+            // «agent did not respond to session/prompt within 60s» when
+            // continuing a conversation: on the second turn the agent managed
+            // to ask about something.
             //
-            // Различаем по наличию "method": оно есть у запросов и
-            // нотификаций и отсутствует у ответов.
+            // Distinguish by the presence of "method": requests and
+            // notifications have it, responses do not.
             if parsed.get("method").is_some() {
                 match parsed.get("id") {
-                    // Запрос агента к клиенту. Отвечать обязаны: без
-                    // ответа агент виснет на своей стороне.
+                    // Agent request to the client. We must reply: without a
+                    // response the agent hangs on its side.
                     Some(request_id) => {
                         reply_method_not_found(&stdin, request_id.clone(), &parsed).await;
                     }
-                    // Нотификация: AgentMessageChunk копится по sessionId
-                    // и прикладывается к PromptResponse в конце хода
-                    // (аудит P2-1).
+                    // Notification: AgentMessageChunk is collected per sessionId
+                    // and appended to the PromptResponse at the end of the turn
+                    // (audit P2-1).
                     None => collect_session_update(&parsed, &updates).await,
                 }
                 continue;
@@ -250,11 +250,11 @@ fn spawn_reader_task(
     });
 }
 
-/// Ответ на запрос агента к клиенту. Клиентские возможности (запрос
-/// разрешений, доступ к файлам, терминал) шлюзом не реализованы —
-/// сообщаем об этом честно, вместо того чтобы молчать и подвешивать
-/// агента. Возможности заявлены пустыми в initialize, так что
-/// корректный агент такие запросы слать не должен.
+/// Reply to an agent-to-client request. Client capabilities (permission
+/// requests, file access, terminal) are not implemented by the gateway —
+/// we report this honestly instead of staying silent and hanging the
+/// agent. Capabilities are declared empty in initialize, so a
+/// well-behaved agent should not send such requests.
 async fn reply_method_not_found(
     stdin: &Arc<Mutex<tokio::process::ChildStdin>>,
     id: Value,
@@ -297,19 +297,19 @@ impl AcpAgent for StdioAcpAgent {
         req: PromptRequest,
     ) -> anyhow::Result<Reply<PromptResponse, SessionUpdate>> {
         let session_key = req.session_id.0.clone();
-        // Хвост предыдущего хода не должен попасть в текущий ответ.
+        // Tail of the previous turn must not leak into the current response.
         self.updates.lock().await.remove(&session_key);
 
-        // ДОБАВЛЕНО (Часть 1 роадмапа стриминга, задача G): канал, в
-        // который reader-таск шлёт session/update-чанки сразу. Нестриминговый
-        // prompt() читает его ПОСЛЕ завершения хода и собирает контент —
-        // сохраняя старое поведение Reply::Complete (Р-20: дефолт не меняется).
+        // ADDED (streaming roadmap Part 1, task G): channel the reader task
+        // sends session/update chunks into immediately. The non-streaming
+        // prompt() reads it AFTER the turn completes and assembles the content —
+        // preserving the old Reply::Complete behavior (P-20: default unchanged).
         let (tx, mut rx) = mpsc::unbounded_channel::<SessionUpdate>();
         self.updates.lock().await.insert(session_key.clone(), tx);
 
         let mut resp: PromptResponse = self.call("session/prompt", req).await?;
 
-        // Собрать все чанки, ушедшие в канал за время хода.
+        // Collect all chunks sent into the channel during the turn.
         let mut collected: Vec<protocol::acp::ContentBlock> = Vec::new();
         while let Ok(update) = rx.try_recv() {
             if let SessionUpdate::AgentMessageChunk { content, .. } = update {
@@ -324,18 +324,18 @@ impl AcpAgent for StdioAcpAgent {
         Ok(Reply::Complete(resp))
     }
 
-    /// ДОБАВЛЕНО (Р-20, Часть 1 роадмапа стриминга): потоковый prompt().
-    /// Возвращает Reply::Streaming(rx) СРАЗУ после записи session/prompt в
-    /// stdin — канал отдаёт чанки по мере генерации (collect_session_update
-    /// шлёт их в tx сразу). Финальный PromptResponse домаппливается фоновым
-    /// таском в терминальный AgentMessageChunk, после чего tx дропается и
-    /// канал закрывается.
+    /// ADDED (P-20, streaming roadmap Part 1): streaming prompt().
+    /// Returns Reply::Streaming(rx) IMMEDIATELY after writing session/prompt to
+    /// stdin — the channel yields chunks as they are generated (collect_session_update
+    /// sends them into tx right away). The final PromptResponse is remapped by a
+    /// background task into a terminal AgentMessageChunk, after which tx is dropped
+    /// and the channel closes.
     async fn prompt_streaming(
         &self,
         req: PromptRequest,
     ) -> anyhow::Result<Reply<PromptResponse, SessionUpdate>> {
         let session_key = req.session_id.0.clone();
-        // Хвост предыдущего хода не должен попасть в текущий ответ.
+        // Tail of the previous turn must not leak into the current response.
         self.updates.lock().await.remove(&session_key);
 
         let (tx, mut rx) = mpsc::unbounded_channel::<SessionUpdate>();
@@ -344,9 +344,9 @@ impl AcpAgent for StdioAcpAgent {
             .await
             .insert(session_key.clone(), tx.clone());
 
-        // Отправляем session/prompt сами (без блокирующего call): канал
-        // должен начать отдавать чанки клиенту немедленно. Регистрируем
-        // pending-запись.
+        // We send session/prompt ourselves (without the blocking call): the channel
+        // must start yielding chunks to the client immediately. Register a
+        // pending entry.
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (resp_tx, mut resp_rx) = oneshot::channel();
         self.pending.lock().await.insert(id, resp_tx);
@@ -362,20 +362,20 @@ impl AcpAgent for StdioAcpAgent {
             })?;
         }
 
-        // Ключевой выбор (Р-20): если первым приходит финальный PromptResponse
-        // (агент не стримил — 0 чанков в канале) — возвращаем Reply::Complete,
-        // сохраняя старое поведение для всех, кто ждёт не потоковый ответ.
-        // Если первым приходит чанк session/update — агент стримит:
-        // возвращаем Reply::Streaming с внешним каналом, в который
-        // пересылаются и остаток чанков, и терминальный элемент.
-        // Если за first_chunk_timeout не пришло ни чанка, ни ответа —
-        // агент вообще не начал ход: таймаут (T9).
+        // Key choice (P-20): if the final PromptResponse arrives first
+        // (agent did not stream — 0 chunks in the channel) — return Reply::Complete,
+        // preserving the old behavior for everyone expecting a non-streaming response.
+        // If a session/update chunk arrives first — the agent is streaming:
+        // return Reply::Streaming with an outer channel that relays both
+        // the remaining chunks and the terminal element.
+        // If neither a chunk nor a response arrives within first_chunk_timeout —
+        // the agent never started the turn: timeout (T9).
         //
-        // ИСПРАВЛЕНО (Р-23): biased + chunk-ветка ПЕРВОЙ. Без biased при
-        // одновременной готовности resp_rx и rx.recv() выбор был случайным
-        // между Complete и Streaming — намерение "если агент начал стримить,
-        // доверяем этому сигналу" не гарантировалось. Теперь chunk-ветка
-        // имеет приоритет, результат детерминирован.
+        // FIXED (P-23): biased + chunk branch FIRST. Without biased, when
+        // resp_rx and rx.recv() became ready simultaneously the choice was random
+        // between Complete and Streaming — the intent "if the agent started
+        // streaming, trust that signal" was not guaranteed. Now the chunk branch
+        // has priority and the result is deterministic.
         tokio::select! {
             biased;
             first = rx.recv() => {
@@ -383,15 +383,15 @@ impl AcpAgent for StdioAcpAgent {
                     self.updates.lock().await.remove(&session_key);
                     anyhow::bail!("stream channel closed before any event");
                 };
-                // Агент стримит: внешний канал, первый чанк уже пришёл.
+                // Agent is streaming: outer channel, first chunk already arrived.
                 let (out_tx, out_rx) = mpsc::unbounded_channel::<SessionUpdate>();
                 let _ = out_tx.send(first);
 
-                // Фоновый таск: пересылает остаток чанков из rx в out, затем
-                // ждёт финальный PromptResponse и шлёт терминальный элемент.
-                // ДОБАВЛЕНО (Часть 2, задача C): idle_chunk_timeout применяется
-                // здесь (первый чанк уже получен выше, поэтому первый wait —
-                // это ожидание ВТОРОГО чанка, таймаут = idle).
+                // Background task: relays the remaining chunks from rx into out, then
+                // waits for the final PromptResponse and sends the terminal element.
+                // ADDED (Part 2, task C): idle_chunk_timeout is applied
+                // here (the first chunk was already received above, so the first wait
+                // is for the SECOND chunk, timeout = idle).
                 tokio::spawn({
                     let updates = self.updates.clone();
                     let idle_chunk_timeout = self.idle_chunk_timeout;
@@ -404,10 +404,10 @@ impl AcpAgent for StdioAcpAgent {
                                         Some(c) => {
                                             last_chunks += 1;
                                             if out_tx.send(c).is_err() {
-                                                break; // получатель отключился
+                                                break; // receiver disconnected
                                             }
                                         }
-                                        None => break, // канал закрыт без terminal
+                                        None => break, // channel closed without terminal
                                     }
                                 }
                                 resp = &mut resp_rx => {
@@ -443,7 +443,7 @@ impl AcpAgent for StdioAcpAgent {
                                     break;
                                 }
                                 _ = tokio::time::sleep(idle_chunk_timeout) => {
-                                    // ЛОГ-ЛОВУШКА (WARN, по умолчанию включена):
+                                    // LOG-TRAP (WARN, enabled by default):
                                     tracing::warn!(
                                         session_id = %session_key,
                                         elapsed = ?idle_chunk_timeout,
@@ -469,8 +469,8 @@ impl AcpAgent for StdioAcpAgent {
                 Ok(Reply::Complete(resp))
             }
             _ = tokio::time::sleep(self.first_chunk_timeout) => {
-                // Т9: агент не начал стримить и не ответил за first_chunk_timeout.
-                // Чистим pending и закрываем сессию, чтобы не висели.
+                // T9: agent neither started streaming nor replied within first_chunk_timeout.
+                // Clean up pending and close the session so nothing hangs.
                 self.pending.lock().await.remove(&id);
                 self.updates.lock().await.remove(&session_key);
                 anyhow::bail!(
@@ -491,21 +491,21 @@ impl AcpAgent for StdioAcpAgent {
     }
 }
 
-// ИСПРАВЛЕНО (аудит P2-9): пустой impl Drop удалён — он только
-// маскировал утечку процессов. Его роль выполняет kill_on_drop(true),
-// выставленный в spawn().
+// FIXED (audit P2-9): the empty impl Drop was removed — it only
+// masked the process leak. kill_on_drop(true), set in spawn(),
+// fulfills its role.
 
-/// ДОБАВЛЕНО (Часть 1 роадмапа стриминга, задача G): извлекает
-/// session/update из JSON-RPC нотификации агента и шлёт в mpsc-канал
-/// сессии сразу, без накопления.
+/// ADDED (streaming roadmap Part 1, task G): extracts the
+/// session/update from the agent's JSON-RPC notification and sends it to the
+/// session's mpsc channel immediately, without accumulation.
 ///
-/// Р-21 (decisions.md): парсится ТОЛЬКО `agent_message_chunk` — основной
-/// канал текстового ответа. ToolCall/ToolCallUpdate/Plan/UsageUpdate НЕ
-/// парсятся в Фазе 2.0: требуют сверки с точной JSON-схемой ACP по
-/// каждому варианту отдельно, риск непропорционален ценности. Маппинг
-/// этих 4 вариантов в convert.rs::session_update_to_a2a_event() написан,
-/// но недостижим при текущем фильтре — сознательно (готовность к
-/// следующей итерации).
+/// P-21 (decisions.md): ONLY `agent_message_chunk` is parsed — the main
+/// channel of the textual response. ToolCall/ToolCallUpdate/Plan/UsageUpdate are
+/// NOT parsed in Phase 2.0: they require checking against the exact ACP JSON
+/// schema for each variant separately, the risk is disproportionate to the
+/// value. The mapping of these 4 variants in convert.rs::session_update_to_a2a_event()
+/// is written but unreachable under the current filter — deliberate (readiness
+/// for the next iteration).
 async fn collect_session_update(parsed: &Value, updates: &UpdatesMap) {
     if parsed.get("method").and_then(Value::as_str) != Some("session/update") {
         return;
@@ -544,12 +544,12 @@ async fn collect_session_update(parsed: &Value, updates: &UpdatesMap) {
     }
 }
 
-/// Финальный PromptResponse → терминальный SessionUpdate (текстовый чанк
-/// с полным контентом ответа). Вызывается в prompt() после завершения хода.
+/// Final PromptResponse → terminal SessionUpdate (a text chunk
+/// carrying the full response content). Called in prompt() after the turn completes.
 fn prompt_to_content_block(resp: &PromptResponse) -> protocol::acp::ContentBlock {
-    // Сливаем весь контент ответа в один текстовый блок: у ACP-агента
-    // финальный ответ может состоять из нескольких ContentBlock, но
-    // терминальный элемент стрима должен нести полный текст.
+    // Merge all response content into one text block: an ACP agent's
+    // final answer may consist of several ContentBlocks, but
+    // the terminal element of the stream must carry the full text.
     let text = resp
         .content
         .iter()
@@ -569,10 +569,10 @@ mod tests {
     use std::collections::HashMap;
     use std::time::{Duration, Instant};
 
-    /// Возвращает путь к тестовому mock-acp-агенту (бинарь gatewayd).
-    /// Юнит-тесты core не получают CARGO_BIN_EXE_* (он задаётся только
-    /// integration-тестам крейта с [[bin]]), поэтому используем явный env
-    /// MOCK_AGENT_BIN либо фолбэк на target/debug/mock_acp_agent workspace.
+    /// Returns the path to the test mock ACP agent (gatewayd binary).
+    /// Core unit tests do not get CARGO_BIN_EXE_* (it is set only for
+    /// integration tests of a crate with [[bin]]), so we use the explicit env
+    /// MOCK_AGENT_BIN or fall back to the workspace target/debug/mock_acp_agent.
     fn mock_bin() -> String {
         if let Ok(path) = std::env::var("MOCK_AGENT_BIN") {
             return path;
@@ -625,10 +625,10 @@ mod tests {
             .session_id
     }
 
-    /// T1: чанки приходят по одному, не батчем в конце.
-    /// Мок-агент шлёт 3 session/update с задержкой 50мс между ними;
-    /// через prompt_streaming() каждый чанк ловится rx.recv() с реальным
-    /// временным интервалом, а не скопом после завершения хода.
+    /// T1: chunks arrive one by one, not as a batch at the end.
+    /// The mock agent sends 3 session/update with 50ms delay between them;
+    /// via prompt_streaming() each chunk is caught by rx.recv() at a real
+    /// time interval, not in one heap after the turn completes.
     #[tokio::test]
     async fn stream_emits_chunks_incrementally() {
         let agent = spawn_mock(&[
@@ -652,7 +652,7 @@ mod tests {
             panic!("ожидался Reply::Streaming, получили Complete");
         };
 
-        // Первый чанк — ждём с достаточным запасом (первый идёт сразу).
+        // First chunk — wait with ample margin (the first comes immediately).
         let t0 = Instant::now();
         let first = tokio::time::timeout(Duration::from_secs(10), rx.recv())
             .await
@@ -664,7 +664,7 @@ mod tests {
             "первый чанк не должен ждать весь ход: {elapsed_first:?}"
         );
 
-        // Последующие — между ними реально проходит ~50мс (не батч в конце).
+        // Subsequent ones — ~50ms really elapses between them (not a batch at the end).
         let t1 = Instant::now();
         let second = tokio::time::timeout(Duration::from_secs(10), rx.recv())
             .await
@@ -685,9 +685,9 @@ mod tests {
         assert!(matches!(second, SessionUpdate::AgentMessageChunk { .. }));
     }
 
-    /// T9: idle_chunk_timeout закрывает зависший стрим. Мок шлёт 1 чанк,
-    /// затем не отвечает дольше idle (200мс) — стрим должен закрыться по
-    /// таймауту (< 500мс), а не висеть до call_timeout.
+    /// T9: idle_chunk_timeout closes a stalled stream. The mock sends 1 chunk,
+    /// then stays silent longer than idle (200ms) — the stream must close on
+    /// timeout (< 500ms), not hang until call_timeout.
     #[tokio::test]
     async fn idle_timeout_closes_stalled_stream() {
         let agent = spawn_mock_with_timeouts(
@@ -715,7 +715,7 @@ mod tests {
             panic!("ожидался Reply::Streaming");
         };
 
-        // Читаем до закрытия канала (idle-таймаут закроет после 1 чанка).
+        // Read until the channel closes (idle timeout closes it after 1 chunk).
         let start = Instant::now();
         let mut chunks = 0usize;
         while rx.recv().await.is_some() {
@@ -729,9 +729,9 @@ mod tests {
         );
     }
 
-    /// T9: first_chunk_timeout срабатывает, если агент вообще не начинает
-    /// стримить и не отвечает. Мок молчит дольше first (100мс) —
-    /// prompt_streaming должен вернуть Err по таймауту, не ждать call_timeout.
+    /// T9: first_chunk_timeout fires if the agent never starts streaming
+    /// and never replies. The mock stays silent longer than first (100ms) —
+    /// prompt_streaming must return Err on timeout, not wait for call_timeout.
     #[tokio::test]
     async fn first_chunk_timeout_fires_if_agent_never_starts() {
         let agent = spawn_mock_with_timeouts(
@@ -762,10 +762,10 @@ mod tests {
         );
     }
 
-    /// Р-23: при одновременной готовности чанка и финального ответа выбор
-    /// должен быть детерминированным в пользу Streaming (biased + chunk-ветка
-    /// первой). Мок шлёт 1 чанк и ответ без задержки — повторные прогоны
-    /// не должны давать случайный Complete/Streaming.
+    /// P-23: when a chunk and the final response are ready simultaneously, the
+    /// choice must be deterministic in favor of Streaming (biased + chunk branch
+    /// first). The mock sends 1 chunk and a response with no delay — repeated runs
+    /// must not produce a random Complete/Streaming.
     #[tokio::test]
     async fn simultaneous_response_and_chunk_prefers_streaming_path() {
         let agent = spawn_mock(&[
@@ -775,9 +775,9 @@ mod tests {
         .await;
         let session = init_session(&agent).await;
 
-        // Один вызов: 5 повторов на одной сессии вносят межходовую гонку
-        // (фоновый таск предыдущего хода ещё жив) — это не тема Р-23.
-        // Детерминированность выбора проверяется однократно.
+        // One call: 5 repeats on the same session introduce a cross-turn race
+        // (the previous turn's background task is still alive) — not the subject
+        // of P-23. The determinism of the choice is checked once.
         let reply = agent
             .prompt_streaming(PromptRequest {
                 session_id: session.clone(),

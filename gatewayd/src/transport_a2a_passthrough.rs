@@ -1,11 +1,11 @@
 //! gatewayd/src/transport_a2a_passthrough.rs
-//! Направление 2: A2A-клиент -> A2A-агент, без семантического
-//! преобразования — reverse-proxy, включая SSE-стрим как есть.
+//! Direction 2: A2A client -> A2A agent, without semantic
+//! transformation — reverse proxy, including the SSE stream as is.
 //!
-//! ДОБАВЛЕНО: диалект-зонд (dialect_probe) выполняется один раз на
-//! agent_id перед первым проксированием — результат только логируется,
-//! не блокирует и не меняет сам passthrough (он остаётся reverse-proxy
-//! "без семантического преобразования").
+//! ADDED: the dialect probe (dialect_probe) runs once per
+//! agent_id before the first proxying — the result is only logged,
+//! it neither blocks nor changes the passthrough itself (it stays a reverse proxy
+//! "without semantic transformation").
 
 use std::sync::Arc;
 
@@ -145,13 +145,13 @@ async fn proxy_handler(
         .map(|ct| ct.contains("application/json"))
         .unwrap_or(false);
 
-    // D3: инвалидация кэша при MethodNotFound на РЕАЛЬНОМ (не зондовом)
-    // запросе. Reverse-proxy не может переслать уже отправленный клиентом
-    // запрос повторно (тело одноразовое), поэтому вместо one-shot retry
-    // (как в driver-a2a-client) здесь сбрасываем закэшированный диалект —
-    // следующий запрос к этому agent_id выполнит зонд заново и, возможно,
-    // выберет другой диалект. Проверяем только JSON-ответы: SSE-стрим
-    // (streaming) проксируется как есть, без чтения.
+    // D3: cache invalidation on MethodNotFound in a REAL (not probe)
+    // request. A reverse proxy cannot resend the request already sent by
+    // the client (the body is one-shot), so instead of a one-shot retry
+    // (as in driver-a2a-client) we reset the cached dialect here —
+    // the next request to this agent_id will run the probe again and may
+    // pick a different dialect. Only JSON responses are checked: the SSE stream
+    // (streaming) is proxied as is, without reading.
     if is_json {
         let bytes =
             match tokio::time::timeout(std::time::Duration::from_secs(30), upstream_resp.bytes())

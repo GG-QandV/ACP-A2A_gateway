@@ -1,13 +1,13 @@
 //! gatewayd/src/health.rs
 //!
-//! Health-мониторинг для пользователя (Фаза 5): фоновый наблюдатель,
-//! который периодически проверяет размеры всех durable-БД против лимитов
-//! и занятость слотов стримов. Алерты пишутся в журнал (journal.rs) и в
-//! tracing. Запускается из main.rs как фоновый таск (как sweeper).
+//! User-facing health monitoring (Phase 5): a background watcher
+//! that periodically checks the sizes of all durable DBs against limits
+//! and stream-slot occupancy. Alerts are written to the journal (journal.rs) and to
+//! tracing. Runs from main.rs as a background task (like the sweeper).
 //!
-//! Минимум Фазы 5 (по плану): размеры БД + сводка активных стримов.
-//! Полный учёт оборванных стримов/дисконнектов без реконнекта требует
-//! регистрации обрывов в журнале из relay — отдельный под-шаг позже.
+//! Phase 5 minimum (per the plan): DB sizes + summary of active streams.
+//! Full accounting of dropped streams/disconnects without reconnect requires
+//! registering breaks in the journal from relay — a separate sub-step later.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -17,22 +17,22 @@ use crate::registry::Registry;
 
 use crate::journal::{Journal, Level};
 
-/// Одна целевая БД для проверки размера.
+/// One target DB for size checking.
 #[derive(Debug, Clone)]
 pub struct DbTarget {
     pub label: &'static str,
     pub path: PathBuf,
-    /// 0 = без лимита (не проверяем).
+    /// 0 = no limit (not checked).
     pub max_mb: u64,
 }
 
-/// Размер файла БД в байтах (файл на диске, включая WAL-журнал активных
-/// записей). Для редкой периодической проверки — приемлемо.
+/// DB file size in bytes (file on disk, including the WAL journal of active
+/// writes). Fine for a rare periodic check.
 pub fn db_size_bytes(path: &Path) -> u64 {
     std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
 }
 
-/// Сводка по одному прогону — чистая функция, тестируется без таска.
+/// Summary for one run — pure function, testable without a task.
 pub struct HealthSnapshot {
     pub db_usage: Vec<DbUsage>,
     pub stream_usage: Vec<StreamUsageRow>,
@@ -41,9 +41,9 @@ pub struct HealthSnapshot {
 pub struct DbUsage {
     pub label: &'static str,
     pub size_bytes: u64,
-    /// 0 = без лимита.
+    /// 0 = no limit.
     pub max_mb: u64,
-    /// Занятость лимита в % (0 при max_mb == 0).
+    /// Limit usage in % (0 when max_mb == 0).
     pub pct: u64,
 }
 
@@ -92,8 +92,8 @@ pub fn collect_snapshot(
     }
 }
 
-/// Проверяет снапшот и возвращает список алертов (level + сообщение).
-/// Алерт = предупреждение/ошибка по занятости БД. Сводка (info) не входит.
+/// Checks the snapshot and returns a list of alerts (level + message).
+/// An alert = a warning/error on DB usage. The summary (info) is not included.
 pub fn alerts_from_snapshot(snap: &HealthSnapshot, warn_pct: u64) -> Vec<(Level, String)> {
     let mut alerts = Vec::new();
     if warn_pct == 0 {
@@ -125,9 +125,9 @@ pub fn alerts_from_snapshot(snap: &HealthSnapshot, warn_pct: u64) -> Vec<(Level,
     alerts
 }
 
-/// Поднимает фоновый таск health-монитора. `journal = None` — алерты идут
-/// только в tracing (журнал выключен в конфиге). `check_interval_secs == 0`
-/// или `!enabled` — не запускается (возвращает None).
+/// Spawns the background health-monitor task. `journal = None` — alerts go
+/// only to tracing (journal disabled in config). `check_interval_secs == 0`
+/// or `!enabled` — does not start (returns None).
 pub fn spawn(
     registry: Arc<Registry>,
     journal: Option<Arc<Journal>>,
@@ -145,7 +145,7 @@ pub fn spawn(
             let snap = collect_snapshot(&targets, &registry);
             let alerts = alerts_from_snapshot(&snap, warn_pct);
 
-            // Алерты: в журнал (если есть) + tracing.
+            // Alerts: to the journal (if present) + tracing.
             for (level, msg) in &alerts {
                 if let Some(j) = &journal {
                     let _ = j.append(*level, "health", msg).await;
@@ -157,7 +157,7 @@ pub fn spawn(
                 }
             }
 
-            // Сводка: всегда в tracing, в журнал — одной записью info.
+            // Summary: always to tracing, to the journal — as a single info record.
             let dbs = snap
                 .db_usage
                 .iter()
@@ -233,7 +233,7 @@ mod tests {
     #[test]
     fn alerts_fire_at_warn_and_error_thresholds() {
         let dir = tempfile::tempdir().unwrap();
-        // 0 байт при max_mb=1 -> pct=0, алертов нет.
+        // 0 bytes at max_mb=1 -> pct=0, no alerts.
         let empty = DbTarget {
             label: "event_log",
             path: dir.path().join("empty.db"),
@@ -242,7 +242,7 @@ mod tests {
         let snap = collect_snapshot(&[empty], &test_registry());
         assert!(alerts_from_snapshot(&snap, 80).is_empty());
 
-        // Файл ~1 МБ при max_mb=1 -> pct >= 100 -> error.
+        // ~1 MB file at max_mb=1 -> pct >= 100 -> error.
         let full = dir.path().join("full.db");
         std::fs::write(&full, vec![0u8; 1024 * 1024]).unwrap();
         let snap = collect_snapshot(
@@ -259,7 +259,7 @@ mod tests {
             "при 100% занятости должен быть error-алерт"
         );
 
-        // Файл ~0.9 МБ -> pct ~90 -> warn (не error).
+        // ~0.9 MB file -> pct ~90 -> warn (not error).
         let near = dir.path().join("near.db");
         std::fs::write(&near, vec![0u8; 900 * 1024]).unwrap();
         let snap = collect_snapshot(

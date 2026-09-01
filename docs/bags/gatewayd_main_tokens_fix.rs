@@ -1,13 +1,13 @@
-//! gatewayd/src/main.rs — ПАТЧ: {env:...} в tokens: теперь резолвится.
-//! Единственное изменение — build_registry(), одна строка.
+//! gatewayd/src/main.rs — PATCH: {env:...} in tokens: now resolves.
+//! The only change — build_registry(), one line.
 //!
-//! ⚠️ ВНИМАНИЕ: эта версия патча СТАРАЯ (писалась под старую сигнатуру
-//! resolve_env_placeholders с unwrap_or_default()). Текущий код main.rs:82
-//! уже возвращает anyhow::Result<String> (фикс аудита P1-10 — отсутствующая
-//! переменная = ошибка конфигурации на старте). Применять патч как есть
-//! НЕЛЬЗЯ: .collect() даст HashSet<Result<String>> и не скомпилируется.
+//! ⚠️ WARNING: this patch version is OLD (written against the old signature
+//! of resolve_env_placeholders with unwrap_or_default()). Current main.rs:82
+//! already returns anyhow::Result<String> (audit fix P1-10 — a missing
+//! variable = configuration error at startup). Applying the patch as is
+//! is NOT ALLOWED: .collect() would give HashSet<Result<String>> and fail to compile.
 //!
-//! Реально применённый эквивалент (в main.rs, строка 97):
+//! The equivalent that was actually applied (in main.rs, line 97):
 //!
 //!     let tokens: std::collections::HashSet<String> = raw
 //!         .tokens
@@ -15,18 +15,18 @@
 //!         .map(|t| resolve_env_placeholders(t))
 //!         .collect::<anyhow::Result<_>>()?;
 //!
-//! Поведение: {env:VAR} в tokens: резолвится как и в env: агентов;
-//! недостающая переменная → ошибка старта (не тихий пустой токен).
+//! Behavior: {env:VAR} in tokens: resolves just like in agents' env:;
+//! a missing variable → startup error (not a silently empty token).
 
 fn build_registry(raw: &RawConfig) -> Registry {
-    // БЫЛО:
+    // BEFORE:
     // let tokens: HashSet<String> = raw.tokens.iter().cloned().collect();
     //
-    // СТАЛО: тот же resolve_env_placeholders, что уже применяется к env:
-    // агентов (см. RawAgentEntry::Stdio ниже) — теперь и tokens: проходит
-    // через ту же функцию. Раньше это было забыто: resolve_env_placeholders
-    // писался с прицелом на env-словарь агентов, про плоский список
-    // tokens: никто явно не подумал.
+    // AFTER: the same resolve_env_placeholders already applied to env:
+    // of agents (see RawAgentEntry::Stdio below) — now tokens: also
+    // goes through the same function. This was forgotten before: resolve_env_placeholders
+    // was written with the agents' env dictionary in mind; the flat
+    // tokens: list was never explicitly considered.
     let tokens: HashSet<String> = raw
         .tokens
         .iter()

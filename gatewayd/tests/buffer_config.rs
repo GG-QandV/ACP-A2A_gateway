@@ -1,13 +1,13 @@
 //! gatewayd/tests/buffer_config.rs
 //!
-//! Фаза 1 буферного конфига: секции `event_log` и `task_store` в
-//! config.loc.buffer.yaml парсятся в типы gatewayd::config и отражают
-//! намерение (sqlite, включены, пути/лимиты из файла). Тест ходит по
-//! реальному файлу репо — это регрессия на «буфер объявлен в конфиге,
-//! но парсер его не видит».
+//! Buffer config Phase 1: the `event_log` and `task_store` sections in
+//! config.loc.buffer.yaml parse into gatewayd::config types and reflect the
+//! intent (sqlite, enabled, paths/limits from the file). The test reads the
+//! real repo file — a regression guard against "the buffer is declared in the
+//! config but the parser does not see it".
 //!
-//! Схему/таблицы наполняет Фаза 2 (EventLog); здесь проверяется только
-//! конфигурационный слой.
+//! Schema/tables are filled in by Phase 2 (EventLog); only the
+//! configuration layer is checked here.
 
 use gatewayd::config::{EventLogConfig, TaskStoreConfig};
 
@@ -53,8 +53,8 @@ fn task_store_section_parses_from_buffer_config() {
     assert_eq!(task_store.max_size_mb, 500);
 }
 
-/// Регрессия: конфиг без буферных секций (как config.example.yaml) не
-/// должен ломать парсинг — секции опциональны.
+/// Regression: a config without buffer sections (like config.example.yaml)
+/// must not break parsing — the sections are optional.
 #[test]
 fn config_without_buffer_sections_parses() {
     let value: serde_yaml::Value = serde_yaml::from_str(

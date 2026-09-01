@@ -238,7 +238,7 @@ fn ask_str(input: &mut impl BufRead, label: &str, default: &str) -> String {
     }
 }
 
-/// Опциональная строка: Enter = пустая (значение не пишется в конфиг).
+/// Optional string: Enter = empty (the value is not written to the config).
 fn ask_optional(input: &mut impl BufRead, label: &str) -> String {
     prompt(input, label, "").trim().to_string()
 }
