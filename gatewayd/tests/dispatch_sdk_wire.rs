@@ -185,7 +185,7 @@ fn build_task_context_id_prefers_camel_case_over_snake_case() {
 //
 // Полный E2E с реальным AcpAsA2a/SupervisedStdioAgent не поднимается в
 // unit-тесте (требует spawn процесса) — покрывается отдельно "живым E2E"
-// по DoD ТЗ (docs/design/TZ-add-adapterd-wire-format.md §5, п.4), вручную
+// по DoD ТЗ (docs/design/SPEC-add-adapterd-wire-format.md §5, п.4), вручную
 // или в CI-джобе с mock-агентом. Здесь фиксируем только чистую сериализацию
 // пары normalize_message → render_task_sdk без сети.
 #[test]

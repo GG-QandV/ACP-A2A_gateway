@@ -1,39 +1,41 @@
 # TECH_DEBT
 
-## Открытые
+> **Language:** English · [Русская версия](TECH_DEBT-ru.md)
 
-### 2026-08-19: юнит-покрытие 5 вариантов `SessionUpdate` (критерий 1.2) — 0 тестов
-- **Что**: маппинг `SessionUpdate → A2aEvent` в конвертерах не покрыт юнит-тестами на каждый из 5 вариантов enum (`AgentMessageChunk`, `ToolCall`, `ToolCallUpdate`, `Plan`, `UsageUpdate`) — untested variant = молчаливая потеря информации при расширении протокола.
-- **Impact**: low-medium — стриминг работает на happy path, но регрессия маппинга не ловится тестами.
-- **Fix**: юнит-тесты в `core/src/convert.rs` по каждому варианту (см. `docs/streaming-roadmap-checklist.md`, критерий 1.2).
+## Open
 
-### 2026-08-19: `tasks/resubscribe` — только HTTP, TCP line-протокол без RPC
-- **Что**: `tasks/resubscribe` и `tasks/get-last-seq` реализованы для HTTP (направление 4, `transport_http.rs`); TCP line-протокол (направление 3) не имеет resubscribe RPC — клиент, отвалившийся от TCP-стрима, переподключается только новым `session/prompt`.
-- **Impact**: low — resubscribe нужен HTTP-клиентам; TCP-направление работает без него.
-- **Fix**: по запросу — добавить `tasks/resubscribe` в TCP-транспорт (опционально).
+### 2026-08-19: unit coverage of the 5 `SessionUpdate` variants (criterion 1.2) — 0 tests
+- **What**: the `SessionUpdate → A2aEvent` mapping in the converters is not covered by unit tests for each of the 5 enum variants (`AgentMessageChunk`, `ToolCall`, `ToolCallUpdate`, `Plan`, `UsageUpdate`) — an untested variant = silent information loss when the protocol is extended.
+- **Impact**: low-medium — streaming works on the happy path, but a mapping regression is not caught by tests.
+- **Fix**: unit tests in `core/src/convert.rs` for each variant (see `docs/streaming-roadmap-checklist.md`, criterion 1.2).
 
-## Закрыто
+### 2026-08-19: `tasks/resubscribe` — HTTP only, TCP line protocol without RPC
+- **What**: `tasks/resubscribe` and `tasks/get-last-seq` are implemented for HTTP (direction 4, `transport_http.rs`); the TCP line protocol (direction 3) has no resubscribe RPC — a client that dropped off a TCP stream reconnects only via a new `session/prompt`.
+- **Impact**: low — resubscribe is needed by HTTP clients; the TCP direction works without it.
+- **Fix**: on request — add `tasks/resubscribe` to the TCP transport (optional).
 
-### 2026-08-19: tasks/resubscribe не реализован (Фаза 2.1 → реализован Phase 3.2)
-- **Закрыто**: durable event buffer (`gatewayd/src/event_log.rs`, монотонный per-task `seq`), `tasks/get-last-seq` + `tasks/resubscribe` в `transport_http.rs` (replay из event log как SSE-стрим) — клиент, отвалившийся посреди стрима, переподключается к идущей задаче через HTTP. См. коммит b9c0b8b.
+## Closed
 
-### 2026-08-18: хеш токена — HMAC-SHA256 (коммит a970dcd)
-- **Закрыто**: `RandomState` заменён на HMAC-SHA256 с ключом из `{env:GATEWAY_HMAC_KEY}` (дефолт `default-dev-key-do-not-use-in-prod` для разработки). Криптографический хеш, формат `Owner::Token { hash: u64 }` не изменился — `StoredTask` без миграции. Прода: обязательно задать ключ через env.
+### 2026-08-19: tasks/resubscribe not implemented (Phase 2.1 → implemented in Phase 3.2)
+- **Closed**: durable event buffer (`gatewayd/src/event_log.rs`, monotonic per-task `seq`), `tasks/get-last-seq` + `tasks/resubscribe` in `transport_http.rs` (replay from the event log as an SSE stream) — a client that dropped off mid-stream reconnects to the running task via HTTP. See commit b9c0b8b.
 
-### 2026-08-18: T4 — TCP-стрим, направление 3 (коммит a970dcd)
-- **Закрыто**: `HttpA2aAgent::send_task` при `Content-Type: text/event-stream` возвращает `Reply::Streaming` (SSE-клиент `sse_to_a2a_events`), иначе `Reply::Complete`. `blocking: false` для стрим-запросов. Тесты: юнит `send_task_returns_streaming_on_sse_response` + интеграционный `streaming_tcp.rs` (TCP-клиент получает `session/update` построчно). Mock-серверы генерируют SSE через реальную сериализацию `A2aEvent` (как прод `stream_to_sse`), без ручного JSON-хардкода.
+### 2026-08-18: token hash — HMAC-SHA256 (commit a970dcd)
+- **Closed**: `RandomState` replaced with HMAC-SHA256 keyed from `{env:GATEWAY_HMAC_KEY}` (default `default-dev-key-do-not-use-in-prod` for development). Cryptographic hash, the `Owner::Token { hash: u64 }` format is unchanged — `StoredTask` needs no migration. Production: the key must be set via env.
 
-### 2026-08-18: continue по contextId таймаутит (направление 4) (коммит 9cde4e6)
-- **Закрыто**: `ensure_session` уже возвращал существующую сессию (аудиты P1-1/P2-10), добавлен интеграционный тест `second_message_send_same_context_returns_same_session`.
+### 2026-08-18: T4 — TCP stream, direction 3 (commit a970dcd)
+- **Closed**: `HttpA2aAgent::send_task` returns `Reply::Streaming` (SSE client `sse_to_a2a_events`) when the response has `Content-Type: text/event-stream`, otherwise `Reply::Complete`. `blocking: false` for stream requests. Tests: unit `send_task_returns_streaming_on_sse_response` + integration `streaming_tcp.rs` (a TCP client receives `session/update` line by line). Mock servers generate SSE via real `A2aEvent` serialization (like prod `stream_to_sse`), without manual JSON hardcoding.
 
-### 2026-08-18: стриминг в конвертерах — Фаза 2.0 (коммиты af9c9d9, 1ee5574, 36745ac, 1e2de5d, da3749f, a970dcd)
-- **Закрыто**: `Reply::Streaming` реализован через `prompt_streaming()` (Р-20/Р-21). Транспорт: SSE (HTTP, направление 4) + построчный TCP (направление 3, SSE-клиент — см. T4). Лимит `max_concurrent_streams` (Semaphore per-agent, try_acquire_stream в HTTP+TCP, fail-closed). Раздельные first/idle_chunk_timeout в стрим-цикле. Логирование с ротацией (tracing-appender). Тесты T1-T9 + negative control + Р-23/Р-24 + hash HMAC. 151 тест, clippy -D warnings чисто. `tasks/resubscribe` закрыт отдельной записью выше.
+### 2026-08-18: continue by contextId times out (direction 4) (commit 9cde4e6)
+- **Closed**: `ensure_session` already returned the existing session (audits P1-1/P2-10); added the integration test `second_message_send_same_context_returns_same_session`.
 
-### 2026-08-09: сессии без session/new копились в HashMap (P2-8)
-- **Закрыто**: сессия только через `session/new`, `prompt` отклоняет неизвестный sessionId до acquire, `cancel` освобождает лиз, TTL-выселение, потолок `MAX_SESSIONS_PER_CONNECTION = 256`.
+### 2026-08-18: streaming in the converters — Phase 2.0 (commits af9c9d9, 1ee5574, 36745ac, 1e2de5d, da3749f, a970dcd)
+- **Closed**: `Reply::Streaming` implemented via `prompt_streaming()` (P-20/P-21). Transport: SSE (HTTP, direction 4) + line-delimited TCP (direction 3, SSE client — see T4). `max_concurrent_streams` limit (Semaphore per-agent, try_acquire_stream in HTTP+TCP, fail-closed). Separate first/idle_chunk_timeout in the stream loop. Logging with rotation (tracing-appender). Tests T1-T9 + negative control + P-23/P-24 + HMAC hash. 151 tests, clippy -D warnings clean. `tasks/resubscribe` closed by a separate entry above.
 
-### 2026-08-09: AgentCard.url пустой (P2-12)
-- **Закрыто**: url = `config.public_url` + `/agents/<id>/rpc`.
+### 2026-08-09: sessions without session/new accumulated in the HashMap (P2-8)
+- **Closed**: session only via `session/new`, `prompt` rejects an unknown sessionId before acquire, `cancel` releases the lease, TTL eviction, cap `MAX_SESSIONS_PER_CONNECTION = 256`.
 
-### 2026-08-09: файлы задач копились бесконечно
-- **Закрыто**: `sweep_expired(ttl)` + фоновая уборка раз в час по mtime файла (`.json.tmp` не трогаются).
+### 2026-08-09: AgentCard.url empty (P2-12)
+- **Closed**: url = `config.public_url` + `/agents/<id>/rpc`.
+
+### 2026-08-09: task files accumulated indefinitely
+- **Closed**: `sweep_expired(ttl)` + background sweep once an hour by file mtime (`.json.tmp` files are not touched).

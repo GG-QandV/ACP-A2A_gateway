@@ -1,25 +1,27 @@
-# SPEC: acp-gateway (минимальная версия ТЗ v0.1)
+# SPEC: acp-gateway (minimal version of the spec v0.1)
 
-Базируется на `tz-acp-a2a-gateway.md`. Цель — сократить ТЗ до
-реализуемого за одну итерацию MVP на Rust, без потери критериев приёмки
-из §9 исходного документа.
+> **Language:** English · [Русская версия](SPEC-acp-gateway-mvp-ru.md)
+
+Based on `SPEC-acp-a2a-gateway-legacy.md`. The goal is to cut the spec down to
+an MVP implementable in one iteration in Rust, without losing the acceptance criteria
+from §9 of the original document.
 
 ---
 
-## 0. Что сознательно вырезано из ТЗ для MVP
+## 0. What is deliberately cut from the spec for the MVP
 
-| Пункт ТЗ                                    | Решение для MVP                                  |
+| Spec item                                    | Decision for the MVP                                  |
 | -------------------------------------------- | ------------------------------------------------- |
-| 3 транспорта (TCP/WS/HTTP+SSE)                | Только **TCP**. Остальное — v1.1.                 |
-| Multi-agent реестр, роутинг по токену         | 1 статический токен → 1 агент. Реестр — потом.    |
-| Обратное направление ACP→A2A (bridge #2)      | Не входит в MVP, отдельный milestone.             |
-| TLS, rate limiting                            | Заглушки/TODO, не блокируют приёмку.               |
-| Reconnect с backoff, health-endpoint, метрики | Отложено в НФТ v1.1.                               |
-| `session/load`, permission policy (allow/deny/ask) | Заглушка: всегда `allow`.                     |
-| session_id remapping (несколько сессий/процесс) | Не нужен: 1 сессия = 1 процесс на MVP.          |
+| 3 transports (TCP/WS/HTTP+SSE)                | **TCP** only. The rest — v1.1.                 |
+| Multi-agent registry, token-based routing         | 1 static token → 1 agent. The registry — later.    |
+| Reverse direction ACP→A2A (bridge #2)      | Not in the MVP, a separate milestone.             |
+| TLS, rate limiting                            | Stubs/TODO, do not block acceptance.               |
+| Reconnect with backoff, health-endpoint, metrics | Deferred to NFR v1.1.                               |
+| `session/load`, permission policy (allow/deny/ask) | Stub: always `allow`.                     |
+| session_id remapping (several sessions/process) | Not needed: 1 session = 1 process in the MVP.          |
 
-Это даёт два независимых, отдельно сдаваемых куска: **(A) ACP Gateway
-MVP** и **(B) A2A→ACP bridge MVP** — вместо одного большого релиза.
+This yields two independent, separately deliverable pieces: **(A) ACP Gateway
+MVP** and **(B) A2A→ACP bridge MVP** — instead of one big release.
 
 ---
 
@@ -29,15 +31,15 @@ MVP** и **(B) A2A→ACP bridge MVP** — вместо одного большо
 acp-gateway/
 ├── Cargo.toml                # workspace
 ├── crates/
-│   ├── acp-proto/            # JSON-RPC 2.0 типы ACP, (de)serialize
-│   ├── acp-core/             # trait AcpAgent + доменные типы
-│   ├── acp-stdio-agent/      # StdioAcpAgent: spawn + framing по stdio
-│   ├── acp-gateway/          # bin: TCP-сервер, token-auth, proxy loop
+│   ├── acp-proto/            # ACP JSON-RPC 2.0 types, (de)serialize
+│   ├── acp-core/             # trait AcpAgent + domain types
+│   ├── acp-stdio-agent/      # StdioAcpAgent: spawn + framing over stdio
+│   ├── acp-gateway/          # bin: TCP server, token-auth, proxy loop
 │   └── acp-a2a-bridge/       # bin: HTTP(A2A) endpoint -> AcpAgent
 └── config.example.yaml
 ```
 
-## 2. Ключевой trait (единственный, нужный для MVP)
+## 2. Key trait (the only one needed for the MVP)
 
 ```rust
 #[async_trait::async_trait]
@@ -50,10 +52,10 @@ pub trait AcpAgent: Send + Sync {
 }
 ```
 
-`A2aAgent` trait из §6 исходного ТЗ откладывается до второго
-направления bridge — для MVP он не нужен.
+The `A2aAgent` trait from §6 of the original spec is deferred until the second
+direction of the bridge — it is not needed for the MVP.
 
-## 3. Конфиг (минимум)
+## 3. Config (minimal)
 
 ```yaml
 gateway:
@@ -64,45 +66,45 @@ agent:
 token: "t-static-dev"
 ```
 
-Без секции `agents:` (мультиагентный реестр) и без `tokens:` списка —
-один токен, один агент.
+Without the `agents:` section (multi-agent registry) and without a `tokens:`
+list — one token, one agent.
 
-## 4. Транспорт
+## 4. Transport
 
-Только TCP, newline-delimited JSON-RPC 2.0 (канон ACP как есть, без
-адаптации под WS/SSE). Хендшейк: первая строка от клиента —
-`{"token": "<T>"}`; при несовпадении — закрыть соединение с кодом ошибки,
-до этого момента ACP-сообщения не принимаются и не форвардятся агенту.
+TCP only, newline-delimited JSON-RPC 2.0 (the ACP canon as-is, without
+adaptation for WS/SSE). Handshake: the first line from the client is
+`{"token": "<T>"}`; on mismatch — close the connection with an error code;
+until that moment no ACP messages are accepted or forwarded to the agent.
 
-## 5. Проксирование
+## 5. Proxying
 
-1:1 форвардинг между TCP-сокетом и stdin/stdout дочернего процесса
-(`StdioAcpAgent`), без ремаппинга `session_id` (не нужен при 1
-сессии/процесс). Lazy-spawn при первом `session/new`, kill при закрытии
-соединения.
+1:1 forwarding between the TCP socket and the stdin/stdout of the child process
+(`StdioAcpAgent`), without `session_id` remapping (not needed at 1
+session/process). Lazy spawn on the first `session/new`, kill on connection
+close.
 
-## 6. Критерии приёмки MVP (сведены к проверяемому минимуму из §9 ТЗ)
+## 6. MVP acceptance criteria (reduced to a verifiable minimum from §9 of the spec)
 
-1. `acp_e2e.py` через `acp-gateway --config config.yaml` получает PONG от `claurst acp`.
-2. Неверный/отсутствующий токен → отказ на уровне транспорта.
-3. `cargo check --workspace` и `clippy` без warnings.
+1. `acp_e2e.py` via `acp-gateway --config config.yaml` gets PONG from `claurst acp`.
+2. Invalid/missing token → refusal at the transport level.
+3. `cargo check --workspace` and `clippy` without warnings.
 
-(Пункты 2, 4, 6 из §9 — multi-agent, обратный bridge, стриминг-латентность — вне MVP, идут в v1.1/v2.)
+(Items 2, 4, 6 from §9 — multi-agent, reverse bridge, streaming-latency — are out of the MVP, they go to v1.1/v2.)
 
-## 7. Оценка трудозатрат
+## 7. Effort estimate
 
-| Этап                                              | Дни     |
+| Stage                                              | Days     |
 | -------------------------------------------------- | ------- |
-| Workspace skeleton + `acp-proto` (JSON-RPC типы)    | 1       |
+| Workspace skeleton + `acp-proto` (JSON-RPC types)    | 1       |
 | `AcpAgent` trait + `StdioAcpAgent` (spawn + framing) | 1.5     |
-| TCP-транспорт + token-auth + proxy loop             | 1.5     |
-| Тесты: mock-agent unit + e2e с реальным `claurst acp` | 1     |
-| **Итого: ACP Gateway MVP**                          | **5**   |
-| A2A HTTP endpoint (`/rpc`, `/.well-known/agent.json`), только A2A→ACP | 3–4 |
-| **Итого: Gateway MVP + однонаправленный bridge**    | **8–9** |
+| TCP transport + token-auth + proxy loop             | 1.5     |
+| Tests: mock-agent unit + e2e with real `claurst acp` | 1     |
+| **Total: ACP Gateway MVP**                          | **5**   |
+| A2A HTTP endpoint (`/rpc`, `/.well-known/agent.json`), A2A→ACP only | 3–4 |
+| **Total: Gateway MVP + one-directional bridge**    | **8–9** |
 
-Полный объём исходного ТЗ (оба направления bridge, 3 транспорта, TLS,
-rate limiting, reconnect+backoff, метрики/health, multi-agent реестр,
-тесты edge-cases из §5.5) — ориентировочно ещё **+10–15 дней** сверху.
+The full scope of the original spec (both bridge directions, 3 transports, TLS,
+rate limiting, reconnect+backoff, metrics/health, multi-agent registry,
+edge-case tests from §5.5) — approximately another **+10–15 days** on top.
 
-**Итого весь ТЗ целиком: ≈ 18–24 человеко-дня (3.5–5 недель одного Rust-разработчика уровня middle+/senior).**
+**Total for the entire spec: ≈ 18–24 person-days (3.5–5 weeks of a single middle+/senior-level Rust developer).**

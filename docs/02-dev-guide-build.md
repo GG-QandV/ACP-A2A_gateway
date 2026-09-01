@@ -1,97 +1,99 @@
-# Дев-гайд: сборка
+# Dev guide: build
 
-## Предварительные требования
+> **Language:** English · [Русская версия](02-dev-guide-build-ru.md)
 
-- Rust stable (edition 2021), `cargo` в PATH.
-- Для реальных ACP-агентов: бинарник агента в PATH (`claurst`, `opencode`
-  и т.п.) — нужен только для интеграционных тестов и локального запуска,
-  не для `cargo build`.
-- Не требуется: Docker, внешние сервисы, сеть (сборка полностью офлайн
-  после `cargo fetch`).
+## Prerequisites
 
-## Сборка с нуля
+- Rust stable (edition 2021), `cargo` in PATH.
+- For real ACP agents: the agent binary in PATH (`claurst`, `opencode`,
+  etc.) — needed only for integration tests and local runs,
+  not for `cargo build`.
+- Not required: Docker, external services, network (the build is fully offline
+  after `cargo fetch`).
+
+## Building from scratch
 
 ```bash
 git clone <repo-url> gateway && cd gateway
 
-# Скачать все зависимости заранее (удобно при нестабильной сети)
+# Download all dependencies upfront (handy on an unstable network)
 cargo fetch
 
-# Собрать весь workspace одной командой
+# Build the entire workspace with one command
 cargo build --workspace
 
-# Релизная сборка (оптимизации, медленнее компилируется)
+# Release build (optimized, slower to compile)
 cargo build --workspace --release
 ```
 
-Бинарник после сборки: `target/debug/gatewayd` (или `target/release/gatewayd`).
+Binary after the build: `target/debug/gatewayd` (or `target/release/gatewayd`).
 
-## Сборка отдельных crate'ов
+## Building individual crates
 
-Полезно при работе над одним модулем — не пересобирает весь workspace:
-
-```bash
-cargo build -p protocol   # только типы, самая быстрая сборка
-cargo build -p core       # ядро + protocol
-cargo build -p gatewayd   # всё целиком (зависит от core и protocol)
-```
-
-## Проверка без полной сборки (быстрее в разработке)
+Useful when working on a single module — doesn't rebuild the whole workspace:
 
 ```bash
-cargo check --workspace       # проверка типов без генерации бинарника
-cargo clippy --workspace       # линтер — обязателен перед коммитом
-cargo clippy --workspace -- -D warnings   # fail on any warning (CI-режим)
+cargo build -p protocol   # types only, fastest build
+cargo build -p core       # core + protocol
+cargo build -p gatewayd   # everything (depends on core and protocol)
 ```
 
-Критерий приёмки из исходного ТЗ: **`cargo check --workspace` и `clippy`
-без warnings** — это должно проходить на каждом коммите, не только перед
-релизом.
+## Checking without a full build (faster in development)
 
-## Первый запуск
+```bash
+cargo check --workspace       # type check without generating a binary
+cargo clippy --workspace       # linter — required before commit
+cargo clippy --workspace -- -D warnings   # fail on any warning (CI mode)
+```
+
+Acceptance criterion from the original spec: **`cargo check --workspace` and `clippy`
+without warnings** — this must pass on every commit, not only before
+release.
+
+## First run
 
 ```bash
 cp config.example.yaml config.yaml
-# отредактировать config.yaml: путь к реальному ACP-агенту, токены,
+# edit config.yaml: path to a real ACP agent, tokens,
 # task_store_dir
 
-export OPENMODEL_API_KEY="..."   # если агент требует ключ (см. env: в конфиге)
+export OPENMODEL_API_KEY="..."   # if the agent requires a key (see env: in the config)
 
 cargo run -p gatewayd -- config.yaml
 ```
 
-При успешном старте в логах (уровень `info`, управляется `RUST_LOG`):
+On a successful start, the logs (level `info`, controlled by `RUST_LOG`) show:
 
 ```
 starting acp-a2a gateway (dual transport, 3 directions)
 tcp transport listening (listen_addr=0.0.0.0:8347)
 ```
 
-Управление уровнем логов:
+Log level control:
 
 ```bash
 RUST_LOG=debug cargo run -p gatewayd -- config.yaml
 RUST_LOG=core=trace,gatewayd=info cargo run -p gatewayd -- config.yaml
 ```
 
-## Частые проблемы сборки
+## Common build problems
 
-| Симптом | Причина | Решение |
+| Symptom | Cause | Fix |
 |---|---|---|
-| `error: linking with cc failed` | Нет системного линкера (Linux) | `apt install build-essential` / `xcode-select --install` (macOS) |
-| `failed to select a version for reqwest` | Конфликт версий TLS-бэкенда | Проверить, что `reqwest` версия одинакова в `core/Cargo.toml` и `gatewayd/Cargo.toml` |
-| Долгая первая сборка (>2 мин) | `axum`+`reqwest`+`tokio` тянут много транзитивных зависимостей | Нормально для первой сборки; последующие — инкрементальные, секунды |
-| `cargo clippy` падает на `unreachable!()` в `convert.rs` | Это ожидаемо — Reply::Streaming веткой в Фазе 1 недостижима намеренно | Не баг, см. архитектурный гайд §"seam для стриминга" |
+| `error: linking with cc failed` | No system linker (Linux) | `apt install build-essential` / `xcode-select --install` (macOS) |
+| `failed to select a version for reqwest` | TLS backend version conflict | Check that the `reqwest` version is the same in `core/Cargo.toml` and `gatewayd/Cargo.toml` |
+| Slow first build (>2 min) | `axum`+`reqwest`+`tokio` pull in many transitive dependencies | Normal for a first build; subsequent ones are incremental, seconds |
+| `cargo clippy` fails on `unreachable!()` in `convert.rs` | This is expected — the Reply::Streaming branch is intentionally unreachable in Phase 1 | Not a bug, see the architecture guide §"seam for streaming" |
 
-## CI-минимум (если настраивается GitHub Actions/аналог)
+## CI minimum (if GitHub Actions or a similar setup is configured)
 
 ```yaml
-# .github/workflows/ci.yml (минимальный, без деплоя)
+# .github/workflows/ci.yml (minimal, no deploy)
 steps:
   - run: cargo check --workspace
   - run: cargo clippy --workspace -- -D warnings
   - run: cargo test --workspace
 ```
 
-Это ровно тот же набор команд, что и локальная разработка — специальной
-CI-инфраструктуры для этого проекта на этапе MVP не требуется.
+This is exactly the same set of commands as local development — no special
+CI infrastructure is needed for this project at the MVP stage.

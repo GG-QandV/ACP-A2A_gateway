@@ -23,7 +23,7 @@ persisted to a durable `event_log` (SQLite), so a dropped client can resume via
 Dialect strategy for the gateway and adapter (SDK v1.0 = base, Spec pre-1.0 =
 fallback, ACP = deep fallback, ANP — out of scope):
 
-- **EN:** [A2A-protocol-strategy-2026-en.summary.md](docs/A2A-protocol-strategy-2026-en.summary.md)
+- **EN:** [docs/A2A-protocol-strategy-2026.summary.md](docs/A2A-protocol-strategy-2026.summary.md)
 - **UA:** [A2A-protocol-strategy-2026-uk.summary.md](docs/A2A-protocol-strategy-2026-uk.summary.md)
 - **RU:** [A2A-protocol-strategy-2026-ru.summary.md](docs/A2A-protocol-strategy-2026-ru.summary.md)
 
@@ -108,7 +108,7 @@ logging:
   (`approvals:` config section; an unapproved agent is not served and is logged to the journal).
 - `gatewayd --setup` — interactive config generation wizard.
 
-Full guide: [`docs/06-gateway-guide.md`](docs/06-gateway-guide.md) (RU) · [`docs/06-gateway-guide-en.md`](docs/06-gateway-guide-en.md) (EN) · [`docs/06-gateway-guide-uk.md`](docs/06-gateway-guide-uk.md) (UK).
+Full guide: [`docs/06-gateway-guide.md`](docs/06-gateway-guide.md) (RU) · [`docs/06-gateway-guide.md`](docs/06-gateway-guide.md) (EN) · [`docs/06-gateway-guide-uk.md`](docs/06-gateway-guide-uk.md) (UK).
 
 ## Streaming (summary)
 

@@ -1,338 +1,340 @@
-# Реестр решений
+# Decision Register
 
-Почему код устроен так, а не иначе. Каждая запись: что решили, из-за
-чего, и что с этим будет при переходе в облако.
+> **Language:** English · [Русская версия](decisions-ru.md)
 
-Колонка «облако» — не план работ, а предупреждение: где решение Фазы 1
-перестанет работать при >1 инстансе gatewayd. Подробности плана — в
-`05-cloud-architecture-draft.md`, но учтите, что черновик писался до
-правок P1-1/P1-2/P2-8 и местами описывает код, которого уже нет (см. Р-16).
+Why the code is structured this way and not another. Each entry: what was
+decided, because of what, and what will become of it on the move to the cloud.
 
----
-
-## Протокол и типы
-
-### Р-1. Крейт называется `gateway-core`, не `core`
-
-Имя `core` конфликтует со встроенным крейтом из extern prelude:
-`use core::{...}` в gatewayd давал `error[E0659]: core is ambiguous`.
-Проект не собирался вовсе.
-
-**Облако:** без последствий.
-
-### Р-2. `protocolVersion` — `u32`, приём либеральный, выход строгий
-
-По ACP версия числовая. claurst отвечает числом `1`; встречаются
-реализации со строкой. Толерантность живёт в десериализаторе
-(`de_protocol_version`: `1`, `"1"`, `"2.1"` → мажорная часть), а
-внутренний тип соответствует протоколу и наружу всегда уходит число.
-
-Промежуточное состояние — принимать оба, а хранить `String` — было
-отвергнуто: тип, который врёт о содержимом, переживает своих авторов.
-Шлюз в этом варианте продолжал слать агенту строку `"1"`; claurst
-проглотил, строгий парсер отверг бы.
-
-**Облако:** без последствий.
-
-### Р-3. `default` для версии — именованная функция, не `Default::default()`
-
-У `u32` дефолт равен нулю, а отсутствующее поле означает версию `1`.
-Поймано тестом, не ревью.
-
-**Облако:** без последствий.
-
-### Р-4. Клиентские возможности в `initialize` заявлены пустыми
-
-Шлюз не реализует fs, терминал и запрос разрешений — значит, не должен
-их заявлять. Корректный агент, увидев пустые возможности, не станет
-слать встречные запросы.
-
-Следствие: сценарий «посмотреть, что спрашивает агент» невоспроизводим
-не случайно, а по построению. Пока возможности не заявлены, агент их не
-использует.
-
-**Облако:** при реализации клиентской стороны ACP (проксирование
-запросов агента конечному A2A-клиенту) решение придётся пересмотреть —
-и тогда же станет актуальна Р-5.
-
-### Р-5. Reader отличает запросы агента от ответов по наличию `method`
-
-ACP — двусторонний JSON-RPC. Агент шлёт клиенту запросы
-(`session/request_permission`, `fs/read_text_file`), и нумерация их `id`
-начинается с единицы, то есть сталкивается с нашей. Раньше ответом
-считалась любая строка с числовым `id`: запрос агента съедал запись из
-`pending`, настоящий ответ разрешать было некому, вызов висел до
-таймаута.
-
-На запрос агента отвечаем `-32601`. Молчать нельзя — иначе вместо
-своего таймаута получаем зависание агента.
-
-**Оговорка:** live-подтверждения нет. claurst встречных запросов не
-слал (см. Р-4), так что причиной наблюдавшегося зависания это, скорее
-всего, не было — реальной причиной оказалась Р-6. Фикс оставлен как
-корректный по протоколу, но не как проверенный.
-
-**Облако:** без последствий.
+The "cloud" column is not a work plan but a warning: where a Phase 1
+decision will stop working with >1 gatewayd instance. Plan details are in
+`05-cloud-architecture-draft.md`, but note that the draft was written before
+the P1-1/P1-2/P2-8 edits and in places describes code that no longer exists (see P-16).
 
 ---
 
-## Жизненный цикл процесса агента
+## Protocol and types
 
-### Р-6. `initialize` — часть подъёма процесса, а не отдельный вызов
+### P-1. The crate is named `gateway-core`, not `core`
 
-Было: `initialize` звался только из `card()`, то есть при запросе
-`agent.json`. Клиент, идущий сразу в `message/send`, доводил агента до
-`session/new` без рукопожатия. После респавна свежий процесс не получал
-`initialize` никогда.
+The name `core` conflicts with the built-in crate from the extern prelude:
+`use core::{...}` in gatewayd gave `error[E0659]: core is ambiguous`.
+The project did not build at all.
 
-Теперь рукопожатие делает `SupervisedStdioAgent::spawn_and_handshake` —
-каждый живой процесс инициализирован ровно один раз. Ответ кэшируется,
-повторный `initialize` не шлётся: ACП его не предполагает.
+**Cloud:** no consequences.
 
-**Live-подтверждено:** после kill/респавна запрос отрабатывает за 2.7с
-вместо 60-секундного таймаута.
+### P-2. `protocolVersion` is `u32` — liberal intake, strict output
 
-**Облако:** без последствий, если процесс агента остаётся локальным для
-инстанса (см. Р-8).
+Per ACP the version is numeric. claurst replies with the number `1`; string-based
+implementations exist. Tolerance lives in the deserializer
+(`de_protocol_version`: `1`, `"1"`, `"2.1"` → major part), while the
+internal type matches the protocol and a number always goes out on the wire.
 
-### Р-7. Респавн помечает потерянные разговоры, а не прячет их
+An intermediate state — accepting both but storing a `String` — was
+rejected: a type that lies about its contents outlives its authors.
+The gateway in that variant kept sending the agent the string `"1"`; claurst
+swallowed it, a strict parser would have rejected it.
 
-Умерший агент раньше кэшировался навсегда: все запросы к нему падали до
-ручного рестарта шлюза.
+**Cloud:** no consequences.
 
-Из трёх вариантов (отказ до вмешательства / тихий респавн / респавн с
-пометкой) выбран третий. Причина: при тихом респавне клиент не отличает
-«агент помнит разговор» от «агент перезапустился и не помнит». Для
-шлюза, который торгует непрерывностью разговора, это неприемлемо.
+### P-3. The version `default` is a named function, not `Default::default()`
 
-Механика — номер поколения процесса. `SessionEntry` помнит, в каком
-поколении заведена ACP-сессия; обращение к разговору прошлого поколения
-даёт `ContextLost` → `409` / `-32010`. Пометка одноразовая: следующий
-запрос с тем же `contextId` создаёт свежую сессию.
+The `u32` default is zero, but a missing field means version `1`.
+Caught by a test, not by review.
 
-`ensure_ready()` в трейте существует именно из-за порядка: при ленивом
-респавне поколение читалось до того, как супервизор замечал смерть, и
-клиент получал от агента «Invalid params» вместо честного `ContextLost`.
+**Cloud:** no consequences.
 
-**Облако:** `contextId` обязан попадать на тот же инстанс — иначе
-поколение чужое и клиент получит ложный `ContextLost`. См. Р-16.
+### P-4. Client capabilities in `initialize` are declared empty
 
-### Р-8. Респавн с backoff 5с, потолок 256 разговоров на агента
+The gateway does not implement fs, terminal, or permission requests — so it must
+not declare them. A correct agent, seeing empty capabilities, will not
+send counter-requests.
 
-Без backoff агент, падающий на старте, даёт цикл перезапусков. Потолок
-разговоров — чтобы клиент упирался в лимит, а не в память шлюза.
+Consequence: the "see what the agent is asking" scenario is unreproducible
+not by accident, but by construction. Until capabilities are declared, the agent
+does not use them.
 
-Оба числа захардкожены. Осознанно: в конфиге и так девять параметров, а
-эти два ни разу не потребовали настройки.
+**Cloud:** when implementing the ACP client side (proxying agent
+requests to the end A2A client), this decision will have to be revisited —
+and P-5 becomes relevant at the same time.
 
-**Облако:** потолок становится per-instance, то есть фактический лимит
-умножается на число реплик. Для per-tenant лимитов нужен внешний счётчик
-(черновик §2.3).
+### P-5. The Reader tells agent requests from responses by the presence of `method`
 
----
+ACP is two-way JSON-RPC. The agent sends requests to the client
+(`session/request_permission`, `fs/read_text_file`), and their `id` numbering
+starts at one, i.e. it collides with ours. Previously any line with a numeric
+`id` was treated as a response: an agent request consumed an entry from
+`pending`, there was nobody left to resolve the real response, and the call hung until
+the timeout.
 
-## Изоляция и владение
+We answer an agent request with `-32601`. Staying silent is not an option — otherwise
+instead of our own timeout we get an agent hang.
 
-### Р-9. Сессия на `contextId`, а не на токен
+**Caveat:** there is no live confirmation. claurst never sent counter-requests
+(see P-4), so this most likely was not the cause of the observed hang —
+the real cause turned out to be P-6. The fix is kept as protocol-correct,
+but not as verified.
 
-Было: одна ACP-сессия на весь адаптер, а адаптер кэшируется по
-`agent_id` — любые два A2A-клиента одного агента оказывались в общем
-разговоре и видели контекст друг друга.
-
-Рассматривался вариант «ключ кэша `(token, agent_id)`»: проще, но
-изоляция получается по токену, а не по разговору, и каждый новый клиент
-требует отдельного токена в конфиге плюс рестарт шлюза. Вариант с
-`contextId` не требует от клиента ничего — это штатное поле A2A,
-которое он и так шлёт.
-
-Ключевое наблюдение: один stdio-процесс держит много ACP-сессий, поэтому
-плодить процессы не нужно. **Live-подтверждено на claurst 0.1.7.**
-
-**Облако:** реестр сессий в памяти процесса. Черновик §2.4 предлагает
-sticky routing — этого достаточно, но именно из-за этого решения, а не
-из-за того, что там написано (см. Р-16).
-
-### Р-10. Владелец — хеш токена, не сам токен
-
-Для ответа на вопрос «тот же клиент?» достаточно равенства, а держать
-секрет в памяти и на диске дольше необходимого незачем.
-`DefaultHasher`, не криптографический: подбор здесь не в модели угроз,
-хеш никогда не покидает процесс и хранилище.
-
-**Облако — здесь мина.** При переходе на OAuth2 токены становятся
-короткоживущими и ротируются. Владелец, записанный как хеш токена,
-после ротации перестанет совпадать, и клиент потеряет доступ к
-собственным задачам. Владельцем должен стать `tenant_id` (или `sub`)
-из `Identity`, а не токен. Правка точечная — `Owner::from_token`
-заменяется на `Owner::from_identity`, — но обязательная, и она требует
-миграции уже записанных задач.
-
-### Р-11. Владелец задачи — в конверте хранилища, не в `Task.metadata`
-
-`metadata` возвращается клиенту в ответе; внутренняя атрибуция там не
-место. Файл хранит `StoredTask { owner, task }`.
-
-Проверка по хранилищу, а не по живому реестру сессий, — потому что иначе
-она не переживает выселение сессии по TTL и рестарт шлюза: та же дыра,
-только с задержкой.
-
-Файлы старого формата (голый `Task`) читаются как `owner: None` и не
-отклоняются — иначе обновление шлюза сделало бы накопленные задачи
-недоступными их же владельцам.
-
-**Облако:** формат конверта переживёт переезд в БД; см. Р-10 про
-содержимое поля.
-
-### Р-12. `session/prompt` отклоняет неизвестный `sessionId`
-
-Было: `prompt` брал `sessionId` прямо из запроса и ключевал им
-`TurnLease`, а `forget` не звался нигде. Любой присланный идентификатор
-навсегда добавлял запись — клиент с валидным токеном забивал память
-шлюза, генерируя `sessionId` на лету.
-
-Теперь сессия существует, только если заведена через `session/new`. Так
-и требует ACP; проверка идёт **до** `acquire`, иначе отвергнутый
-идентификатор успевал бы оставить запись.
-
-Аудит формулировал этот пункт как «нужен `session/close`, которого в
-A2A нет». Формулировка оказалась неверной: проблема на ACP-стороне, где
-`session/cancel` есть и приходит от клиента — просто не освобождал лиз.
-Стоит помнить как пример: чинить по описанию дефекта, не глядя в код,
-здесь не сработало.
-
-**Облако:** `TurnLease` — мьютекс в памяти процесса. При >1 инстансе
-гарантия «один ход на сессию» исчезает, если запросы одной сессии
-попадут на разные реплики. Sticky routing её восстанавливает; без него
-нужен распределённый лиз.
+**Cloud:** no consequences.
 
 ---
 
-## Хранилище и ошибки
+## Agent process lifecycle
 
-### Р-13. Уборка задач по mtime файла, а не по времени внутри задачи
+### P-6. `initialize` is part of process bring-up, not a separate call
 
-`mtime` обновляется атомарной записью и не зависит от того, что агент
-положил в поле времени (а положить он может что угодно или ничего).
+Before: `initialize` was called only from `card()`, i.e. on a request for
+`agent.json`. A client going straight to `message/send` brought the agent to
+`session/new` without a handshake. After a respawn, the fresh process never received
+`initialize`.
 
-Файлы `.json.tmp` не трогаются — это чужая недописанная запись. Уборка
-ходит по каталогам на диске, а не по живым адаптерам: задачи
-остановленного агента тоже надо убирать, а его адаптера в памяти уже
-нет. Срок по умолчанию — неделя: клиент вправе забрать результат через
-`tasks/get` спустя долгое время.
+Now the handshake is done by `SupervisedStdioAgent::spawn_and_handshake` —
+every live process is initialized exactly once. The response is cached,
+a repeated `initialize` is not sent: ACP does not contemplate one.
 
-**Облако — вторая мина.** Уборщик запускается в каждом процессе
-gatewayd. При общем хранилище (сетевой том, объектное хранилище) N реплик
-будут обходить один каталог параллельно. Само по себе не разрушительно
-(удаление идемпотентно), но это N-кратный лишний обход и гонки на
-`remove_file`. Нужен либо лидер-элект, либо вынос уборки в отдельный
-cron-под.
+**Live-confirmed:** after kill/respawn the request completes in 2.7s
+instead of the 60-second timeout.
 
-### Р-14. Коды отказа агента разделены по смыслу
+**Cloud:** no consequences if the agent process stays local to the
+instance (see P-8).
 
-`404` — про адресацию, повтор не поможет. `503` — про доступность,
-повторить стоит. `400` — не тот транспорт.
+### P-7. Respawn marks lost conversations rather than hiding them
 
-До этого все три случая отдавали `404` / `-32601`, и падение спавна
-выглядело как опечатка в `agent_id`. Именно это увело диагностику при
-разборе live-теста с `protocolVersion`: сообщение врало о природе
-проблемы. В проде такая ошибка стоит не одного отладочного цикла, а
-каждого инцидента.
+A dead agent used to be cached forever: every request to it failed until
+a manual restart of the gateway.
 
-**Облако:** коды переживут переезд; добавятся `401`/`403` от Auth-слоя.
+Of the three options (refuse until intervention / quiet respawn / respawn with
+a mark) the third was chosen. Reason: with a quiet respawn the client cannot tell
+"the agent remembers the conversation" from "the agent restarted and does not remember". For
+a gateway that sells conversation continuity, this is unacceptable.
 
-### Р-15. `AgentCard.url` — адрес конкретного агента, не шлюза
+The mechanic is a process generation number. `SessionEntry` remembers which
+generation the ACP session was created in; addressing a conversation of a past generation
+yields `ContextLost` → `409` / `-32010`. The mark is one-shot: the next
+request with the same `contextId` creates a fresh session.
 
-Карточка описывает конечную точку, куда клиент будет слать
-`message/send`: `{public_url}/agents/{agent_id}/rpc`. Раньше поле было
-пустым, то есть карточка невалидна по A2A-спеке, — а `agent.json` это
-первое, что читает внешний клиент.
+`ensure_ready()` exists in the trait precisely because of ordering: under lazy
+respawn the generation was read before the supervisor noticed the death, and the
+client got "Invalid params" from the agent instead of an honest `ContextLost`.
 
-`public_url` — внешний адрес, а не адрес привязки: за reverse-proxy это
-домен прокси. Дефолт `http://localhost:8348` безопасен, но почти
-наверняка неверен для любого реального развёртывания.
+**Cloud:** `contextId` must land on the same instance — otherwise the
+generation is foreign and the client gets a false `ContextLost`. See P-16.
 
-**Облако:** значение станет зависеть от тенанта, если появятся
-пер-тенантные домены.
+### P-8. Respawn with 5s backoff, ceiling of 256 conversations per agent
+
+Without backoff, an agent crashing on startup produces a restart loop. The conversation
+ceiling is so that the client runs into a limit, not into the gateway's memory.
+
+Both numbers are hardcoded. Deliberately: the config already has nine parameters, and
+these two never once required tuning.
+
+**Cloud:** the ceiling becomes per-instance, i.e. the effective limit
+is multiplied by the number of replicas. Per-tenant limits need an external counter
+(draft §2.3).
 
 ---
 
-## Границы системы
+## Isolation and ownership
 
-### Р-16. Черновик облачной архитектуры частично устарел
+### P-9. Session per `contextId`, not per token
 
-`05-cloud-architecture-draft.md` §2.4 описывает
-`session: Mutex<Option<SessionId>>` как текущее состояние. Этого поля
-больше нет с Р-9: состояние теперь `HashMap<ContextId, SessionEntry>`
-плюс реестр сессий в `A2aAsAcp` (Р-12) плюс кэш адаптеров плюс
+Before: one ACP session for the whole adapter, and the adapter is cached by
+`agent_id` — any two A2A clients of one agent ended up in a shared
+conversation and saw each other's context.
+
+The variant "cache key `(token, agent_id)`" was considered: simpler, but the
+isolation comes out per token rather than per conversation, and every new client
+requires a separate token in the config plus a gateway restart. The
+`contextId` variant requires nothing from the client — it is a standard A2A field
+it already sends.
+
+Key observation: one stdio process holds many ACP sessions, so there is no need
+to multiply processes. **Live-confirmed on claurst 0.1.7.**
+
+**Cloud:** session registry in process memory. Draft §2.4 proposes
+sticky routing — that is enough, but precisely because of this decision, not
+because of what is written there (see P-16).
+
+### P-10. The owner is the token hash, not the token itself
+
+To answer the question "the same client?" equality is enough, and there is no reason
+to keep the secret in memory and on disk longer than necessary.
+`DefaultHasher`, not cryptographic: brute-forcing is not in the threat model here,
+the hash never leaves the process and the store.
+
+**Cloud — this is where the landmine is.** On the move to OAuth2 tokens become
+short-lived and rotate. An owner recorded as a token hash,
+after rotation, will stop matching, and the client loses access to
+its own tasks. The owner should become `tenant_id` (or `sub`) from
+`Identity`, not the token. The edit is pinpoint — `Owner::from_token`
+is replaced by `Owner::from_identity` — but mandatory, and it requires
+migrating already-recorded tasks.
+
+### P-11. Task owner lives in the storage envelope, not in `Task.metadata`
+
+`metadata` is returned to the client in the response; internal attribution has no place
+there. The file stores `StoredTask { owner, task }`.
+
+The check goes against the store, not the live session registry — because otherwise
+it would not survive session TTL eviction and a gateway restart: the same hole,
+just with a delay.
+
+Old-format files (bare `Task`) are read as `owner: None` and are not
+rejected — otherwise a gateway upgrade would make accumulated tasks
+unavailable to their own owners.
+
+**Cloud:** the envelope format will survive the move to a DB; see P-10 on the
+contents of the field.
+
+### P-12. `session/prompt` rejects an unknown `sessionId`
+
+Before: `prompt` took `sessionId` straight from the request and keyed `TurnLease`
+with it, and `forget` was never called anywhere. Any submitted identifier permanently
+added an entry — a client with a valid token could fill up the gateway's memory
+by generating `sessionId` values on the fly.
+
+Now a session exists only if created through `session/new`. That is what
+ACP requires; the check runs **before** `acquire`, otherwise a rejected
+identifier would have time to leave an entry behind.
+
+The audit phrased this item as "a `session/close` is needed, which A2A does not have". The phrasing
+turned out to be wrong: the problem is on the ACP side, where
+`session/cancel` exists and comes from the client — it just did not release the lease.
+Worth remembering as an example: fixing by the defect description without looking at the code
+did not work here.
+
+**Cloud:** `TurnLease` is a mutex in process memory. With >1 instance,
+the "one turn per session" guarantee disappears if requests of one session
+land on different replicas. Sticky routing restores it; without it
+a distributed lease is needed.
+
+---
+
+## Storage and errors
+
+### P-13. Task cleanup by file mtime, not by a time inside the task
+
+`mtime` is updated by the atomic write and does not depend on what the agent
+put in the time field (it may put anything, or nothing).
+
+`.json.tmp` files are not touched — that is someone else's half-written record. Cleanup
+walks directories on disk, not live adapters: tasks of a
+stopped agent also need removing, and its adapter is no longer in memory. The default age
+is a week: the client is entitled to pick up the result via
+`tasks/get` long afterwards.
+
+**Cloud — the second landmine.** The cleaner runs in every gatewayd
+process. With shared storage (network volume, object storage), N replicas
+will walk one directory in parallel. Not destructive in itself
+(removal is idempotent), but this is N-fold redundant traversal and races on
+`remove_file`. Needed: either leader election, or moving cleanup out to a separate
+cron job.
+
+### P-14. Agent refusal codes separated by meaning
+
+`404` — about addressing, a retry will not help. `503` — about availability, worth
+retrying. `400` — wrong transport.
+
+Before, all three cases returned `404` / `-32601`, and a spawn failure
+looked like a typo in `agent_id`. It is exactly what led diagnostics astray during
+the live-test analysis with `protocolVersion`: the message lied about the nature of
+the problem. In production such an error costs not one debugging cycle but every
+incident.
+
+**Cloud:** the codes will survive the move; `401`/`403` from the Auth layer will be added.
+
+### P-15. `AgentCard.url` is the specific agent's address, not the gateway's
+
+The card describes the endpoint the client will send `message/send` to:
+`{public_url}/agents/{agent_id}/rpc`. Before, the field was
+empty, i.e. the card was invalid per the A2A spec — and `agent.json` is the
+first thing an external client reads.
+
+`public_url` is the external address, not the bind address: behind a reverse proxy this is
+the proxy's domain. The default `http://localhost:8348` is safe, but almost
+certainly wrong for any real deployment.
+
+**Cloud:** the value will become tenant-dependent if per-tenant domains
+appear.
+
+---
+
+## System boundaries
+
+### P-16. The cloud architecture draft is partially outdated
+
+`05-cloud-architecture-draft.md` §2.4 describes
+`session: Mutex<Option<SessionId>>` as the current state. That field
+has not existed since P-9: the state is now `HashMap<ContextId, SessionEntry>`
+plus the session registry in `A2aAsAcp` (P-12) plus the adapter cache plus
 `TurnLease`.
 
-Вывод §2.4 при этом остаётся верным и даже усиливается: инстанс-локального
-состояния стало **больше**, не меньше, и sticky routing из «желательно»
-превратился в «обязательно» для четырёх независимых структур:
+The §2.4 conclusion nonetheless remains correct and even strengthens: instance-local
+state has become **more**, not less, and sticky routing has turned from "desirable"
+into "mandatory" for four independent structures:
 
-| Состояние | Где | Что ломается без sticky |
+| State | Where | What breaks without sticky |
 |---|---|---|
-| `sessions: HashMap<ContextId, SessionEntry>` | `AcpAsA2a` | Разговор не найдётся на другой реплике |
-| `generation` процесса | `SupervisedStdioAgent` | Ложный `ContextLost` от чужого поколения (Р-7) |
-| `sessions` ACP-стороны | `A2aAsAcp` | `session/prompt` отвергнет валидную сессию (Р-12) |
-| `TurnLease` | оба конвертера | Исчезает гарантия «один ход на сессию» |
+| `sessions: HashMap<ContextId, SessionEntry>` | `AcpAsA2a` | Conversation not found on another replica |
+| process `generation` | `SupervisedStdioAgent` | False `ContextLost` from a foreign generation (P-7) |
+| ACP-side `sessions` | `A2aAsAcp` | `session/prompt` rejects a valid session (P-12) |
+| `TurnLease` | both converters | The "one turn per session" guarantee disappears |
 
-Перед облачным этапом черновик стоит перечитать против текущего кода, а
-не против описания в нём.
+Before the cloud stage, the draft should be re-read against the current code, not
+against the description inside it.
 
-### Р-17. TLS и rate limiting отданы reverse-proxy
+### P-17. TLS and rate limiting are delegated to the reverse proxy
 
-Сертификаты, ротация, HTTP/2, лимиты — не забота шлюза. Шлюз слушает
-HTTP и не терминирует TLS сам; выставлять его напрямую в недоверенную
-сеть нельзя, токены пойдут открытым текстом. Записано в
-`config.example.yaml`, чтобы решение не выглядело забытым.
+Certificates, rotation, HTTP/2, limits — not the gateway's concern. The gateway listens
+over HTTP and does not terminate TLS itself; exposing it directly to an untrusted
+network is not an option, tokens would travel in cleartext. Recorded in
+`config.example.yaml` so the decision does not look like an oversight.
 
-**Облако:** для rate limiting решение меняется — per-tenant лимиты
-(черновик §2.3) прокси не реализует, потому что не знает про тенантов.
-TLS остаётся за прокси/ingress.
+**Cloud:** for rate limiting the decision changes — per-tenant limits
+(draft §2.3) are not implemented by the proxy, because it does not know about tenants.
+TLS stays with the proxy/ingress.
 
-### Р-18. Стриминг не реализован — Фаза 2
+### P-18. Streaming is not implemented — Phase 2
 
-`Reply<T, U>` существует как шов: `Complete` сейчас, `Streaming` потом,
-без изменения сигнатур трейтов. `Reply::Streaming` возвращает ошибку,
-а не паникует — в сетевом сервисе `unreachable!()` роняет воркер-таск.
+`Reply<T, U>` exists as a seam: `Complete` now, `Streaming` later,
+without changing trait signatures. `Reply::Streaming` returns an error
+rather than panicking — in a network service `unreachable!()` takes down a worker task.
 
-Практическое следствие: `session/update` от агента собираются в буфер и
-отдаются одним куском в конце хода. Клиент не видит ответ по мере
-генерации.
+Practical consequence: `session/update` messages from the agent are collected into a buffer and
+delivered as one chunk at the end of the turn. The client does not see the answer as it is
+generated.
 
-**Облако:** SSE через passthrough (направление 2) работает и
-live-проверен — там шлюз просто переливает байты. Стриминг отсутствует
-именно на конвертирующих направлениях 3 и 4.
+**Cloud:** SSE through passthrough (direction 2) works and is
+live-tested — there the gateway simply pours bytes through. Streaming is absent
+precisely on the converting directions 3 and 4.
 
-### Р-19. Не-ASCII `taskId` схлопываются в одно имя файла — оставлено как есть
+### P-19. Non-ASCII `taskId` values collapse to one filename — left as is
 
-`sanitize_task_id` вырезает все не-ASCII символы, поэтому два разных
-кириллических идентификатора дают одно имя файла и затирают друг друга.
-Найдено случайно: тестовая задача с именем «старая» превратилась в
+`sanitize_task_id` strips all non-ASCII characters, so two different
+Cyrillic identifiers produce one filename and overwrite each other. Found by accident: a test
+task named "старая" ("old") turned into
 `.json`.
 
-Снаружи невоспроизводимо — идентификаторы генерирует шлюз, они ASCII.
-Чинить сейчас значило бы менять схему имён и мигрировать существующие
-файлы ради проблемы, которой нет. Поведение зафиксировано тестом
+Not reproducible from outside — the gateway generates the identifiers, and they are ASCII.
+Fixing it now would mean changing the naming scheme and migrating existing files for
+a problem that does not exist. The behavior is pinned by the test
 `non_ascii_ids_collapse_to_same_name`.
 
-**Облако:** станет актуальным, если `taskId` начнут принимать от
-клиента или если хранилище переедет в БД с другой схемой ключей.
+**Cloud:** becomes relevant if `taskId` starts being accepted from
+the client, or if storage moves to a DB with a different key scheme.
 
 ---
 
-## Как это писалось
+## How this was written
 
-Два практических вывода из процесса, которые стоят отдельной строки.
+Two practical takeaways from the process that deserve a line of their own.
 
-**Юнит-тесты против фейкового агента ловят не всё.** Фейк по
-определению послушен: он не умирал лениво, не задавал встречных
-вопросов и не требовал рукопожатия — поэтому три дефекта (Р-6, порядок
-в Р-7, Р-5) дожили до живого стенда. Каждый раз, когда фейк учили
-вредничать, тесты начинали ловить.
+**Unit tests against a fake agent do not catch everything.** A fake is by
+definition obedient: it did not die lazily, did not ask counter-questions, and did not demand a
+handshake — which is why three defects (P-6, the ordering in P-7, P-5)
+survived to the live stand. Every time the fake was taught to misbehave, the tests
+started catching.
 
-**Negative control обязателен.** Тест, добавленный вместе с фиксом,
-проверяется откатом фикса: если не краснеет, он проверяет не то.
-Так был отсеян `body_limit_is_bounded` в первой редакции — `assert!`
-на константах, который clippy справедливо назвал тавтологией.
+**Negative control is mandatory.** A test added together with the fix is
+checked by reverting the fix: if it does not go red, it is checking the wrong thing.
+That is how `body_limit_is_bounded` in its first revision was weeded out — an `assert!`
+over constants that clippy rightly called a tautology.

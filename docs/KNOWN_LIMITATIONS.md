@@ -1,73 +1,75 @@
-# Известные ограничения driver-a2a-client (ТЗ: docs/TZ-a2a-dialects-gateway-adapter.md)
+# Known limitations of driver-a2a-client (spec: docs/SPEC-a2a-dialects-gateway-adapter.md)
 
-Статус на 2026-08-18. Документ фиксирует, что из ТЗ реализовано полностью,
-что — осознанно отложено (с триггером закрытия), и что не сделано вовсе.
-Не заменяет сам ТЗ, служит чек-листом закрытия. Формат и решения повторяют
-`agent-connector/TECH_DEBT.md`.
+> **Language:** English · [Русская версия](KNOWN_LIMITATIONS-ru.md)
 
-## Полностью выполнено
+Status as of 2026-08-18. This document records what from the spec is fully implemented,
+what was deliberately deferred (with a closure trigger), and what was not done at all.
+It does not replace the spec itself; it serves as a closure checklist. The format and decisions
+mirror `agent-connector/TECH_DEBT.md`.
 
-- **§2.4.1** `wire_format: sdk | spec | auto` в `A2aClientConfig`.
-- **§2.4.2** Разделение SDK/Spec через `trait A2aWire` (`wire/sdk.rs`, `wire/spec.rs`).
-- **§2.4.4** `cancel`/`provide_input` через `remote_task_ids: DashMap<TaskId, String>`.
-- **§2.5** Коды ошибок `a2a_remote_error` / `a2a_no_task` через `send_error_to_a2a_code()` (коммит `9166c52`).
-- **§3.2** Детект на входе шлюза по имени JSON-RPC метода — в `ACP-A2A_gateway`
+## Fully done
+
+- **§2.4.1** `wire_format: sdk | spec | auto` in `A2aClientConfig`.
+- **§2.4.2** SDK/Spec separation via `trait A2aWire` (`wire/sdk.rs`, `wire/spec.rs`).
+- **§2.4.4** `cancel`/`provide_input` via `remote_task_ids: DashMap<TaskId, String>`.
+- **§2.5** Error codes `a2a_remote_error` / `a2a_no_task` via `send_error_to_a2a_code()` (commit `9166c52`).
+- **§3.2** Detection at the gateway entry by JSON-RPC method name — in `ACP-A2A_gateway`
   (`transport_http.rs`: `SendMessage`/`GetTask`/`CancelTask` → SDK; `message/send`/`tasks/get`/`tasks/cancel` → Spec).
-- **§3.3** Зонд идемпотентен (`GetTask`/`tasks/get` с фиктивным `Uuid`, задач не создаёт).
-- **§3.3** Распознавание "метод не найден" — по коду `-32601` (JSON-RPC 2.0 стандарт)
-  ИЛИ по нормализованному тексту с несколькими формулировками (D1, коммит `9ba5bb9`).
-- **§3.4** `wire_format: auto` — ленивая резолюция через `resolved_wire()` + `OnceCell`,
-  D3 one-shot retry при MethodNotFound на реальном вызове (коммит `9ba5bb9`).
-- **§3.4** Направление 2 (шлюз как клиент к сторонним A2A-агентам) —
-  `ACP-A2A_gateway/gatewayd/src/dialect_probe.rs` (коммиты `669c390` + `1e4756d`),
-  включая D3-инвалидацию кэша при MethodNotFound на проксируемом запросе.
-- **§3.5 DoD** Приоритет SDK при неоднозначности.
-- **§3.5 DoD** Понятная ошибка при нераспознанном диалекте (`ProtocolError`).
+- **§3.3** The probe is idempotent (`GetTask`/`tasks/get` with a dummy `Uuid`, creates no tasks).
+- **§3.3** Recognition of "method not found" — by code `-32601` (JSON-RPC 2.0 standard)
+  OR by normalized text with several phrasings (D1, commit `9ba5bb9`).
+- **§3.4** `wire_format: auto` — lazy resolution via `resolved_wire()` + `OnceCell`,
+  D3 one-shot retry on MethodNotFound on a real call (commit `9ba5bb9`).
+- **§3.4** Direction 2 (the gateway as a client to third-party A2A agents) —
+  `ACP-A2A_gateway/gatewayd/src/dialect_probe.rs` (commits `669c390` + `1e4756d`),
+  including D3 cache invalidation on MethodNotFound on a proxied request.
+- **§3.5 DoD** SDK priority when ambiguous.
+- **§3.5 DoD** A clear error on an unrecognized dialect (`ProtocolError`).
 
-## Осознанные отказы / долги (с триггером закрытия)
+## Deliberate refusals / debt (with closure trigger)
 
-### §2.4.3 Типизированный SDK-парсер (`a2a::Task`) — осознанный отказ
-- **Что**: `wire/sdk.rs::parse_task` парсит ответ вручную через `serde_json::Value`
-  (`get`/`as_str`/`as_array`), хотя SDK предоставляет типизированные `a2a::Task`/`TaskState`/`Part`.
-- **Почему осознанный отказ (не недоделка)**: крейт `a2a` (workspace dep, pinned `02ee560`) —
-  **v0.3.0, pre-1.0**, без `#[non_exhaustive]` ни на одном типе, в `types.rs` всего 3 коммита.
-  SDK может без предупреждения добавить вариант enum или обязательное поле (например
-  у `Task.context_id` нет `#[serde(default)]`) — типизированный парсер тогда ломается
-  целиком, ручной — нет.
-- **Impact**: low (рабочий код, покрыт тестами); риск — расхождение с форматом при будущих версиях SDK.
-- **Триггер закрытия**: новая версия SDK ≥1.0 с `#[non_exhaustive]` → перейти на `a2a::Task`
-  в `sdk.rs` (проверить `context_id`).
+### §2.4.3 Typed SDK parser (`a2a::Task`) — deliberate refusal
+- **What**: `wire/sdk.rs::parse_task` parses the response manually via `serde_json::Value`
+  (`get`/`as_str`/`as_array`), although the SDK provides typed `a2a::Task`/`TaskState`/`Part`.
+- **Why a deliberate refusal (not unfinished work)**: the `a2a` crate (workspace dep, pinned `02ee560`) is
+  **v0.3.0, pre-1.0**, with no `#[non_exhaustive]` on any type, only 3 commits in `types.rs`.
+  The SDK may silently add an enum variant or a required field (for instance,
+  `Task.context_id` has no `#[serde(default)]`) — the typed parser then breaks
+  entirely, the manual one does not.
+- **Impact**: low (working code, covered by tests); the risk — divergence from the format in future SDK versions.
+- **Closure trigger**: a new SDK version ≥1.0 with `#[non_exhaustive]` → switch to `a2a::Task`
+  in `sdk.rs` (check `context_id`).
 
-### §3.2 п.4 / §3.5 DoD — «AgentCard приоритетнее зонда» — отменено владельцем
-- **Что**: `detect_from_agent_card` в `dialect_probe.rs` всегда возвращает `None`.
-- **Почему**: маппинг `protocolVersion` → wire-диалект семантически ошибочен (версия
-  протокола ≠ выбор wire-реализации); спека AgentCard не содержит поля, надёжно
-  отличающего wire-реализацию. Решение владельца: пункт отменён, ключевое определение
-  диалекта — зонд (`probe_wire_format`), он корректен. Порядок `card → probe` в
-  `resolve_auto_wire()` сохранён как точка расширения.
-- **Impact**: none (карточка не участвует в резолюции, зонд всё решает корректно).
-- **Триггер закрытия**: новая версия спеки AgentCard с полем, различающим wire-реализацию
-  → реализовать детект в `detect_from_agent_card`, порядок в `resolve_auto_wire()` уже готов.
+### §3.2 item 4 / §3.5 DoD — "AgentCard takes priority over the probe" — cancelled by the owner
+- **What**: `detect_from_agent_card` in `dialect_probe.rs` always returns `None`.
+- **Why**: the `protocolVersion` → wire-dialect mapping is semantically wrong (protocol
+  version ≠ wire-implementation choice); the AgentCard spec contains no field that reliably
+  distinguishes the wire implementation. Owner's decision: the item is cancelled; the key dialect
+  determination is the probe (`probe_wire_format`), and it is correct. The `card → probe` order in
+  `resolve_auto_wire()` is kept as an extension point.
+- **Impact**: none (the card does not participate in resolution; the probe decides everything correctly).
+- **Closure trigger**: a new AgentCard spec version with a field distinguishing the wire implementation
+  → implement detection in `detect_from_agent_card`; the order in `resolve_auto_wire()` is already ready.
 
-### D3 — полная инвалидация кэша `OnceCell` — частично
-- **Что**: one-shot retry в `execute()` при MethodNotFound на реальном вызове сделан
-  (коммит `9ba5bb9`), но постоянная инвалидация `OnceCell` (замена на `arc-swap` или
-  `RwLock<Option<Arc<dyn A2aWire>>>`) — не реализована.
-- **Impact**: low; ошибка при неверном первом резолве исправляется одной повторной
-  попыткой, после чего остаётся закэшированной до пересоздания драйвера.
-- **Триггер закрытия**: если реальные агенты покажут устойчивый неверный первый
-  резолв — заменить `OnceCell` на структуру с `reset()`.
+### D3 — full invalidation of the `OnceCell` cache — partial
+- **What**: the one-shot retry in `execute()` on MethodNotFound on a real call is done
+  (commit `9ba5bb9`), but permanent `OnceCell` invalidation (replacement with `arc-swap` or
+  `RwLock<Option<Arc<dyn A2aWire>>>`) is not implemented.
+- **Impact**: low; an error from a wrong first resolution is fixed by one retry
+  attempt, after which it stays cached until the driver is recreated.
+- **Closure trigger**: if real agents show a persistent wrong first
+  resolution — replace `OnceCell` with a structure that has `reset()`.
 
-## Остаток: живой E2E — только ручной запуск, не в CI
+## Remainder: live E2E — manual run only, not in CI
 
-Сам E2E реализован и проверен живьём в обоих репо (см. ниже). Единственное
-ограничение — он требует реально запущенных процессов (шлюз + hermes +
-adapterd), поэтому не выполняется в автоматическом CI.
-- **`agent-connector`**: `crates/driver-a2a-client/tests/e2e_live.rs` (ignored-по-умолчанию,
-  запуск вручную): spec / auto / sdk / smoke — проверено живьём, 4/4 passed против реального
-  шлюза + hermes и против adapterd (SDK-сервер). Коммит `3f7061b` + `9d057a5`.
-- **`ACP-A2A_gateway`**: `gatewayd/tests/e2e_live.rs` (коммит `00fe731`, ignored-по-умолчанию):
-  spec (`message/send` → Completed), SDK (`SendMessage` → `TASK_STATE_COMPLETED` в `{task}`),
-  agent-card — проверено живьём, 3/3 passed против реального шлюза + hermes.
-  Плюс внутрипроцессный харнес `gatewayd/tests/rest_transport.rs` (коммит `39ea530`).
-- Требует реально запущенных процессов (шлюз + hermes + adapterd), не выполняется в CI.
+The E2E itself is implemented and verified live in both repos (see below). The only
+limitation is that it requires actually running processes (gateway + hermes +
+adapterd), so it does not run in the automated CI.
+- **`agent-connector`**: `crates/driver-a2a-client/tests/e2e_live.rs` (ignored by default,
+  run manually): spec / auto / sdk / smoke — verified live, 4/4 passed against a real
+  gateway + hermes and against adapterd (an SDK server). Commits `3f7061b` + `9d057a5`.
+- **`ACP-A2A_gateway`**: `gatewayd/tests/e2e_live.rs` (commit `00fe731`, ignored by default):
+  spec (`message/send` → Completed), SDK (`SendMessage` → `TASK_STATE_COMPLETED` in `{task}`),
+  agent-card — verified live, 3/3 passed against a real gateway + hermes.
+  Plus the in-process harness `gatewayd/tests/rest_transport.rs` (commit `39ea530`).
+- Requires actually running processes (gateway + hermes + adapterd), not run in CI.

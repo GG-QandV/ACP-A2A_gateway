@@ -1,24 +1,24 @@
-# GitNexus Gate — BINDING (для всех агентов)
+# GitNexus Gate — BINDING (all agents)
 
-Репозиторий проиндексирован GitNexus как **`ACP-A2A_gateway`**. Код понимаем через граф, а не через grep.
+The repository is indexed by GitNexus as **`ACP-A2A_gateway`**. Understand code through the graph, not through grep.
 
-**MANDATORY (перед правкой любого символа):**
-- [ ] `impact(target, direction="upstream")` → отчёт о blast radius (callers, affected processes, risk). Risk HIGH/CRITICAL → НЕ править, показать пользователю.
-- [ ] Rename только через `rename` (dry_run сначала), НЕ find-and-replace.
-- [ ] Перед изменением route-хендлера → `api_impact`.
-- [ ] Перед коммитом → `detect_changes()` — проверить, что затронуты только ожидаемые символы/флоу.
+**MANDATORY (before editing any symbol):**
+- [ ] `impact(target, direction="upstream")` → blast-radius report (callers, affected processes, risk). Risk HIGH/CRITICAL → do NOT edit, show it to the user.
+- [ ] Rename only via `rename` (with `dry_run` first), never find-and-replace.
+- [ ] Before changing a route handler → `api_impact`.
+- [ ] Before committing → `detect_changes()` — verify that only the expected symbols/flows are affected.
 
-**Как искать:**
-- "Как работает X?" → `query(search_query="...")` — execution flows по смыслу, не файлы.
-- Нужен полный контекст символа (callers/callees/флоу) → `context(name)`.
-- "Что сломается?" → `impact`. "Почему падает?" → `trace` / `gitnexus-debugging`.
-- Security-ревью → `explain(target)` (taint source→sink).
+**How to search:**
+- "How does X work?" → `query(search_query="...")` — execution flows by meaning, not files.
+- Full context on a symbol (callers/callees/flows) → `context(name)`.
+- "What breaks?" → `impact`. "Why does it fail?" → `trace` / `gitnexus-debugging`.
+- Security review → `explain(target)` (taint source→sink).
 
-**Запрещено:**
-- Правка символа без `impact`.
-- Игнор HIGH/CRITICAL risk.
-- `query` для поиска по имени (для этого grep/glob).
-- `git add -A` (тянет Cargo.lock и docs/) — стейджить только нужные файлы.
+**Forbidden:**
+- Editing a symbol without `impact`.
+- Ignoring HIGH/CRITICAL risk.
+- Using `query` to search by name (that is what grep/glob is for).
+- `git add -A` (it pulls in Cargo.lock and docs/) — stage only the files you need.
 
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence

@@ -17,6 +17,15 @@ editing that single line (plus `Cargo.lock` on the next `cargo check`), tagging
 - This changelog; the version is now stated in `README.md`.
 
 ### Changed
+- Documentation is now English-primary: every guide/spec/log has an English file
+  under its plain name and a Russian copy under the `-ru` suffix
+  (e.g. `docs/02-dev-guide-build.md` + `docs/02-dev-guide-build-ru.md`).
+  Previously Russian lived in the unsuffixed file (the `06-gateway-guide`,
+  `A2A-protocol-strategy-2026` and `INSTALL` families were flipped accordingly).
+- `docs/TZ-*` / `docs/tz-*` renamed to `docs/SPEC-*`; `docs/шлюз-описание-a2a.md`
+  to `docs/a2a-gateway-overview.md`; `docs/bags/Подтверждение бага.md` to
+  `docs/bags/bug-confirmation.md` — no Cyrillic in tracked file names.
+- Decision identifiers are now Latin (`P-18`) in both languages.
 - `protocol`, `core` and `gatewayd` manifests use
   `version.workspace = true` / `edition.workspace = true` instead of repeating
   the version.

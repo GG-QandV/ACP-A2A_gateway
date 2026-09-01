@@ -28,7 +28,7 @@ Older dialects are supported **for a defined period** — migration/refactoring 
 
 ## Links
 
-- **Full strategy (EN):** [A2A-protocol-strategy-2026-en.md](A2A-protocol-strategy-2026-en.md)
+- **Full strategy (EN):** [docs/A2A-protocol-strategy-2026.md](docs/A2A-protocol-strategy-2026.md)
 - Ukrainian version: [A2A-protocol-strategy-2026-uk.md](A2A-protocol-strategy-2026-uk.md)
 - Russian version: [A2A-protocol-strategy-2026.md](A2A-protocol-strategy-2026.md)
-- Unified ТЗ (gateway / adapter / probe): [TZ-a2a-dialects-gateway-adapter.md](TZ-a2a-dialects-gateway-adapter.md) (in the gateway repo)
+- Unified specification (gateway / adapter / probe): [SPEC-a2a-dialects-gateway-adapter.md](SPEC-a2a-dialects-gateway-adapter.md) (in the gateway repo)

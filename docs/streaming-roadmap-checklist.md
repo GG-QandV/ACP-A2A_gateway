@@ -1,152 +1,156 @@
-# Роадмап: включение стриминга в ACP-A2A_gateway
+# Roadmap: enabling streaming in ACP-A2A_gateway
 
-Полный workflow от текущего состояния (Р-18 в `docs/decisions.md`: `Reply::Streaming` объявлен, но
-возвращает ошибку) до продакшн-готового потокового гейтвея с конфигурируемыми лимитами масштаба.
-Каждая контрольная точка incl. лог-ловушки по умолчанию (WARN/ERROR), критерии перехода между этапами
-и раздел тестов. Логирование сейчас — только `tracing_subscriber::fmt()` в stdout без ротации
-(`gatewayd/src/main.rs`) — это отдельно закрывается в Части 4.
+> **Language:** English · [Русская версия](streaming-roadmap-checklist-ru.md)
 
----
-
-## Часть 0 — Предварительные условия (Gate 0)
-
-Ничего из нижеследующего не начинается, пока не выполнено:
-
-- [ ] Зафиксирована базовая ветка (`git tag pre-streaming-baseline`) — откат должен быть тривиальным.
-- [ ] `cargo test --workspace` зелёный на текущем HEAD (69+ тестов, `docs/06-gateway-guide.md` §2).
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings` без предупреждений.
-- [ ] Прочитан и подтверждён Р-18 в `docs/decisions.md` — команда согласна, что `unreachable!()` в
-      сетевом сервисе недопустим, только `anyhow::Result::Err`.
-- [ ] Заведён отдельный TECH_DEBT-пункт "стриминг в разработке" со ссылкой на этот роадмап, чтобы
-      текущая запись TECH_DEBT.md:17-21 не потерялась в процессе.
-
-**🔒 Лог-ловушка по умолчанию (WARN):** если `cargo test` красный на старте работы — это должно
-всплывать в CI как WARN "baseline unstable before streaming work started", не ERROR (пока не блокирует,
-но фиксируется).
+Full workflow from the current state (P-18 in `docs/decisions.md`: `Reply::Streaming` is declared, but
+returns an error) to a production-ready streaming gateway with configurable scale limits.
+Each checkpoint incl. default log traps (WARN/ERROR), transition criteria between stages,
+and a tests section. Logging right now — only `tracing_subscriber::fmt()` to stdout without rotation
+(`gatewayd/src/main.rs`) — that is covered separately in Part 4.
 
 ---
 
-## Часть 1 — Механизм стриминга (Этап 1)
+## Part 0 — Prerequisites (Gate 0)
 
-### 1.1 `core/src/stdio_agent.rs` — канал вместо буфера
+None of the below starts until the following are done:
 
-- [ ] Заменить `UpdatesMap = HashMap<String, Vec<ContentBlock>>` на
+- [ ] The base branch is tagged (`git tag pre-streaming-baseline`) — rollback must be trivial.
+- [ ] `cargo test --workspace` green at the current HEAD (69+ tests, `docs/06-gateway-guide.md` §2).
+- [ ] `cargo clippy --workspace --all-targets -- -D warnings` with no warnings.
+- [ ] P-18 in `docs/decisions.md` read and confirmed — the team agrees that `unreachable!()` in
+      a network service is unacceptable, only `anyhow::Result::Err`.
+- [ ] A separate TECH_DEBT item "streaming in development" is filed with a link to this roadmap, so
+      that the current entry TECH_DEBT.md:17-21 does not get lost in the process.
+
+**🔒 Default log trap (WARN):** if `cargo test` is red at the start of the work — it should
+surface in CI as a WARN "baseline unstable before streaming work started", not ERROR (it does not
+block yet, but it is recorded).
+
+---
+
+## Part 1 — Streaming mechanism (Stage 1)
+
+### 1.1 `core/src/stdio_agent.rs` — a channel instead of a buffer
+
+- [ ] Replace `UpdatesMap = HashMap<String, Vec<ContentBlock>>` with
       `HashMap<SessionId, mpsc::UnboundedSender<SessionUpdate>>`.
-- [ ] `collect_session_update()`: каждый разобранный `session/update` уходит в `tx.send(...)` сразу,
-      без накопления.
-- [ ] `prompt()`: после записи `session/prompt` в stdin, если для сессии зарегистрирован
-      получатель — возвращать `Reply::Streaming(rx)`; иначе (обратная совместимость на переходный
-      период) — старое поведение `Reply::Complete`.
-- [ ] Терминальный элемент потока — маппинг финального `PromptResponse` от `call()` в последнее
-      сообщение канала, закрывающее его (`drop(tx)` после отправки last-элемента).
+- [ ] `collect_session_update()`: each parsed `session/update` goes straight into `tx.send(...)`,
+      without accumulating.
+- [ ] `prompt()`: after writing `session/prompt` to stdin, if a receiver is registered for the
+      session — return `Reply::Streaming(rx)`; otherwise (backward compatibility for the transition
+      period) — the old `Reply::Complete` behavior.
+- [ ] Terminal item of the stream — mapping the final `PromptResponse` from `call()` into the last
+      channel message, closing it (`drop(tx)` after sending the last item).
 
-**🔒 Лог-ловушка (ERROR, по умолчанию включена):**
+**🔒 Log trap (ERROR, on by default):**
 ```rust
 tracing::error!(session_id = %session_key, "stream channel closed before terminal event — возможная утечка ресурсов агента");
 ```
-Срабатывает, если `rx` у диспетчера получает `None` до того, как получен статус `completed/failed/cancelled`.
-Это индикатор баги маппинга, а не штатное поведение — должен быть ERROR, не WARN.
+Fires when the dispatcher's `rx` receives `None` before a `completed/failed/cancelled` status was
+received.
+This indicates a mapping bug, not normal behavior — it must be ERROR, not WARN.
 
-**🔒 Лог-ловушка (WARN, по умолчанию включена):**
+**🔒 Log trap (WARN, on by default):**
 ```rust
 tracing::warn!(session_id = %session_key, chunk_count, "stream produced 0 chunks before terminal event");
 ```
-Срабатывает, если стрим завершился без единого промежуточного чанка — не баг сам по себе (агент может
-отвечать одним сообщением), но полезный сигнал для диагностики, включён по умолчанию.
+Fires if the stream finished without a single intermediate chunk — not a bug per se (an agent may
+reply in one message), but a useful diagnostic signal, on by default.
 
-- [ ] **Критерий готовности 1.1**: юнит-тест `stream_emits_chunks_incrementally` — мок-агент шлёт 3
-      `session/update` с задержкой 50мс между каждым; тест ловит их **по одному** через `rx.recv()`
-      с проверкой, что между приёмами реально прошло время (не всё разом в конце).
-      ✅ Выполнено — стрим-цикл в `stdio_agent.rs` + юнит-тесты в `core/src/stdio_agent.rs`.
+- [ ] **Readiness criterion 1.1**: unit test `stream_emits_chunks_incrementally` — a mock agent sends 3
+      `session/update`s with a 50 ms delay between each; the test catches them **one by one** via
+      `rx.recv()` with a check that time actually elapsed between receives (not everything at once
+      at the end).
+      ✅ Done — the stream loop in `stdio_agent.rs` + unit tests in `core/src/stdio_agent.rs`.
 
-### 1.2 `core/src/convert.rs` — реальный маппинг
+### 1.2 `core/src/convert.rs` — real mapping
 
-- [x] `AcpAsA2a`: `Reply::Streaming(rx)` → цикл, транслирующий каждый `SessionUpdate` в
-      `A2aEvent::TaskStatusUpdate`/`TaskArtifactUpdate` (по образцу `map_event()` из
-      `protocol_a2a_mapper.rs` в соседнем `agent-connector` — готовый шаблон трансляции
-      `CoreEventKind → A2aStreamEvent`, адаптировать под локальные типы). ✅ Выполнено (Phase 3.2).
-- [x] `A2aAsAcp`: обратный маппинг `A2aEvent → SessionUpdate` (`agent_message_chunk` для текста,
-      финальное уведомление на терминальном состоянии). ✅ Выполнено.
-- [x] Убрать все `unreachable!()`/`anyhow::bail!("Фаза 1: ...")` — заменить на реальную логику. ✅
+- [x] `AcpAsA2a`: `Reply::Streaming(rx)` → a loop translating each `SessionUpdate` into
+      `A2aEvent::TaskStatusUpdate`/`TaskArtifactUpdate` (modeled on `map_event()` from
+      `protocol_a2a_mapper.rs` in the adjacent `agent-connector` — a ready translation template
+      `CoreEventKind → A2aStreamEvent`, adapt to local types). ✅ Done (Phase 3.2).
+- [x] `A2aAsAcp`: the reverse mapping `A2aEvent → SessionUpdate` (`agent_message_chunk` for text,
+      a final notification at the terminal state). ✅ Done.
+- [x] Remove all `unreachable!()`/`anyhow::bail!("Фаза 1: ...")` — replace with real logic. ✅
 
-**🔒 Лог-ловушка (ERROR, по умолчанию включена):**
+**🔒 Log trap (ERROR, on by default):**
 ```rust
 tracing::error!(agent_id = %agent_id, event = ?unmapped_event, "получено A2aEvent/SessionUpdate без маппинга — протокол расширился без обновления конвертера");
 ```
-Срабатывает на `_ => ...` в `match` по типу события — сигнал, что схема протокола (ACP/A2A) обновилась,
-а конвертер не успел за ней.
+Fires on the `_ => ...` arm of the `match` on event type — a signal that the protocol schema
+(ACP/A2A) changed while the converter did not keep up.
 
-- [ ] **Критерий готовности 1.2**: юнит-тест на каждый вариант `SessionUpdate` (5 вариантов enum:
-      `AgentMessageChunk`, `ToolCall`, `ToolCallUpdate`, `Plan`, `UsageUpdate`) — маппинг в `A2aEvent`
-      не паникует и не тратит информацию молча (untested variant = красный тест по умолчанию,
-      не пропуск).
+- [ ] **Readiness criterion 1.2**: a unit test per `SessionUpdate` variant (5 enum variants:
+      `AgentMessageChunk`, `ToolCall`, `ToolCallUpdate`, `Plan`, `UsageUpdate`) — the mapping into
+      `A2aEvent` does not panic and does not silently drop information (untested variant = red test
+      by default, not a skip).
 
-### 1.3 `gatewayd/src/transport_http.rs` — SSE-ответ (направление 4)
+### 1.3 `gatewayd/src/transport_http.rs` — SSE response (direction 4)
 
-Три места с одинаковой заглушкой (`message/send`, `SendMessage`, REST `message:send` в
-`dispatch_a2a_method()` и `rest_send_message_core()`) — вынести в одну общую функцию рендеринга:
+Three places with the same stub (`message/send`, `SendMessage`, REST `message:send` in
+`dispatch_a2a_method()` and `rest_send_message_core()`) — extract into one shared rendering function:
 
-- [x] Добавить `tokio-stream = "0.1"` в `gatewayd/Cargo.toml`. ✅
-- [x] Общая функция `fn stream_to_sse(rx: UnboundedReceiver<A2aEvent>) -> Sse<impl Stream<...>>`. ✅
-- [x] Заменить все три вызова заглушки на вызов этой функции. ✅
-- [x] `tasks/resubscribe` — новый JSON-RPC метод в `dispatch_a2a_method()`, читающий из `TaskStore`
-      состояние существующей задачи и переподключающийся к её потоку (задел на этап 2 resume).
-      ✅ Выполнено (Phase 3.2, коммит b9c0b8b): durable event buffer (`gatewayd/src/event_log.rs`,
-      монотонный per-task `seq`) + `tasks/get-last-seq` + `tasks/resubscribe` — replay из event log
-      как SSE-стрим. HTTP (направление 4). TCP line-протокол resubscribe RPC не имеет (см. TECH_DEBT).
+- [x] Add `tokio-stream = "0.1"` to `gatewayd/Cargo.toml`. ✅
+- [x] Shared function `fn stream_to_sse(rx: UnboundedReceiver<A2aEvent>) -> Sse<impl Stream<...>>`. ✅
+- [x] Replace all three stub calls with a call to this function. ✅
+- [x] `tasks/resubscribe` — a new JSON-RPC method in `dispatch_a2a_method()`, reading the state of an
+      existing task from `TaskStore` and reconnecting to its stream (groundwork for stage 2 resume).
+      ✅ Done (Phase 3.2, commit b9c0b8b): durable event buffer (`gatewayd/src/event_log.rs`,
+      monotonic per-task `seq`) + `tasks/get-last-seq` + `tasks/resubscribe` — replay from event log
+      as an SSE stream. HTTP (direction 4). The TCP line protocol has no resubscribe RPC (see TECH_DEBT).
 
-**🔒 Лог-ловушка (WARN, по умолчанию включена):**
+**🔒 Log trap (WARN, on by default):**
 ```rust
 tracing::warn!(agent_id, task_id = %id, "SSE клиент отключился до terminal event — задача продолжает выполняться в фоне");
 ```
-Срабатывает при `Err` записи в HTTP-соединение на середине стрима — клиент ушёл, но ACP-процесс
-всё ещё работает над задачей. Явный сигнал возможной утечки вычислений.
+Fires on a write `Err` to the HTTP connection mid-stream — the client left, but the ACP process
+is still working on the task. An explicit signal of a possible compute leak.
 
-- [ ] **Критерий готовности 1.3**: live-прогон (как в `docs/06-gateway-guide.md` §7 п.10 для
-      направления 2) — реальный HTTP-клиент получает несколько SSE-событий `data: {...}\n\n` до
-      финального `final: true`.
+- [ ] **Readiness criterion 1.3**: a live run (as in `docs/06-gateway-guide.md` §7 item 10 for
+      direction 2) — a real HTTP client receives several SSE events `data: {...}\n\n` before
+      the final `final: true`.
 
-### 1.4 `gatewayd/src/transport_tcp.rs` — построчный стрим (направление 3)
+### 1.4 `gatewayd/src/transport_tcp.rs` — line-by-line stream (direction 3)
 
-- [ ] Обработать `Reply::Streaming` — каждый элемент сериализуется как ACP-нотификация `session/update`
-      и пишется newline-delimited в тот же TCP-сокет.
+- [ ] Handle `Reply::Streaming` — each item is serialized as an ACP `session/update` notification
+      and written newline-delimited to the same TCP socket.
 
-**🔒 Лог-ловушка (ERROR, по умолчанию включена):**
+**🔒 Log trap (ERROR, on by default):**
 ```rust
 tracing::error!(session_id = %session.0, error = %e, "не удалось записать session/update в TCP-сокет клиента — соединение будет закрыто");
 ```
 
-- [x] **Критерий готовности 1.4**: юнит-тест на TCP-харнесе — клиент получает поток строк, каждая —
-      валидный JSON-RPC notification с методом `session/update`.
-      ✅ Выполнено — интеграционный `streaming_tcp.rs` (закрыто в TECH_DEBT, T4).
+- [x] **Readiness criterion 1.4**: a unit test on a TCP harness — the client receives a stream of
+      lines, each a valid JSON-RPC notification with method `session/update`.
+      ✅ Done — integration test `streaming_tcp.rs` (closed in TECH_DEBT, T4).
 
-### ✅ Gate 1 — переход к этапу 2
+### ✅ Gate 1 — moving to stage 2
 
-Все критерии готовности 1.1–1.4 выполнены, `cargo test --workspace` зелёный, добавлены новые тесты
-(не заменили старые — старые тесты на `Reply::Complete`-путь должны продолжать проходить, обратная
-совместимость обязательна). Negative control по конвенции проекта (`docs/decisions.md`, раздел
-"Как это писалось"): откатить каждый фикс по одному, убедиться что соответствующий тест краснеет.
+All readiness criteria 1.1–1.4 are met, `cargo test --workspace` is green, new tests were added
+(they did not replace the old ones — the old tests for the `Reply::Complete` path must keep passing,
+backward compatibility is mandatory). Negative control per the project convention (`docs/decisions.md`,
+section "How this was written"): roll back each fix one at a time, verify the corresponding test goes red.
 
 ---
 
-## Часть 2 — Лимиты масштаба (Этап 2)
+## Part 2 — Scale limits (Stage 2)
 
 ### 2.1 `gatewayd/src/registry.rs` — Semaphore per-agent
 
-- [x] `AgentEntry` получает `stream_permits: Arc<tokio::sync::Semaphore>`. ✅
+- [x] `AgentEntry` gets `stream_permits: Arc<tokio::sync::Semaphore>`. ✅
 - [x] `Registry::try_acquire_stream(agent_id) -> Result<SemaphorePermit, StreamCapacityExhausted>`. ✅
 
-**🔒 Лог-ловушка (WARN, по умолчанию включена):**
+**🔒 Log trap (WARN, on by default):**
 ```rust
 tracing::warn!(agent_id, active_streams, limit, "agent stream capacity exhausted — запрос отклонён fail-closed");
 ```
 
-- [ ] **Критерий готовности 2.1**: юнит-тест — при лимите `max_concurrent_streams=2` третий
-      одновременный запрос стрима получает явную ошибку, не зависание.
+- [ ] **Readiness criterion 2.1**: unit test — with a limit of `max_concurrent_streams=2` the third
+      concurrent stream request gets an explicit error, not a hang.
 
-### 2.2 `gatewayd/src/main.rs` — конфигурация
+### 2.2 `gatewayd/src/main.rs` — configuration
 
-- [x] `RawAgentEntry` (и Stdio, и Http-варианты) получают опциональную секцию:
+- [x] `RawAgentEntry` (both the Stdio and Http variants) gets an optional section:
   ```yaml
   streaming:
     max_concurrent_streams: 4
@@ -154,197 +158,200 @@ tracing::warn!(agent_id, active_streams, limit, "agent stream capacity exhausted
     idle_chunk_timeout_secs: 120
     buffer_capacity: 256
   ```
-  ✅ Выполнено.
-- [x] `RawConfig` получает `runtime.global_max_concurrent_streams` (дефолт — сумма всех per-agent
-      лимитов, вычисляется автоматически, если не указан явно). ✅
-- [x] Валидация на старте: `max_concurrent_streams == 0` → ошибка старта (по конвенции проекта —
-      пустой токен/отсутствующая env-переменная уже фейлят старт таким же образом). ✅
+  ✅ Done.
+- [x] `RawConfig` gets `runtime.global_max_concurrent_streams` (default — the sum of all per-agent
+      limits, computed automatically if not specified explicitly). ✅
+- [x] Startup validation: `max_concurrent_streams == 0` → startup error (per the project convention —
+      an empty token/missing env variable already fail startup in the same way). ✅
 
-**🔒 Лог-ловушка (ERROR при старте, по умолчанию включена):**
+**🔒 Log trap (ERROR at startup, on by default):**
 ```rust
 anyhow::bail!("agent {id}: streaming.max_concurrent_streams не может быть 0 — используйте отдельный флаг disable_streaming: true, если стрим не нужен");
 ```
 
-- [ ] **Критерий готовности 2.2**: тест конфиг-парсинга — YAML без секции `streaming:` использует
-      дефолты (`max_concurrent_streams: 1` для stdio, безопасный минимум), не паникует.
+- [ ] **Readiness criterion 2.2**: config-parsing test — YAML without a `streaming:` section uses
+      defaults (`max_concurrent_streams: 1` for stdio, a safe minimum), does not panic.
 
-### 2.3 `core/src/supervisor.rs` + `core/src/stdio_agent.rs` — раздельные таймауты
+### 2.3 `core/src/supervisor.rs` + `core/src/stdio_agent.rs` — separate timeouts
 
-- [x] `SpawnConfig` получает `first_chunk_timeout: Duration`, `idle_chunk_timeout: Duration`. ✅
-- [x] В стрим-цикле: первый `rx.recv()` — таймаут `first_chunk_timeout`; последующие — `idle_chunk_timeout`. ✅
+- [x] `SpawnConfig` gets `first_chunk_timeout: Duration`, `idle_chunk_timeout: Duration`. ✅
+- [x] In the stream loop: the first `rx.recv()` — `first_chunk_timeout`; subsequent ones — `idle_chunk_timeout`. ✅
 
-**🔒 Лог-ловушка (WARN, по умолчанию включена):**
+**🔒 Log trap (WARN, on by default):**
 ```rust
 tracing::warn!(session_id = %key, elapsed = ?elapsed, "idle_chunk_timeout сработал — агент не присылал чанков дольше лимита, поток закрыт");
 ```
-Отдельная от текущего `agent did not respond to {method} within {:?}` (это ERROR для полного
-незапуска), потому что idle-таймаут внутри уже начатого стрима — иная по смыслу ситуация (агент
-начал отвечать, но завис на середине).
+Separate from the current `agent did not respond to {method} within {:?}` (that one is an ERROR for a
+complete non-start), because an idle timeout inside an already started stream is a situation that is
+different by meaning (the agent started replying but hung midway).
 
-- [ ] **Критерий готовности 2.3**: юнит-тест — мок-агент присылает 1 чанк, затем не шлёт 200мс при
-      `idle_chunk_timeout_secs=0.1` — стрим закрывается по таймауту, а не висит до `call_timeout`.
+- [ ] **Readiness criterion 2.3**: unit test — a mock agent sends 1 chunk, then stays silent for 200 ms
+      with `idle_chunk_timeout_secs=0.1` — the stream closes on timeout instead of hanging until
+      `call_timeout`.
 
-### ✅ Gate 2 — переход к продакшену
+### ✅ Gate 2 — moving to production
 
-Все критерии 2.1–2.3 выполнены. Нагрузочный прогон (см. Часть 3) пройден без лог-ловушек ERROR-уровня.
+All criteria 2.1–2.3 are met. The load run (see Part 3) passed with no ERROR-level log traps.
 
 ---
 
-## Часть 3 — Раздел тестов (сводный)
+## Part 3 — Tests section (summary)
 
-| # | Тип теста | Файл | Что проверяет | Уровень |
+| # | Test type | File | What it checks | Stage |
 |---|---|---|---|---|
-| T1 | Юнит | `core/src/stdio_agent.rs` (`#[cfg(test)]`) | Чанки приходят по одному, не батчем | Этап 1 |
-| T2 | Юнит | `core/src/convert.rs` (`#[cfg(test)]`) | Каждый вариант `SessionUpdate`/`A2aEvent` маппится, ни один вариант не паникует | Этап 1 |
-| T3 | Интеграционный | новый `gatewayd/tests/streaming_http.rs` | Реальный HTTP SSE-клиент получает несколько событий до `final: true` | Этап 1 |
-| T4 | Интеграционный | новый `gatewayd/tests/streaming_tcp.rs` | TCP-клиент получает построчные `session/update`-нотификации | Этап 1 |
-| T5 | Regression | существующие тесты `Reply::Complete`-пути | Нестриминговый путь не ломается после рефакторинга `stdio_agent.rs` | Этап 1 |
-| T6 | Negative control | откат каждого фикса по одному | Соответствующий тест из T1–T4 краснеет при откате | Этап 1 |
-| T7 | Юнит | `gatewayd/src/registry.rs` (`#[cfg(test)]`) | `Semaphore` отклоняет запрос сверх лимита | Этап 2 |
-| T8 | Юнит | `gatewayd/src/main.rs` (`#[cfg(test)]`) | Конфиг без секции `streaming:` — дефолты, не паника | Этап 2 |
-| T9 | Юнит | `core/src/stdio_agent.rs` (`#[cfg(test)]`) | `idle_chunk_timeout` закрывает зависший стрим, `first_chunk_timeout` — незапустившийся | Этап 2 |
-| T10 | Нагрузочный | `gatewayd/tests/streaming_load.rs` (новый) | 5 мок-агентов, 20 параллельных стримов на агента — нет ERROR-логов, память стабильна за 10 минут. *Тест написан (быстрая версия: 100 стримов, все 200 + final:true); полный 10-мин прогон — ручной* | Gate 2 |
-| T11 | Live | ручной прогон по образцу §7 п.10 `docs/06-gateway-guide.md` | Реальный ACP-агент (claurst/hermes) стримит через направление 4 | Gate 2 |
-| T12 | Clippy/build | `cargo clippy --workspace --all-targets -- -D warnings` | Ни один этап не оставляет warnings | Все этапы |
+| T1 | Unit | `core/src/stdio_agent.rs` (`#[cfg(test)]`) | Chunks arrive one at a time, not as a batch | Stage 1 |
+| T2 | Unit | `core/src/convert.rs` (`#[cfg(test)]`) | Every `SessionUpdate`/`A2aEvent` variant maps, no variant panics | Stage 1 |
+| T3 | Integration | new `gatewayd/tests/streaming_http.rs` | A real HTTP SSE client receives several events before `final: true` | Stage 1 |
+| T4 | Integration | new `gatewayd/tests/streaming_tcp.rs` | The TCP client receives line-by-line `session/update` notifications | Stage 1 |
+| T5 | Regression | existing tests of the `Reply::Complete` path | The non-streaming path does not break after the `stdio_agent.rs` refactor | Stage 1 |
+| T6 | Negative control | roll back each fix one at a time | The corresponding test from T1–T4 goes red on rollback | Stage 1 |
+| T7 | Unit | `gatewayd/src/registry.rs` (`#[cfg(test)]`) | `Semaphore` rejects a request beyond the limit | Stage 2 |
+| T8 | Unit | `gatewayd/src/main.rs` (`#[cfg(test)]`) | Config without a `streaming:` section — defaults, not a panic | Stage 2 |
+| T9 | Unit | `core/src/stdio_agent.rs` (`#[cfg(test)]`) | `idle_chunk_timeout` closes a hung stream, `first_chunk_timeout` one that never started | Stage 2 |
+| T10 | Load | `gatewayd/tests/streaming_load.rs` (new) | 5 mock agents, 20 parallel streams per agent — no ERROR logs, memory stable over 10 minutes. *Test written (fast version: 100 streams, all 200 + final:true); the full 10-minute run is manual* | Gate 2 |
+| T11 | Live | manual run modeled on §7 item 10 of `docs/06-gateway-guide.md` | A real ACP agent (claurst/hermes) streams through direction 4 | Gate 2 |
+| T12 | Clippy/build | `cargo clippy --workspace --all-targets -- -D warnings` | No stage leaves warnings | All stages |
 
-**Правило для всех тестов T1–T11** (конвенция проекта, `docs/decisions.md`, раздел "Как это писалось"):
-каждый новый тест обязан быть проверен через откат соответствующего фикса — если тест не краснеет при
-откате, он проверяет не то, что задумано, и должен быть переписан.
+**Rule for all tests T1–T11** (project convention, `docs/decisions.md`, section "How this was written"):
+every new test must be verified by rolling back the corresponding fix — if the test does not go red on
+rollback, it checks something other than what was intended, and must be rewritten.
 
 ---
 
-## Часть 4 — Конфигурация логирования и ротация
+## Part 4 — Logging configuration and rotation
 
-### 4.1 Текущее состояние (до этой работы)
+### 4.1 Current state (before this work)
 
-`gatewayd/src/main.rs::tracing_subscriber_init()` — только `tracing_subscriber::fmt()` в stdout,
-управление уровнем через `RUST_LOG`/`EnvFilter`, **без файлового вывода и без ротации**. Для
-контейнерного окружения (Docker/systemd journal) это обычно приемлемо — ротацию берёт на себя
-docker-логгер или journald. Но при включении стриминга объём логов растёт (каждый чанк — потенциальная
-точка логирования на DEBUG-уровне), и если логи пишутся в файл (например, при локальном запуске без
-контейнера) — нужен явный лимит.
+`gatewayd/src/main.rs::tracing_subscriber_init()` — only `tracing_subscriber::fmt()` to stdout,
+level control via `RUST_LOG`/`EnvFilter`, **no file output and no rotation**. For a containerized
+environment (Docker/systemd journal) this is usually acceptable — rotation is taken over by the
+docker logger or journald. But enabling streaming grows log volume (each chunk is a potential
+logging point at DEBUG level), and if logs are written to a file (e.g. a local run without a
+container) — an explicit limit is needed.
 
-### 4.2 Расчёт объёма логов
+### 4.2 Log volume calculation
 
-Модель нагрузки: 5 агентов, по 20 стримов/час на агента, среднее 15 чанков на стрим, средний размер
-строки лога (`tracing` fmt с полями `session_id`, `agent_id`, `seq`, `timestamp`) — ~220 байт.
+Load model: 5 agents, 20 streams/hour per agent, on average 15 chunks per stream, average log
+line size (`tracing` fmt with `session_id`, `agent_id`, `seq`, `timestamp` fields) — ~220 bytes.
 
-| Уровень логирования | Что логируется | Объём/сутки (номинал) | Объём/сутки (пик ×5) |
+| Log level | What is logged | Volume/day (nominal) | Volume/day (peak ×5) |
 |---|---|---|---|
-| `ERROR` + `WARN` только | Ловушки из Частей 1–2, без чанков | ~1.5 MB | ~7.5 MB |
-| `INFO` (дефолт) | + открытие/закрытие стримов, старт/стоп агентов | ~1.5–3 MB | ~15 MB |
-| `DEBUG` (включая чанки) | + каждый `session/update`/`A2aEvent`-чанк | ~7.5 MB | ~37 MB |
-| `TRACE` | + полные тела JSON-RPC сообщений | ×3–5 от DEBUG (~25–40 MB) | ~150–200 MB |
+| `ERROR` + `WARN` only | Traps from Parts 1–2, without chunks | ~1.5 MB | ~7.5 MB |
+| `INFO` (default) | + stream open/close, agent start/stop | ~1.5–3 MB | ~15 MB |
+| `DEBUG` (including chunks) | + every `session/update`/`A2aEvent` chunk | ~7.5 MB | ~37 MB |
+| `TRACE` | + full JSON-RPC message bodies | ×3–5 of DEBUG (~25–40 MB) | ~150–200 MB |
 
-Вывод: при дефолтном `INFO`-уровне ротация практически не требуется даже без лимита (несколько МБ в
-сутки). Порог ротации нужен на случай, если оператор временно включит `DEBUG`/`TRACE` для диагностики
-и забудет вернуть обратно — именно этот сценарий чаще всего забивает диск на реальных серверах.
+Takeaway: at the default `INFO` level rotation is practically unnecessary even without a limit (a few
+MB per day). A rotation threshold is needed in case the operator temporarily enables `DEBUG`/`TRACE`
+for diagnostics and forgets to switch back — that very scenario is what most often fills up the disk
+on real servers.
 
-### 4.3 Конфиг ротации (новая секция `config.yaml`)
+### 4.3 Rotation config (new `config.yaml` section)
 
 ```yaml
 logging:
-  level: "info"                    # info | debug | trace | warn | error — дефолт info
-  output: "stdout"                 # stdout | file | both — дефолт stdout (без смены поведения)
+  level: "info"                    # info | debug | trace | warn | error — default info
+  output: "stdout"                 # stdout | file | both — default stdout (no behavior change)
   file:
     path: "/var/log/acp-a2a-gateway/gateway.log"
-    max_file_size_mb: 100          # порог одного файла до ротации
-    max_files: 10                  # сколько ротированных файлов держать (старшие затираются)
-    max_total_size_mb: 1000        # ЖЁСТКИЙ потолок суммарного объёма — приоритетнее max_files
-    compress_rotated: true         # gzip старых файлов сразу после ротации
+    max_file_size_mb: 100          # per-file threshold before rotation
+    max_files: 10                  # how many rotated files to keep (oldest are overwritten)
+    max_total_size_mb: 1000        # HARD ceiling on total volume — takes priority over max_files
+    compress_rotated: true         # gzip old files right after rotation
 ```
 
-**Обоснование чисел:** `max_file_size_mb: 100` — при пиковом `DEBUG`-уровне (~37 МБ/сутки) один файл
-покрывает ~2.5 суток, что достаточно для окна диагностики без частой ротации. `max_files: 10` ×
-`max_file_size_mb: 100` = 1000 МБ, что и задаёт `max_total_size_mb: 1000` — те же цифры с двух сторон,
-чтобы `max_total_size_mb` реально был контрольным потолком, а не декоративным полем.
+**Rationale for the numbers:** `max_file_size_mb: 100` — at peak `DEBUG` level (~37 MB/day) one file
+covers ~2.5 days, which is enough for a diagnostics window without frequent rotation. `max_files: 10` ×
+`max_file_size_mb: 100` = 1000 MB, which is exactly what `max_total_size_mb: 1000` sets — the same
+figures from two sides, so that `max_total_size_mb` is a real control ceiling, not a decorative field.
 
-### 4.4 Механизм ротации — реализация
+### 4.4 Rotation mechanism — implementation
 
-- [x] Добавить `tracing-appender = "0.2"` в `gatewayd/Cargo.toml`.
-- [x] `tracing_appender::rolling::RollingFileAppender` с `rolling::Builder` — `max_log_files(10)`
-      обеспечивает автоматическое затирание старших версий при превышении `max_files`.
-- [x] Если `logging.output: both` — `tracing_subscriber::registry()` с двумя слоями (`fmt::layer()`
-      для stdout + `fmt::layer()` для файла), не заменяя друг друга.
-- [x] Проверка `max_total_size_mb` — отдельная фоновая задача (по аналогии с уже существующим
-      `sweeper` в `main.rs` для `TaskStore`, тот же `tokio::spawn` + `interval` паттерн), которая
-      считает суммарный размер каталога логов раз в час и **принудительно** удаляет старейшие
-      ротированные файлы, если `tracing-appender`'овский `max_files` почему-то не успел (защита от
-      расхождения между "N файлов" и "N мегабайт" при резком скачке размера одного файла).
-- [x] `compress_rotated: true` (дефолт) — gzip-сжатие ротированных файлов при чистке каталога
-      (`prune_log_dir` в `main.rs`, `flate2`).
-- [x] Реальная чистка вместо лог-сообщения: `prune_log_dir` gzip-сжимает старые файлы и удаляет
-      старейшие, пока суммарный размер не вернётся к `max_total_size_mb` (активный файл не трогается).
+- [x] Add `tracing-appender = "0.2"` to `gatewayd/Cargo.toml`.
+- [x] `tracing_appender::rolling::RollingFileAppender` with `rolling::Builder` — `max_log_files(10)`
+      provides automatic overwrite of older versions when `max_files` is exceeded.
+- [x] If `logging.output: both` — `tracing_subscriber::registry()` with two layers (`fmt::layer()`
+      for stdout + `fmt::layer()` for the file), not replacing each other.
+- [x] `max_total_size_mb` check — a separate background task (by analogy with the already existing
+      `sweeper` in `main.rs` for `TaskStore`, the same `tokio::spawn` + `interval` pattern) that
+      computes the total log-directory size once an hour and **forcefully** deletes the oldest
+      rotated files if the `tracing-appender`'s own `max_files` somehow lagged (protection against
+      a divergence between "N files" and "N megabytes" during a sharp jump in a single file's size).
+- [x] `compress_rotated: true` (default) — gzip compression of rotated files during directory
+      cleanup (`prune_log_dir` in `main.rs`, `flate2`).
+- [x] Real cleanup instead of a log message: `prune_log_dir` gzip-compresses old files and deletes
+      the oldest ones until the total size returns below `max_total_size_mb` (the active file is
+      left untouched).
 
-**🔒 Лог-ловушка (WARN, по умолчанию включена, пишется даже при полном отключении файлового
-логирования — только в stdout):**
+**🔒 Log trap (WARN, on by default, written even when file logging is fully
+disabled — stdout only):**
 ```rust
 tracing::warn!(current_size_mb, limit_mb, "лог-каталог приближается к max_total_size_mb (>80%) — рассмотрите понижение уровня логирования или увеличение лимита");
 ```
 
-**🔒 Лог-ловушка (ERROR, по умолчанию включена):**
+**🔒 Log trap (ERROR, on by default):**
 ```rust
 tracing::error!(current_size_mb, limit_mb, "лог-каталог превысил max_total_size_mb — принудительное удаление старейших файлов");
 ```
 
-### 4.5 Полное отключение логирования (аварийный клапан)
+### 4.5 Completely disabling logging (emergency valve)
 
-Отдельный флаг, а не побочный эффект `level`:
+A separate flag, not a side effect of `level`:
 
 ```yaml
 logging:
-  level: "off"        # полностью отключает даже ERROR — использовать только в экстренной ситуации
+  level: "off"        # disables even ERROR completely — use only in an emergency
 ```
 
-- [x] `EnvFilter::new("off")` вместо построения фильтра из `level`.
-- [x] При `level: "off"` — стартовое сообщение **обязательно** печатается один раз до отключения
-      фильтра (иначе оператор не сможет отличить "гейтвей не пишет логи по конфигу" от "гейтвей не
-      запустился"):
+- [x] `EnvFilter::new("off")` instead of building the filter from `level`.
+- [x] With `level: "off"` — the startup message is **mandatorily** printed once before the filter is
+      disabled (otherwise the operator cannot tell apart "the gateway writes no logs per config" from
+      "the gateway did not start"):
   ```rust
   eprintln!("[gatewayd] ВНИМАНИЕ: логирование полностью отключено (logging.level: off) — диагностика по логам будет недоступна");
   ```
-  Пишется напрямую в stderr, минуя `tracing`, потому что к этому моменту фильтр уже может быть `off`.
+  Written directly to stderr, bypassing `tracing`, because by this point the filter may already be `off`.
 
-### 4.6 Расширение логирования (диагностический режим)
+### 4.6 Expanding logging (diagnostic mode)
 
-Обратный аварийный клапан — временное расширение без правки `config.yaml` и рестарта:
+The reverse emergency valve — temporary expansion without editing `config.yaml` and without a restart:
 
-- [x] HTTP-эндпоинт смены уровня в рантайме: `POST /debug/level` (body `{"level":"debug"}`) через
-      `tracing_subscriber::reload::Handle` — стандартный паттерн `tracing-subscriber` для горячей
-      смены фильтра без пересборки и рестарта процесса. GET возвращает текущий уровень.
-      Проверка авторизации — тот же `Authorization: Bearer <token>`, что у RPC.
-- [x] Ограничение по времени: расширенный уровень (`debug`/`trace`) автоматически возвращается к
-      дефолтному `info` через настраиваемый `logging.debug_ttl_minutes` (дефолт 60), чтобы забытый
-      диагностический режим не работал бесконечно и не выел диск через `max_total_size_mb`.
+- [x] Runtime level-change HTTP endpoint: `POST /debug/level` (body `{"level":"debug"}`) via
+      `tracing_subscriber::reload::Handle` — the standard `tracing-subscriber` pattern for hot-swapping
+      the filter without a rebuild or process restart. GET returns the current level.
+      Authorization check — the same `Authorization: Bearer <token>` as for RPC.
+- [x] Time limit: the expanded level (`debug`/`trace`) automatically returns to the default `info`
+      after a configurable `logging.debug_ttl_minutes` (default 60), so a forgotten diagnostic mode
+      does not run forever and eat the disk past `max_total_size_mb`.
 
-**🔒 Лог-ловушка (WARN, по умолчанию включена):**
+**🔒 Log trap (WARN, on by default):**
 ```rust
 tracing::warn!(new_level = %level, ttl_minutes, "уровень логирования временно расширен — автоматический откат через ttl_minutes");
 ```
 
-### ✅ Gate 4 — критерий готовности логирования
+### ✅ Gate 4 — logging readiness criterion
 
-- [ ] При включённом `DEBUG` на протяжении 24 часов пикового трафика (T10 из Части 3) суммарный
-      объём логов остаётся под `max_total_size_mb`, ротация срабатывает без потери последних записей.
-      *(ручной прогон — не выполнялся; автотест `streaming_load.rs` (T10) написан)*
-- [ ] Откат `level: off → info` и обратно проверен вручную — процесс не требует рестарта.
-      *(проверка через GET/POST /debug/level — ручной прогон, не выполнялся)*
-- [ ] Лог-ловушка "приближается к лимиту" (WARN на 80%) реально срабатывает в нагрузочном тесте до
-      того, как сработает принудительное удаление (ERROR) — порядок эскалации подтверждён.
-      *(ручной прогон — не выполнялся)*
+- [ ] With `DEBUG` enabled over 24 hours of peak traffic (T10 from Part 3) the total
+      log volume stays under `max_total_size_mb`, rotation fires without losing the latest records.
+      *(manual run — not performed; the automated test `streaming_load.rs` (T10) is written)*
+- [ ] Rolling `level: off → info` and back is verified manually — the process requires no restart.
+      *(check via GET/POST /debug/level — manual run, not performed)*
+- [ ] The "approaching the limit" log trap (WARN at 80%) actually fires in the load test before
+      the forced deletion (ERROR) fires — the escalation order is confirmed.
+      *(manual run — not performed)*
 
 ---
 
-## Сводная таблица: файлы, лог-ловушки и тесты по этапам
+## Summary table: files, log traps, and tests by stage
 
-| Этап | Файлы (правка) | Новые файлы | Лог-ловушки (кол-во WARN/ERROR) | Тесты |
+| Stage | Files (edit) | New files | Log traps (count WARN/ERROR) | Tests |
 |---|---|---|---|---|
-| 1. Механизм стриминга | `stdio_agent.rs`, `convert.rs`, `transport_http.rs`, `transport_tcp.rs`, `Cargo.toml` (gatewayd) | 1 обязательный (интеграционный тест) | 2 ERROR, 2 WARN | T1–T6 |
-| 2. Лимиты масштаба | `registry.rs`, `main.rs`, `supervisor.rs`, `stdio_agent.rs` (повторно) | 0 обязательных | 1 ERROR (старт), 2 WARN | T7–T9 |
-| 3. Нагрузка/live | — | 2 новых тестовых файла (`streaming_load.rs`, ручной чек-лист) | — (проверка существующих) | T10–T12 |
-| 4. Логирование/ротация | `main.rs` (расширение `tracing_subscriber_init`), `Cargo.toml` (gatewayd) | 0 обязательных | 2 WARN, 1 ERROR, 1 стартовый eprintln | Gate 4 чек-лист |
+| 1. Streaming mechanism | `stdio_agent.rs`, `convert.rs`, `transport_http.rs`, `transport_tcp.rs`, `Cargo.toml` (gatewayd) | 1 mandatory (integration test) | 2 ERROR, 2 WARN | T1–T6 |
+| 2. Scale limits | `registry.rs`, `main.rs`, `supervisor.rs`, `stdio_agent.rs` (again) | 0 mandatory | 1 ERROR (startup), 2 WARN | T7–T9 |
+| 3. Load/live | — | 2 new test files (`streaming_load.rs`, manual checklist) | — (checking existing ones) | T10–T12 |
+| 4. Logging/rotation | `main.rs` (extending `tracing_subscriber_init`), `Cargo.toml` (gatewayd) | 0 mandatory | 2 WARN, 1 ERROR, 1 startup eprintln | Gate 4 checklist |
 
-**Итог по всему роадмапу:** 8 уникальных существующих файлов на правку, 1 обязательный + 2
-опциональных новых файла кода, 1 новая зависимость на механизм (`tokio-stream`) + 1 на логирование
-(`tracing-appender`), 12 именованных тестов плюс нагрузочный прогон, 6 ERROR-ловушек и 6 WARN-ловушек,
-включённых по умолчанию без дополнительной настройки оператором.
+**Total across the whole roadmap:** 8 unique existing files to edit, 1 mandatory + 2
+optional new code files, 1 new mechanism dependency (`tokio-stream`) + 1 for logging
+(`tracing-appender`), 12 named tests plus a load run, 6 ERROR traps and 6 WARN traps,
+on by default with no extra operator configuration.

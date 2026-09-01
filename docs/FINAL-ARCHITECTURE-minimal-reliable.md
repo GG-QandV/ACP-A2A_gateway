@@ -1,96 +1,98 @@
-# Итоговая структура: минимальный, надёжный, расширяемый gateway (Rust)
+# Final structure: a minimal, reliable, extensible gateway (Rust)
 
-Синтез всех решений по треду: универсальный конвертер вместо двух бриджей,
-токен как чистый allow/deny, seam-подход через `Reply<T,U>` для будущего
-стриминга, `TurnLease` и паттерны модульности из `hermes-agent/gateway/`.
+> **Language:** English · [Русская версия](FINAL-ARCHITECTURE-minimal-reliable-ru.md)
+
+Synthesis of all decisions across the thread: a universal converter instead of two bridges,
+token as pure allow/deny, a seam approach via `Reply<T,U>` for future
+streaming, `TurnLease`, and the modularity patterns from `hermes-agent/gateway/`.
 
 ---
 
-## 1. Дерево crate'ов (3 крейта — минимум без потери расширяемости)
+## 1. Crate tree (3 crates — the minimum without losing extensibility)
 
 ```
 gateway/
 ├── Cargo.toml                  # workspace
 ├── config.example.yaml
 │
-├── protocol/                   # ТИПЫ. Ничего не знает о Reply/lease/dispatch.
+├── protocol/                   # TYPES. Knows nothing about Reply/lease/dispatch.
 │   ├── Cargo.toml
 │   └── src/
 │       ├── lib.rs
 │       ├── acp.rs               # SessionId, Prompt, PromptResponse, SessionUpdate
 │       └── a2a.rs               # TaskId, Task, AgentCard, A2aEvent
 │
-├── core/                        # ЯДРО. Единственное место с реальной сложностью.
+├── core/                        # CORE. The only place with real complexity.
 │   ├── Cargo.toml
 │   └── src/
 │       ├── lib.rs
-│       ├── reply.rs              # enum Reply<T, U> — seam для стриминга (Фаза 2)
+│       ├── reply.rs              # enum Reply<T, U> — seam for streaming (Phase 2)
 │       ├── agent.rs               # trait AcpAgent, trait A2aAgent
-│       ├── convert.rs             # AcpAsA2a, A2aAsAcp — универсальный конвертер
-│       ├── lease.rs               # TurnLease — сериализация promptов на сессию
-│       └── stdio_agent.rs         # StdioAcpAgent — spawn + framing (Фаза 1.1)
+│       ├── convert.rs             # AcpAsA2a, A2aAsAcp — the universal converter
+│       ├── lease.rs               # TurnLease — serialization of prompts per session
+│       └── stdio_agent.rs         # StdioAcpAgent — spawn + framing (Phase 1.1)
 │
-└── gatewayd/                    # БИНАРНИК. Только проводка, без бизнес-логики.
+└── gatewayd/                    # BINARY. Wiring only, no business logic.
     ├── Cargo.toml
     └── src/
         ├── main.rs
-        ├── registry.rs            # плоский token-set + agent map (id -> transport)
+        ├── registry.rs            # flat token-set + agent map (id -> transport)
         ├── dispatch.rs             # token check -> registry lookup -> lease -> convert
-        └── transport_tcp.rs        # newline-delimited JSON-RPC приёма соединений
+        └── transport_tcp.rs        # newline-delimited JSON-RPC for accepting connections
 ```
 
-**Почему 3, а не 5 и не 1**: `protocol` отделён, потому что типы переиспользуются
-и тестируются независимо от логики. `core` отделён от `gatewayd`, потому что
-ядро (trait'ы, конвертер, lease) — единственное, что стоит покрывать unit-тестами
-изолированно от сети; `gatewayd` — это только I/O-обвязка, которая меняется
-при добавлении транспортов, но не должна тянуть за собой пересборку тестов ядра.
+**Why 3, not 5 or 1**: `protocol` is separated because the types are reused
+and tested independently of the logic. `core` is separated from `gatewayd` because
+the core (traits, converter, lease) is the only thing worth covering with unit tests
+in isolation from the network; `gatewayd` is just I/O scaffolding, which changes
+when transports are added, but must not drag along a rebuild of the core tests.
 
 ---
 
-## 2. Поток запроса (что происходит на каждый входящий байт)
+## 2. Request flow (what happens on every incoming byte)
 
 ```
-TCP-соединение
+TCP connection
    │
    ▼
-gatewayd::transport_tcp   — читает newline-delimited JSON-RPC
+gatewayd::transport_tcp   — reads newline-delimited JSON-RPC
    │
    ▼
 gatewayd::dispatch::handle_connection
    │
-   ├─▶ registry.check_token(token)?          // allow/deny, без знания об агентах
-   │        │ deny → закрыть соединение, до чтения payload
+   ├─▶ registry.check_token(token)?          // allow/deny, no knowledge of agents
+   │        │ deny → close the connection, before reading the payload
    │        ▼ allow
    ├─▶ registry.lookup(agent_id)              // id -> AgentEntry{transport}
    │
-   ├─▶ lease.acquire(session_id).await?       // сериализация turn'ов на сессию
-   │        │ timeout → TurnLeaseTimeoutError, отказ клиенту
+   ├─▶ lease.acquire(session_id).await?       // serialization of turns per session
+   │        │ timeout → TurnLeaseTimeoutError, refuse the client
    │        ▼ acquired
    ├─▶ core::convert::{AcpAsA2a|A2aAsAcp|identity}.prompt(...)
    │        │
    │        └─▶ match Reply<T,U> {
-   │               Complete(resp)   => отдать клиенту   (Фаза 1: единственный путь)
-   │               Streaming(rx)    => unreachable!()   (Фаза 2: pump в клиента)
+   │               Complete(resp)   => hand to the client  (Phase 1: the only path)
+   │               Streaming(rx)    => unreachable!()   (Phase 2: pump into the client)
    │            }
    │
    └─▶ lease.release(session_id)
 ```
 
-Единственная реальная логика — конвертер и lease. Всё остальное — passthrough
-байтов.
+The only real logic is the converter and the lease. Everything else is byte
+passthrough.
 
 ---
 
-## 3. Ключевые типы (финальная версия)
+## 3. Key types (final version)
 
 ```rust
-// core/src/reply.rs — seam для будущего стриминга, без изменений когда он появится
+// core/src/reply.rs — seam for future streaming, no changes when it arrives
 pub enum Reply<T, U> {
     Complete(T),
     Streaming(tokio::sync::mpsc::UnboundedReceiver<U>),
 }
 
-// core/src/lease.rs — надёжность: не даёт двум promptам в одну сессию сталкиваться
+// core/src/lease.rs — reliability: prevents two prompts in one session from colliding
 pub struct TurnLease {
     locks: tokio::sync::Mutex<HashMap<SessionId, Arc<tokio::sync::Mutex<()>>>>,
 }
@@ -100,7 +102,7 @@ impl TurnLease {
         -> Result<TurnGuard, TurnLeaseTimeoutError> { /* fail-closed */ }
 }
 
-// core/src/agent.rs — оба протокола за одним контрактом
+// core/src/agent.rs — both protocols behind one contract
 #[async_trait]
 pub trait AcpAgent: Send + Sync {
     async fn prompt(&self, s: SessionId, p: Prompt) -> Result<Reply<PromptResponse, SessionUpdate>>;
@@ -113,50 +115,50 @@ pub trait A2aAgent: Send + Sync {
     async fn cancel_task(&self, id: TaskId) -> Result<Task>;
 }
 
-// gatewayd/src/registry.rs — токен НЕ знает про агентов, агент НЕ знает про токен
+// gatewayd/src/registry.rs — the token does NOT know about agents, the agent does NOT know about the token
 pub struct Registry {
-    tokens: HashSet<String>,               // allow/deny на вход, и только
-    agents: HashMap<String, AgentEntry>,   // id -> {transport} (protocol выводится из transport)
+    tokens: HashSet<String>,               // allow/deny at entry, and only that
+    agents: HashMap<String, AgentEntry>,   // id -> {transport} (protocol derived from transport)
 }
 ```
 
 ---
 
-## 4. Что делает решение надёжным уже в MVP (не отложено на "потом")
+## 4. What makes the solution reliable already in the MVP (not deferred to "later")
 
-| Риск                                                                 | Механизм в MVP                                                                                                                           |
+| Risk                                                                 | Mechanism in the MVP                                                                                                                     |
 | -------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| Два promptа одновременно в одну ACP-сессию портят stdio-поток агента | `TurnLease` — fail-closed, `TurnLeaseTimeoutError` вместо тихого зависания                                                               |
-| Невалидный токен доходит до парсинга JSON-RPC                        | Проверка токена — первая операция после accept(), до чтения payload                                                                      |
-| Процесс агента умер, а gateway продолжает слать ему запросы          | `StdioAcpAgent` держит `Child` и проверяет `try_wait()` перед каждым `prompt` — если процесс мёртв, `Result::Err` вместо тихого таймаута |
-| Один зависший клиент блокирует весь сервис                           | Каждое соединение — свой `tokio::spawn`, `TurnLease` блокирует только на уровне сессии, не глобально                                     |
+| Two prompts simultaneously into one ACP session corrupt the agent's stdio stream | `TurnLease` — fail-closed, `TurnLeaseTimeoutError` instead of a silent hang                                                               |
+| An invalid token reaches JSON-RPC parsing                        | The token check is the first operation after accept(), before reading the payload                                                                      |
+| The agent process died, yet the gateway keeps sending it requests          | `StdioAcpAgent` holds the `Child` and checks `try_wait()` before each `prompt` — if the process is dead, `Result::Err` instead of a silent timeout |
+| One hung client blocks the whole service                           | Each connection gets its own `tokio::spawn`; `TurnLease` blocks only at session level, not globally                                     |
 
 ---
 
-## 5. Точки расширения (без изменения существующих файлов)
+## 5. Extension points (without changing existing files)
 
-| Что добавляется                      | Куда                                                                                                                   | Что НЕ трогается                                             |
+| What gets added                      | Where                                                                                                                   | What is NOT touched                                             |
 | ------------------------------------ | ---------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------ |
-| Стриминг                             | `core/convert.rs`: заменить `unreachable!()` на реальный маппинг; `gatewayd/dispatch.rs`: обработать `Streaming` ветку | Сигнатуры `AcpAgent`/`A2aAgent`, `Reply<T,U>`, `registry.rs` |
-| WS/HTTP+SSE транспорт                | Новый файл `gatewayd/src/transport_ws.rs`, вызывающий тот же `dispatch::handle_connection`                             | `core/`, `protocol/`, `transport_tcp.rs`                     |
-| TLS                                  | Обёртка вокруг `TcpListener` в `transport_tcp.rs` (rustls)                                                             | Всё выше транспортного слоя                                  |
-| Rate limiting                        | Новый `gatewayd/src/rate_limit.rs`, подключается перед `registry.check_token`                                          | `dispatch.rs` логика после токена                            |
-| Множественные агенты на один токен   | Просто расширение `agents:` в YAML — `Registry` уже поддерживает                                                       | Код не меняется совсем                                       |
-| `HttpA2aAgent` (реальный A2A-клиент) | Новый файл `core/src/http_agent.rs`, реализует `A2aAgent`                                                              | `convert.rs` работает с любой реализацией трейта уже сейчас  |
+| Streaming                             | `core/convert.rs`: replace `unreachable!()` with real mapping; `gatewayd/dispatch.rs`: handle the `Streaming` branch | `AcpAgent`/`A2aAgent` signatures, `Reply<T,U>`, `registry.rs` |
+| WS/HTTP+SSE transport                | New file `gatewayd/src/transport_ws.rs` calling the same `dispatch::handle_connection`                             | `core/`, `protocol/`, `transport_tcp.rs`                     |
+| TLS                                  | A wrapper around the `TcpListener` in `transport_tcp.rs` (rustls)                                                             | Everything above the transport layer                                  |
+| Rate limiting                        | New `gatewayd/src/rate_limit.rs`, hooked in before `registry.check_token`                                          | `dispatch.rs` logic after the token                            |
+| Multiple agents on one token   | Just an extension of `agents:` in YAML — `Registry` already supports it                                                       | The code does not change at all                                       |
+| `HttpA2aAgent` (a real A2A client) | New file `core/src/http_agent.rs` implementing `A2aAgent`                                                              | `convert.rs` already works with any trait implementation   |
 
 ---
 
-## 6. Оценка (сведено с учётом всех упрощений по треду)
+## 6. Estimate (consolidated with all simplifications across the thread)
 
-| Часть                                                             | Дни         |
+| Part                                                             | Days         |
 | ----------------------------------------------------------------- | ----------- |
-| `protocol` (типы, без логики)                                     | 1           |
-| `core`: `Reply`, trait'ы, `TurnLease`                             | 1.5         |
-| `core`: `convert.rs` (AcpAsA2a + A2aAsAcp, синхронный путь)       | 2.5         |
+| `protocol` (types, no logic)                                     | 1           |
+| `core`: `Reply`, traits, `TurnLease`                             | 1.5         |
+| `core`: `convert.rs` (AcpAsA2a + A2aAsAcp, synchronous path)       | 2.5         |
 | `core`: `StdioAcpAgent` (spawn, framing, dead-process check)      | 1           |
-| `gatewayd`: registry + dispatch + TCP-транспорт                   | 1.5         |
-| Тесты (lease concurrency, token deny, оба направления конвертера) | 1.5         |
-| **Итого MVP**                                                     | **~9 дней** |
+| `gatewayd`: registry + dispatch + TCP transport                   | 1.5         |
+| Tests (lease concurrency, token deny, both converter directions) | 1.5         |
+| **MVP total**                                                     | **~9 days** |
 
-Сверху (модули из §5, по мере необходимости): стриминг +3-4 дня, WS/HTTP+SSE
-+1-2 дня каждый, TLS +1 день, rate limiting +0.5 дня.
+On top (modules from §5, as needed): streaming +3-4 days, WS/HTTP+SSE
++1-2 days each, TLS +1 day, rate limiting +0.5 days.

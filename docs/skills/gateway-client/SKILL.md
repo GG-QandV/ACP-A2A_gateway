@@ -1,38 +1,41 @@
 ---
 name: gateway-client
 description: >-
-  Как агенту (claurst, hermes, opencode, любой ACP/A2A-клиент) ходить в
-  ACP-A2A_gateway: адреса, токены, форматы message/send и session/prompt,
-  продолжение разговора по contextId, изоляция между клиентами, известные
-  ограничения. Триггер: "отправить задачу через гатевей", "поговорить с
-  агентом X через шлюз", "A2A message/send", "почему continue таймаутит".
+  How an agent (claurst, hermes, opencode, any ACP/A2A client) talks to
+  ACP-A2A_gateway: addresses, tokens, message/send and session/prompt
+  formats, continuing a conversation via contextId, isolation between
+  clients, known limitations. Trigger: "send a task through the gateway",
+  "talk to agent X through the gateway", "A2A message/send", "why does
+  continue time out".
 ---
 
-# gateway-client — как агенту пользоваться ACP-A2A_gateway
+# gateway-client — how an agent uses ACP-A2A_gateway
 
-Гатевей (`GG-QandV/ACP-A2A_gateway`) — маршрутизатор между клиентами и
-ACP-агентами. Два порта, четыре направления. Ты можешь быть и клиентом
-(ходить в агентов через шлюз), и агентом (тебя подключают как stdio-агента).
+> **Language:** English · [Русская версия](SKILL-ru.md)
 
-## 1. Когда ты клиент (идёшь в агентов через шлюз)
+The gateway (`GG-QandV/ACP-A2A_gateway`) is a router between clients and
+ACP agents. Two ports, four directions. You can be both a client (reaching
+agents through the gateway) and an agent (you get connected as a stdio agent).
 
-### TCP (ACP-клиент, направления 1/2)
+## 1. When you are a client (reaching agents through the gateway)
+
+### TCP (ACP client, directions 1/2)
 
 ```bash
-# порт listen (по умолч. 8347), первая строка — handshake, дальше ACP JSON-RPC построчно
+# listen port (default 8347), first line — handshake, then line-delimited ACP JSON-RPC
 { printf '%s\n' '{"token":"TOKEN","agent_id":"claurst-main"}'
   printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{}}}'
   printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"/tmp","mcpServers":[],"additionalDirectories":[]}}'
 } | nc 127.0.0.1 8347
 ```
 
-Каждый `session/new` даёт **новую** сессию на том же процессе агента — можно
-вести много разговоров через один TCP-поток. Ответы — строки JSON, корреляция по `id`.
+Each `session/new` gives a **new** session on the same agent process — you can
+run many conversations over one TCP stream. Responses are JSON lines, correlated by `id`.
 
-### HTTP (A2A-клиент, направления 3/4)
+### HTTP (A2A client, directions 3/4)
 
 ```bash
-# порт http_listen (по умолч. 8348)
+# http_listen port (default 8348)
 curl -s http://127.0.0.1:8348/agents/<agent_id>/.well-known/agent.json \
   -H "Authorization: Bearer <token>"
 
@@ -43,52 +46,52 @@ curl -s -X POST http://127.0.0.1:8348/agents/<agent_id>/rpc \
       }}'
 ```
 
-## 2. Форматы — критично, проверено на живых агентах
+## 2. Formats — critical, verified against live agents
 
 ### A2A `message/send`
 
 - `message.parts[].kind` — `text` / `file` / `data` (tagged enum, kebab/lowercase).
-- Ответ: `result.context_id` (**snake_case**), `result.id` (task), `result.status`,
+- Response: `result.context_id` (**snake_case**), `result.id` (task), `result.status`,
   `result.artifacts`.
-- **Продолжение разговора**: `contextId` кладётся в `message.contextId`
-  (или `params.contextId`), **НЕ** в `configuration` — конфигурация его не читает.
-- Без `contextId` → гатевей заводит новый разговор.
-- Чужой существующий `contextId` → ошибка `contextId принадлежит другому клиенту`
-  (изоляция между токенами, IDOR закрыт).
-- Несуществующий `contextId` → не отклоняется, заводится заново (так задумано).
-- Сессия живёт 24ч простоя; потолок 256 разговоров на агента.
+- **Continuing a conversation**: `contextId` goes into `message.contextId`
+  (or `params.contextId`), **NOT** into `configuration` — configuration does not read it.
+- Without `contextId` → the gateway starts a new conversation.
+- Another client's existing `contextId` → error `contextId принадлежит другому клиенту`
+  (isolation between tokens, IDOR closed).
+- A nonexistent `contextId` → not rejected, a new one is created (by design).
+- A session lives 24h idle; cap of 256 conversations per agent.
 
-### ACP `session/prompt` (если говоришь с агентом напрямую через TCP)
+### ACP `session/prompt` (if you talk to an agent directly over TCP)
 
-- `prompt` — **sequence** ContentBlock'ов, НЕ строка (строка → `-32602`).
-- Блоки пишутся с полем `type` (не `kind`): `{"type":"text","text":"..."}`.
-- `initialize` → `session/new` (запомнить `sessionId`) → `session/prompt` с этим `sessionId`.
+- `prompt` — a **sequence** of ContentBlocks, NOT a string (string → `-32602`).
+- Blocks are written with a `type` field (not `kind`): `{"type":"text","text":"..."}`.
+- `initialize` → `session/new` (remember `sessionId`) → `session/prompt` with that `sessionId`.
 
-## 3. Когда тебя подключают как агента (stdio)
+## 3. When you are connected as an agent (stdio)
 
-- Твоя команда должна включать ACP-подкоманду:
+- Your command must include the ACP subcommand:
   claurst → `claurst acp`, hermes → `hermes acp`, opencode → `opencode acp`.
-  Это **не** `--bare`, **не** `--print`.
-- Твой stdout должен быть **настоящим pipe** (не файл): `> log` роняет Hermes
-  с `Pipe transport is only for pipes`. Шлюз спавнит через `Stdio::piped()` — ок.
-- claurst: ставь `CLAURST_DISABLE_MODELS_FETCH=1`, `CLAURST_SHARE_NO_OPEN=1`
-  (не ходить за моделями, не открывать браузер).
-- Ожидай, что шлюз/клиент дёргает `session/new` **многократно** на одном процессе —
-  это нормально, каждый раз отвечай новым `sessionId`.
+  This is **not** `--bare`, **not** `--print`.
+- Your stdout must be a **real pipe** (not a file): `> log` crashes Hermes
+  with `Pipe transport is only for pipes`. The gateway spawns via `Stdio::piped()` — OK.
+- claurst: set `CLAURST_DISABLE_MODELS_FETCH=1`, `CLAURST_SHARE_NO_OPEN=1`
+  (don't fetch models, don't open a browser).
+- Expect the gateway/client to call `session/new` **repeatedly** on one process —
+  that's normal; reply with a new `sessionId` each time.
 
-## 4. Известные ограничения (не паниковать, это не твой баг)
+## 4. Known limitations (don't panic, it's not your bug)
 
-| Симптом | Причина | Обход |
+| Symptom | Cause | Workaround |
 |---|---|---|
-| `continue` по contextId таймаутит (2-й `message/send` в ту же сессию) | Дефект конвертера шлюза (направление 4), воспроизводится на claurst и hermes | Держать каждый запрос в новой сессии (без contextId) либо чинить шлюз; прямым `session/prompt` продолжение работает |
-| `Reply::Streaming` — ошибка «Фаза 1: стриминг не реализован» | Стриминг не реализован в конвертере | Только блокирующие вызовы |
-| Таймаут ответа агента | `agent_call_timeout_secs` (по умолч. 120) | Увеличить в `config.yaml` |
-| Ошибка `-32010` / HTTP 409 на старом `contextId` | Агент умер и был переспавнен (P2-10): сессия относится к прошлому поколению процесса (`ContextLost`) | Повторить тот же вызов — заведётся свежая сессия. Пометка одноразовая |
-| Агент падает, но «жив» (завис) | `is_alive` ловит смерть, не зависание | Упрётся в `agent_call_timeout_secs`, увеличить таймаут |
+| `continue` by contextId times out (2nd `message/send` into the same session) | Gateway converter defect (direction 4), reproduces on claurst and hermes | Keep each request in a new session (no contextId) or fix the gateway; continuation works via direct `session/prompt` |
+| `Reply::Streaming` — error "Phase 1: streaming is not implemented" | Streaming not implemented in the converter | Blocking calls only |
+| Agent response timeout | `agent_call_timeout_secs` (default 120) | Increase in `config.yaml` |
+| Error `-32010` / HTTP 409 on an old `contextId` | Agent died and was respawned (P2-10): the session belongs to a previous process generation (`ContextLost`) | Repeat the same call — a fresh session gets created. The notice is one-time |
+| Agent has hung but appears "alive" | `is_alive` catches death, not a hang | Hits `agent_call_timeout_secs`, increase the timeout |
 
-## 5. Быстрая проверка, что шлюз жив
+## 5. Quick check that the gateway is alive
 
 ```bash
-ss -tlnp | grep -E "8347|8348"        # оба порта слушаются
+ss -tlnp | grep -E "8347|8348"        # both ports are listening
 curl -s http://127.0.0.1:8348/agents/<id>/.well-known/agent.json -H "Authorization: Bearer <token>"
 ```

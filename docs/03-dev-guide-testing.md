@@ -1,26 +1,26 @@
-# Дев-гайд: тестирование
+# Dev guide: testing
 
-## Обзор по модулям
+## Module overview
 
-| Модуль | Что тестировать | Как (без сети/процессов или с ними) |
+| Module | What to test | How (without/with network and processes) |
 |---|---|---|
-| `protocol` | (Де)сериализация типов ACP/A2A | Unit, без внешних зависимостей |
-| `core::reply` | Match на оба варианта `Reply<T,U>` | Unit, тривиально |
-| `core::lease` | Конкурентный acquire, timeout, RAII-release | Unit + `tokio::test`, без сети |
-| `core::task_store` | save/load roundtrip, path traversal, atomic write | Unit + `tempfile`, без сети |
-| `core::convert` | Маппинг ContentBlock↔Part, TaskState↔StopReason | Unit с mock `AcpAgent`/`A2aAgent` |
-| `core::stdio_agent` | Реальный spawn, dead-process detection | Интеграционный, требует бинарник-стаб |
-| `core::http_agent` | HTTP JSON-RPC клиент | Интеграционный, требует mock HTTP-сервер |
-| `gatewayd::registry` | check_token, lookup | Unit, без сети |
-| `gatewayd::transport_*` | End-to-end через реальный TCP/HTTP | Интеграционный, требует запущенный gatewayd |
+| `protocol` | (De)serialization of ACP/A2A types | Unit, no external dependencies |
+| `core::reply` | Match on both `Reply<T,U>` variants | Unit, trivial |
+| `core::lease` | Concurrent acquire, timeout, RAII release | Unit + `tokio::test`, no network |
+| `core::task_store` | save/load roundtrip, path traversal, atomic write | Unit + `tempfile`, no network |
+| `core::convert` | Mapping ContentBlock↔Part, TaskState↔StopReason | Unit with mock `AcpAgent`/`A2aAgent` |
+| `core::stdio_agent` | Real spawn, dead-process detection | Integration, requires a stub binary |
+| `core::http_agent` | HTTP JSON-RPC client | Integration, requires a mock HTTP server |
+| `gatewayd::registry` | check_token, lookup | Unit, no network |
+| `gatewayd::transport_*` | End-to-end over real TCP/HTTP | Integration, requires a running gatewayd |
 
-## 1. protocol — тестирование типов
+## 1. protocol — type testing
 
 ```bash
 cargo test -p protocol
 ```
 
-Пример теста (добавить в `protocol/src/acp.rs` или отдельный `tests/`):
+Example test (add to `protocol/src/acp.rs` or a separate `tests/`):
 
 ```rust
 #[test]
@@ -32,18 +32,18 @@ fn content_block_text_roundtrip() {
 }
 ```
 
-Приоритет: проверить, что реальные JSON-примеры из спеки ACP/A2A
-парсятся без ошибок (взять примеры из agentclientprotocol.com/protocol/v1/schema
-и a2a-protocol.org/latest/specification — вставить как fixture-строки).
+Priority: check that real JSON examples from the ACP/A2A spec
+parse without errors (take examples from agentclientprotocol.com/protocol/v1/schema
+and a2a-protocol.org/latest/specification — paste them as fixture strings).
 
-## 2. core::lease — конкурентность
+## 2. core::lease — concurrency
 
 ```bash
 cargo test -p core --lib lease
 ```
 
-Уже есть тест-паттерн в `test_turn_lease.py` у Hermes (см. предыдущий
-разбор) — переносим идею на Rust:
+There is already a test pattern in Hermes' `test_turn_lease.py` (see the previous
+review) — porting the idea to Rust:
 
 ```rust
 #[tokio::test]
@@ -54,7 +54,7 @@ async fn concurrent_acquire_serializes() {
     let guard1 = lease.acquire(&session, Duration::from_secs(1)).await.unwrap();
     let start = std::time::Instant::now();
 
-    // Второй acquire на ТУ ЖЕ сессию должен ждать, а не пройти сразу
+    // The second acquire on the SAME session must wait, not pass immediately
     let lease2 = &lease;
     let session2 = session.clone();
     let handle = tokio::spawn(async move {
@@ -62,7 +62,7 @@ async fn concurrent_acquire_serializes() {
     });
 
     tokio::time::sleep(Duration::from_millis(100)).await;
-    drop(guard1); // освобождаем первый лиз
+    drop(guard1); // release the first lease
 
     let guard2 = handle.await.unwrap().unwrap();
     assert!(start.elapsed() >= Duration::from_millis(100));
@@ -76,24 +76,24 @@ async fn acquire_timeout_is_fail_closed() {
     let _guard1 = lease.acquire(&session, Duration::from_secs(10)).await.unwrap();
 
     let result = lease.acquire(&session, Duration::from_millis(50)).await;
-    assert!(result.is_err()); // TurnLeaseTimeoutError, не панику и не тихий проход
+    assert!(result.is_err()); // TurnLeaseTimeoutError, not a panic and not a silent pass
 }
 ```
 
-## 3. core::task_store — уже покрыт в исходном файле
+## 3. core::task_store — already covered in the source file
 
-Тесты `save_then_load_roundtrip`, `load_missing_task_errors_cleanly`,
-`path_traversal_id_is_sanitized` уже написаны в `core/src/task_store.rs`
-(см. `#[cfg(test)] mod tests`). Запуск:
+The tests `save_then_load_roundtrip`, `load_missing_task_errors_cleanly`,
+`path_traversal_id_is_sanitized` are already written in `core/src/task_store.rs`
+(see `#[cfg(test)] mod tests`). Run:
 
 ```bash
 cargo test -p core --lib task_store
 ```
 
-## 4. core::convert — тестирование с mock-агентами
+## 4. core::convert — testing with mock agents
 
-Ключевая идея: не поднимать реальный процесс/HTTP для проверки маппинга —
-реализовать `AcpAgent`/`A2aAgent` заглушками прямо в тесте.
+The key idea: don't spin up a real process/HTTP just to check the mapping —
+implement `AcpAgent`/`A2aAgent` with stubs right in the test.
 
 ```rust
 struct MockAcpAgent {
@@ -119,7 +119,7 @@ async fn acp_as_a2a_maps_end_turn_to_completed() {
     let mock = MockAcpAgent { fixed_response: PromptResponse { stop_reason: StopReason::EndTurn } };
     let adapter = AcpAsA2a::new(mock, "/tmp".into(), tempfile::tempdir().unwrap().path(), Duration::from_secs(5));
 
-    let task = Task { /* с status.message заполненным */ };
+    let task = Task { /* with status.message populated */ };
     let result = adapter.send_task(task).await.unwrap();
 
     match result {
@@ -129,20 +129,20 @@ async fn acp_as_a2a_maps_end_turn_to_completed() {
 }
 ```
 
-Обязательные кейсы для покрытия (соответствуют местам, где маппинг
-не биективен — см. архитектурный гайд):
+Required coverage cases (they correspond to the places where the mapping
+is not bijective — see the architecture guide):
 
-- `TaskState::InputRequired` → `task_state_to_stop_reason` возвращает `Err`, не паникует.
-- `ContentBlock::ResourceLink` → `Part::Text` (деградация, не потеря).
-- Конкурентные `send_task` на одну сессию → второй блокируется `TurnLease`, не гонка.
+- `TaskState::InputRequired` → `task_state_to_stop_reason` returns `Err`, does not panic.
+- `ContentBlock::ResourceLink` → `Part::Text` (degradation, not loss).
+- Concurrent `send_task` calls on one session → the second is blocked by `TurnLease`, no race.
 
-## 5. core::stdio_agent — интеграционный тест с реальным процессом
+## 5. core::stdio_agent — integration test with a real process
 
-Нужен минимальный ACP-совместимый скрипт-стаб (не полноценный агент),
-чтобы не зависеть от внешних бинарников в тестах:
+A minimal ACP-compatible stub script is needed (not a full agent),
+so the tests don't depend on external binaries:
 
 ```bash
-# tests/fixtures/echo_acp_agent.py — минимальный ACP-эхо для тестов
+# tests/fixtures/echo_acp_agent.py — minimal ACP echo for tests
 #!/usr/bin/env python3
 import sys, json
 for line in sys.stdin:
@@ -172,18 +172,18 @@ async fn stdio_agent_survives_roundtrip() {
 #[tokio::test]
 async fn dead_process_returns_error_not_hang() {
     let agent = StdioAcpAgent::spawn(&["false".into()], &None, &HashMap::new()).await.unwrap();
-    // "false" завершается немедленно с кодом 1
+    // "false" exits immediately with code 1
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let result = agent.initialize(InitializeRequest { /* ... */ }).await;
-    assert!(result.is_err()); // не должно висеть до 60s таймаута
+    assert!(result.is_err()); // must not hang until the 60s timeout
 }
 ```
 
-## 6. core::http_agent — mock HTTP-сервер
+## 6. core::http_agent — mock HTTP server
 
-Используем `wiremock` (добавить как dev-dependency) вместо реального
-внешнего A2A-агента:
+Use `wiremock` (add as a dev-dependency) instead of a real
+external A2A agent:
 
 ```toml
 [dev-dependencies]
@@ -206,56 +206,56 @@ async fn http_agent_send_task_parses_response() {
     let agent = HttpA2aAgent::new(mock_server.uri(), None);
     let task = Task { /* ... */ };
     let result = agent.send_task(task).await.unwrap();
-    // проверить Reply::Complete с ожидаемым Task
+    // check Reply::Complete with the expected Task
 }
 ```
 
-## 7. gatewayd::registry — тесты уже написаны
+## 7. gatewayd::registry — tests already written
 
-`valid_token_passes`, `invalid_token_denied`, `agent_lookup_by_id` — см.
-`#[cfg(test)] mod tests` в `gatewayd/src/registry.rs`.
+`valid_token_passes`, `invalid_token_denied`, `agent_lookup_by_id` — see
+`#[cfg(test)] mod tests` in `gatewayd/src/registry.rs`.
 
 ```bash
 cargo test -p gatewayd --lib registry
 ```
 
-## 8. End-to-end (весь gatewayd целиком)
+## 8. End-to-end (the whole gatewayd)
 
-Единственный уровень, где нужен реально запущенный процесс gatewayd
-плюс реальный (или стаб) агент.
+The only level that requires an actually running gatewayd process
+plus a real (or stub) agent.
 
 ```bash
-# Терминал 1: поднять gateway с тестовым конфигом
+# Terminal 1: start the gateway with a test config
 cargo run -p gatewayd -- tests/fixtures/e2e_config.yaml
 
-# Терминал 2: направление 1 (ACP-клиент -> ACP-агент, passthrough)
+# Terminal 2: direction 1 (ACP client -> ACP agent, passthrough)
 echo '{"token":"t-test","agent_id":"echo-agent"}' | nc localhost 8347
-# затем вручную отправить {"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}
+# then manually send {"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}
 
-# Терминал 2: направление 4 (A2A-клиент -> ACP-агент)
+# Terminal 2: direction 4 (A2A client -> ACP agent)
 curl -X POST http://localhost:8348/agents/echo-agent/rpc \
   -H "Authorization: Bearer t-test" \
   -H "Content-Type: application/json" \
   -d '{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"message":{"role":"user","parts":[{"kind":"text","text":"hi"}]}}}'
 ```
 
-Автоматизация (Rust-интеграционный тест в `gatewayd/tests/e2e.rs`):
-спавнить `gatewayd` как subprocess внутри теста, дождаться готовности
-порта, выполнить запросы через `reqwest`/`tokio::net::TcpStream`,
-проверить ответы, убить процесс в конце теста (`Drop`).
+Automation (a Rust integration test in `gatewayd/tests/e2e.rs`):
+spawn `gatewayd` as a subprocess inside the test, wait for the port to be
+ready, run requests via `reqwest`/`tokio::net::TcpStream`,
+check the responses, kill the process at the end of the test (`Drop`).
 
-## 9. Критерии приёмки (сведены к проверяемому)
+## 9. Acceptance criteria (reduced to what is checkable)
 
-Соответствуют §9 исходного ТЗ и §6 SPEC v2, адаптированы под то, что
-реализовано:
+Match §9 of the original spec and §6 of SPEC v2, adapted to what is
+implemented:
 
-1. `cargo test --workspace` — все тесты зелёные.
-2. `cargo clippy --workspace -- -D warnings` — без предупреждений.
-3. Неверный/отсутствующий токен → отказ на TCP и HTTP до чтения payload
-   (тест `invalid_token_denied` + интеграционный на `transport_tcp`).
-4. Два конкурентных `session/prompt`/`send_task` на одну сессию не
-   происходят одновременно (тест `concurrent_acquire_serializes`).
-5. Мёртвый процесс агента → явная ошибка, не таймаут 60s
-   (тест `dead_process_returns_error_not_hang`).
-6. `get_task` после `send_task` возвращает сохранённый результат
-   (тест `save_then_load_roundtrip` + end-to-end).
+1. `cargo test --workspace` — all tests green.
+2. `cargo clippy --workspace -- -D warnings` — no warnings.
+3. Invalid/missing token → refusal on TCP and HTTP before reading the payload
+   (test `invalid_token_denied` + an integration test on `transport_tcp`).
+4. Two concurrent `session/prompt`/`send_task` calls on one session do not
+   happen simultaneously (test `concurrent_acquire_serializes`).
+5. Dead agent process → explicit error, not a 60s timeout
+   (test `dead_process_returns_error_not_hang`).
+6. `get_task` after `send_task` returns the saved result
+   (test `save_then_load_roundtrip` + end-to-end).

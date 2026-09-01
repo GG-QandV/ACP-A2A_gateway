@@ -1,5 +1,7 @@
 # Установка ACP-A2A Gateway
 
+
+> **Язык:** русский · [English version](./INSTALL.md)
 **Репозиторий**: `GG-QandV/ACP-A2A_gateway`  
 **Требования**: Rust 1.80+, git, YAML-конфиг
 
