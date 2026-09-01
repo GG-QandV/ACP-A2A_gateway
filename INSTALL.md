@@ -1,7 +1,57 @@
 # ACP-A2A Gateway Installation Guide
 
 **Repository**: `GG-QandV/ACP-A2A_gateway`  
-**Requirements**: Rust 1.80+, git, YAML config
+**Requirements**: Rust 1.80+, git, a C compiler, YAML config
+
+---
+
+## Which install path to use
+
+| Path | Verified? | Use it if |
+|---|---|---|
+| Clone + `cargo build --release` | **yes — Linux x86_64 at v1.1.2.** The Windows and macOS builds below are documented, not tested by us | any OS; this is the only way to get `gatewayd.exe` or an Apple Silicon binary |
+| Prebuilt binary from Releases | Linux x86_64 only | you are on x86-64 Linux and do not want a Rust toolchain |
+| WSL2 + the Linux binary | not tested by us | you are on Windows 10/11 and want zero native setup |
+
+Two constraints shape this table:
+
+- **A C toolchain is always required.** `rusqlite` is pulled in with `features = ["bundled"]`
+  (`gatewayd/Cargo.toml:40`), so SQLite itself is compiled from source: MSVC
+  "Desktop development with C++" on Windows, Xcode Command Line Tools on macOS,
+  `gcc` + `libssl-dev` on Linux.
+- **A binary runs only on the OS it was built for.** The Linux file is ELF
+  (`interpreter /lib64/ld-linux-x86-64.so.2`); Windows and macOS kernels will not load it,
+  and Rosetta does not help — it translates instructions, not file formats. TLS comes from
+  `native-tls`: Linux builds link OpenSSL 3 at runtime, while Windows uses schannel and
+  macOS uses Security.framework, so neither of those needs OpenSSL.
+
+### Windows 10/11
+
+- **Recommended:** build natively into `target\release\gatewayd.exe`
+  (see [Windows 10/11](#windows-1011)). Untested by us — budget time for the
+  Build Tools install (`winget install Microsoft.VisualStudio.2022.BuildTools`, workload
+  "Desktop development with C++").
+- **Without a toolchain:** run the Linux binary inside **WSL2**
+  (`wsl --install -d Ubuntu-24.04`, then `sudo apt install libssl3`). Untested by us, and
+  three things bite: (1) the default paths are Unix-style `/tmp/gateway/...`, and `/tmp` is
+  wiped when WSL shuts down — point `task_store_dir` and the journal / event-log / approvals
+  `.db` paths at a persistent directory; (2) agents are spawned inside WSL, so
+  `claurst` / `opencode` must be installed there too; (3) `localhost` works out of the box,
+  but reaching the gateway from your LAN needs a `netsh portproxy` rule plus a firewall allow.
+
+### macOS
+
+Build on the machine (`cargo build --release`): it yields a binary for *your* architecture
+(Apple Silicon arm64 or Intel x86_64), and no darwin asset is published — so this is the only
+realistic path. Steps are in [macOS (Intel/Apple Silicon)](#macos-intelapple-silicon),
+documented but untested by us. A locally built binary runs as-is; an unsigned one fetched from
+elsewhere needs `xattr -d com.apple.quarantine ./gatewayd` first.
+
+### Linux x86-64 — the verified path
+
+Either build (`cargo build --release --workspace`) or take the `gatewayd` asset from Releases,
+`chmod +x` it and run. The only runtime requirement beyond glibc is OpenSSL 3 (`libssl3`),
+present on Debian 12 / Ubuntu 22.04 and newer.
 
 ---
 

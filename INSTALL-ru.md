@@ -3,7 +3,58 @@
 
 > **Язык:** русский · [English version](./INSTALL.md)
 **Репозиторий**: `GG-QandV/ACP-A2A_gateway`  
-**Требования**: Rust 1.80+, git, YAML-конфиг
+**Требования**: Rust 1.80+, git, C-компилятор, YAML-конфиг
+
+---
+
+## Какой способ установки выбрать
+
+| Способ | Проверено? | Кому подходит |
+|---|---|---|
+| Клон + `cargo build --release` | **да — Linux x86_64 на v1.1.2.** Сборки под Windows и macOS описаны, но нами не тестировались | любая ОС; единственный способ получить `gatewayd.exe` или бинарник под Apple Silicon |
+| Готовый бинарник из Releases | только Linux x86_64 | вы на x86-64 Linux и не хотите поднимать Rust-тулчейн |
+| WSL2 + линуксовый бинарник | нами не тестировалось | вы на Windows 10/11 и хотите вообще без нативной сборки |
+
+Два ограничения, из которых растёт эта таблица:
+
+- **C-тулчейн нужен всегда.** `rusqlite` подключён с фичей `features = ["bundled"]`
+  (`gatewayd/Cargo.toml:40`), то есть сам SQLite компилируется из исходников: MSVC
+  «Desktop development with C++» на Windows, Xcode Command Line Tools на macOS,
+  `gcc` + `libssl-dev` на Linux.
+- **Бинарник работает только в той ОС, под которую собран.** Линуксовый файл — это ELF
+  (`interpreter /lib64/ld-linux-x86-64.so.2`); ядро Windows и macOS его не загрузит, и
+  Rosetta не помогает — она транслирует инструкции, а не формат файла. TLS берётся из
+  `native-tls`: на Linux бинарник в рантайме линкуется с OpenSSL 3, а на Windows это
+  schannel и Security.framework на macOS — там OpenSSL не нужен.
+
+### Windows 10/11
+
+- **Рекомендуем:** собрать нативно в `target\release\gatewayd.exe`
+  (см. [Windows 10/11](#windows-1011)). Нами не проверено — заложите время на установку
+  Build Tools (`winget install Microsoft.VisualStudio.2022.BuildTools`, workload
+  «Desktop development with C++»).
+- **Без тулчейна:** запускить линуксовый бинарник внутри **WSL2**
+  (`wsl --install -d Ubuntu-24.04`, затем `sudo apt install libssl3`). Нами не тестировалось,
+  и есть три грабли: (1) пути по умолчанию в unix-стиле `/tmp/gateway/...`, а `/tmp` при
+  выключении WSL очищается — направьте `task_store_dir` и `.db`-пути журнала, event log и
+  approvals в постоянный каталог; (2) агенты запускаются внутри WSL, значит `claurst` /
+  `opencode` должны быть установлены там же; (3) `localhost` работает из коробки, а вот доступ
+  из локалки требует правила `netsh portproxy` и разрешения в фаерволе.
+
+### macOS
+
+Собирать на самой машине (`cargo build --release`): получится бинарник под **вашу**
+архитектуру (Apple Silicon arm64 или Intel x86_64), а darwin-ассет не публикуется — то есть
+это единственный реалистичный путь. Шаги в разделе
+[macOS (Intel/Apple Silicon)](#macos-intelapple-silicon), описаны, но нами не тестировались.
+Локально собранный бинарник запускается сразу; для неподписанного, скачанного откуда-то, нужно
+сначала `xattr -d com.apple.quarantine ./gatewayd`.
+
+### Linux x86-64 — проверенный путь
+
+Либо собрать (`cargo build --release --workspace`), либо взять ассет `gatewayd` из Releases,
+`chmod +x` и запускать. Кроме glibc нужно только OpenSSL 3 (`libssl3`) — он есть в
+Debian 12 / Ubuntu 22.04 и новее.
 
 ---
 
