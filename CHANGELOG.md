@@ -9,6 +9,22 @@ editing that single line (plus `Cargo.lock` on the next `cargo check`), tagging
 `vX.Y.Z`, and adding an entry here. Versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- `.github/workflows/ci.yml`: `cargo fmt --all --check` + `cargo clippy --workspace
+  --all-targets -- -D warnings` + `cargo test --workspace --locked` on ubuntu, windows and
+  macOS runners (first green run: all three platforms).
+- `scripts/publish-docs.sh`: publishes `AGENTS.md` / `CLAUDE.md` into `main` from the
+  out-of-repo overlay, then re-applies `skip-worktree` so indexing-tool noise stays invisible.
+
+### Changed
+- The whole workspace was formatted with `cargo fmt --all` — the repository had never passed
+  `cargo fmt --check` before (22 files), which would have failed the new Format gate at once.
+- `AGENTS.md` and `CLAUDE.md` are no longer tracked in the repository; their vetted versions
+  come from `_doc_overlay/ACP-A2A_gateway/`. Git-ignored locally: `/AGENTS.md`, `/CLAUDE.md`,
+  `/_LOCAL_RULE_gitnexus-docs.md`.
+
 ## [1.1.2] - 2026-09-01
 
 ### Added
