@@ -11,8 +11,8 @@
 
 | Способ | Проверено? | Кому подходит |
 |---|---|---|
-| Клон + `cargo build --release` | **да — Linux x86_64 на v1.1.2.** Сборки под Windows и macOS описаны, но нами не тестировались | любая ОС; единственный способ получить `gatewayd.exe` или бинарник под Apple Silicon |
-| Готовый бинарник из Releases | только Linux x86_64 | вы на x86-64 Linux и не хотите поднимать Rust-тулчейн |
+| Клон + `cargo build --release` | **Linux x86_64 — проверено** (сборка + 152 теста на v1.1.2). Windows/macOS-сборки компилируются в CI, но мы их не запускаем | любая ОС; запасной путь, если ассет ведёт себя странно |
+| Готовый бинарник из Releases | **компиляция подтверждена CI** для linux-x86_64, windows-x86_64, darwin-arm64, darwin-x86_64 (+ universal); рантайм на Windows/macOS мы не проверяли | нужно просто запустить шлюз |
 | WSL2 + линуксовый бинарник | нами не тестировалось | вы на Windows 10/11 и хотите вообще без нативной сборки |
 
 Два ограничения, из которых растёт эта таблица:
@@ -29,13 +29,17 @@
 
 ### Windows 10/11
 
-- **Рекомендуем:** собрать нативно в `target\release\gatewayd.exe`
-  (см. [Windows 10/11](#windows-1011)). Нами не проверено — заложите время на установку
-  Build Tools (`winget install Microsoft.VisualStudio.2022.BuildTools`, workload
-  «Desktop development with C++»).
-- **Без тулчейна:** запускить линуксовый бинарник внутри **WSL2**
-  (`wsl --install -d Ubuntu-24.04`, затем `sudo apt install libssl3`). Нами не тестировалось,
-  и есть три грабли: (1) пути по умолчанию в unix-стиле `/tmp/gateway/...`, а `/tmp` при
+- **Быстрый путь:** скачать `gatewayd-v<версия>-windows-x86_64.exe` из Releases. Его собирает
+  наш релизный workflow на Windows-раннере, то есть *компиляция* подтверждена; сам Windows мы
+  не запускаем, так что первый старт считаем смоук-тестом. TLS — schannel, OpenSSL ставить
+  не нужно. Сначала снимите отметку загрузки:
+  `Unblock-File .\gatewayd-v<версия>-windows-x86_64.exe`.
+- **Собрать самому:** `cargo build --release` → `target\release\gatewayd.exe`
+  (см. [Windows 10/11](#windows-1011)). Нужен workload MSVC C++, потому что SQLite собирается
+  из исходников: `winget install Microsoft.VisualStudio.2022.BuildTools`.
+- **Без тулчейна — в WSL2:** линуксовый бинарник внутри
+  **WSL2** (`wsl --install -d Ubuntu-24.04`, затем `sudo apt install libssl3`). Нами не
+  тестировалось, и есть три грабли: (1) пути по умолчанию в unix-стиле `/tmp/gateway/...`, а `/tmp` при
   выключении WSL очищается — направьте `task_store_dir` и `.db`-пути журнала, event log и
   approvals в постоянный каталог; (2) агенты запускаются внутри WSL, значит `claurst` /
   `opencode` должны быть установлены там же; (3) `localhost` работает из коробки, а вот доступ
@@ -43,12 +47,12 @@
 
 ### macOS
 
-Собирать на самой машине (`cargo build --release`): получится бинарник под **вашу**
-архитектуру (Apple Silicon arm64 или Intel x86_64), а darwin-ассет не публикуется — то есть
-это единственный реалистичный путь. Шаги в разделе
-[macOS (Intel/Apple Silicon)](#macos-intelapple-silicon), описаны, но нами не тестировались.
-Локально собранный бинарник запускается сразу; для неподписанного, скачанного откуда-то, нужно
-сначала `xattr -d com.apple.quarantine ./gatewayd`.
+Берите ассет под свою машину: `darwin-arm64` (Apple Silicon), `darwin-x86_64` (Intel) или
+`darwin-universal` (оба). Как и windows-сборка, он подтверждён компиляцией в CI, но не
+запускался нами. Бинарники не подписаны, поэтому после скачивания перед первым запуском нужно
+снять карантин: `xattr -d com.apple.quarantine ./gatewayd-v<версия>-darwin-arm64`.
+Альтернатива — сборка на самой машине (`cargo build --release`), она автоматически даёт вашу
+архитектуру; шаги в разделе [macOS (Intel/Apple Silicon)](#macos-intelapple-silicon).
 
 ### Linux x86-64 — проверенный путь
 

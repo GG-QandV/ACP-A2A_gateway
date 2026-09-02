@@ -9,8 +9,8 @@
 
 | Path | Verified? | Use it if |
 |---|---|---|
-| Clone + `cargo build --release` | **yes — Linux x86_64 at v1.1.2.** The Windows and macOS builds below are documented, not tested by us | any OS; this is the only way to get `gatewayd.exe` or an Apple Silicon binary |
-| Prebuilt binary from Releases | Linux x86_64 only | you are on x86-64 Linux and do not want a Rust toolchain |
+| Clone + `cargo build --release` | **Linux x86_64: verified** (built + 152 tests at v1.1.2). Windows/macOS source builds compile in CI, but we never run them | any OS; the fallback if an asset misbehaves |
+| Prebuilt binary from Releases | **compile-verified by CI** for linux-x86_64, windows-x86_64, darwin-arm64, darwin-x86_64 (+ universal); runtime on Windows/macOS not exercised by us | you just want to run the gateway |
 | WSL2 + the Linux binary | not tested by us | you are on Windows 10/11 and want zero native setup |
 
 Two constraints shape this table:
@@ -27,11 +27,14 @@ Two constraints shape this table:
 
 ### Windows 10/11
 
-- **Recommended:** build natively into `target\release\gatewayd.exe`
-  (see [Windows 10/11](#windows-1011)). Untested by us — budget time for the
-  Build Tools install (`winget install Microsoft.VisualStudio.2022.BuildTools`, workload
-  "Desktop development with C++").
-- **Without a toolchain:** run the Linux binary inside **WSL2**
+- **Fastest:** download `gatewayd-v<version>-windows-x86_64.exe` from Releases. It is built by
+  our release workflow on a Windows runner, so the *compile* is verified; we do not run Windows
+  ourselves, so treat the first start as a smoke test. TLS is schannel — no OpenSSL to install.
+  Remove the download mark first: `Unblock-File .\gatewayd-v<version>-windows-x86_64.exe`.
+- **Build it yourself:** `cargo build --release` → `target\release\gatewayd.exe`
+  (see [Windows 10/11](#windows-1011)). Needs the MSVC C++ workload, because SQLite is compiled
+  from source: `winget install Microsoft.VisualStudio.2022.BuildTools`.
+- **Without a toolchain, inside WSL2:** take the Linux binary
   (`wsl --install -d Ubuntu-24.04`, then `sudo apt install libssl3`). Untested by us, and
   three things bite: (1) the default paths are Unix-style `/tmp/gateway/...`, and `/tmp` is
   wiped when WSL shuts down — point `task_store_dir` and the journal / event-log / approvals
@@ -41,11 +44,12 @@ Two constraints shape this table:
 
 ### macOS
 
-Build on the machine (`cargo build --release`): it yields a binary for *your* architecture
-(Apple Silicon arm64 or Intel x86_64), and no darwin asset is published — so this is the only
-realistic path. Steps are in [macOS (Intel/Apple Silicon)](#macos-intelapple-silicon),
-documented but untested by us. A locally built binary runs as-is; an unsigned one fetched from
-elsewhere needs `xattr -d com.apple.quarantine ./gatewayd` first.
+Pick the asset for your machine: `darwin-arm64` (Apple Silicon), `darwin-x86_64` (Intel), or
+`darwin-universal` (both). Like the Windows build, these are CI-compiled but not CI-run.
+Binaries are unsigned, so a downloaded copy needs the quarantine flag cleared before the first
+start: `xattr -d com.apple.quarantine ./gatewayd-v<version>-darwin-arm64`. Building on the
+machine (`cargo build --release`) is the alternative and automatically matches your
+architecture — steps in [macOS (Intel/Apple Silicon)](#macos-intelapple-silicon).
 
 ### Linux x86-64 — the verified path
 
