@@ -1,0 +1,111 @@
+name: release
+
+# Each job builds on a native runner for its own OS — no cross-compilation,
+# and no OpenSSL needed on Windows/macOS (native-tls -> schannel / Security.framework).
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)build and attach assets for, e.g. v1.1.2"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build ${{ matrix.slug }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            slug: linux-x86_64
+            binary: gatewayd
+          - os: windows-latest
+            slug: windows-x86_64
+            binary: gatewayd.exe
+          - os: macos-14
+            slug: darwin-arm64
+            binary: gatewayd
+          - os: macos-13
+            slug: darwin-x86_64
+            binary: gatewayd
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release -p gatewayd --bin gatewayd
+
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Stage asset + checksum
+        id: stage
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          asset="gatewayd-${TAG}-${{ matrix.slug }}"
+          cp "target/release/${{ matrix.binary }}" "$asset"
+          # python is present on all three runner images; portable sha256
+          hash=$(python3 -c "import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())" "$asset" \
+                 || python -c "import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())" "$asset")
+          printf '%s  %s\n' "$hash" "$asset" > "$asset.sha256"
+          echo "asset=$asset" >> "$GITHUB_OUTPUT"
+          echo "sha256=$hash" >> "$GITHUB_OUTPUT"
+          ls -l "$asset"
+
+      - name: Create the release if it does not exist yet
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          gh release view "$TAG" >/dev/null 2>&1 \
+            || gh release create "$TAG" --target "$GITHUB_SHA" --title "$TAG" \
+                 --notes "Prebuilt gatewayd binaries. See README/INSTALL.md for the three install paths."
+
+      - name: Upload asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: gh release upload "$TAG" "${{ steps.stage.outputs.asset }}" "${{ steps.stage.outputs.asset }}.sha256" --clobber
+
+  summary:
+    name: asset summary
+    needs: build
+    if: always()
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: List assets on the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${{ inputs.tag || github.ref_name }}"
+          echo "### Assets on \`$tag\`" >> "$GITHUB_STEP_SUMMARY"
+          gh release view "$tag" --json assets,name,isDraft \
+            --jq '"release: \(.name) (draft=\(.isDraft))", (.assets[] | "- `\(.name)` — \(.size) bytes — \(.downloadUrl)")' \
+            >> "$GITHUB_STEP_SUMMARY" || true
