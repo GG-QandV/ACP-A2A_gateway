@@ -2,9 +2,10 @@
 
 > **Language:** English · [Русская версия](a2a-gateway-overview-ru.md)
 
-**Source:** `.` (repo)
-**Host:** `203.0.113.10`, service `acp-gateway`, domain `gateway.example.com`
-**Role:** intermediary A2A client → ACP agents (hermes, claurst).
+**Repository:** `GG-QandV/ACP-A2A_gateway`
+**Deployment:** host address, systemd service name and public domain live in the private
+deployment notes, not in this repository.
+**Role:** intermediary A2A client → ACP agents behind it.
 
 ## 1. Architecture
 
