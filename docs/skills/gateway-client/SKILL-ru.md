@@ -1,14 +1,15 @@
 ---
 name: gateway-client
 description: >-
-  Как агенту (claurst, hermes, opencode, любой ACP/A2A-клиент) ходить в
-  ACP-A2A_gateway: адреса, токены, форматы message/send и session/prompt,
-  продолжение разговора по contextId, изоляция между клиентами, известные
-  ограничения. Триггер: "отправить задачу через гатевей", "поговорить с
-  агентом X через шлюз", "A2A message/send", "почему continue таймаутит".
+  Как агенту (Claude Code, Gemini CLI, Codex, Cline, opencode, hermes, любой
+  ACP/A2A-клиент) ходить в ACP-A2A_gateway: адреса, токены, форматы message/send
+  и session/prompt, продолжение разговора по contextId, изоляция между
+  клиентами, известные ограничения. Триггер: "отправить задачу через гатевей",
+  "поговорить с агентом X через шлюз", "A2A message/send", "почему continue
+  таймаутит".
 ---
 
-> **Язык:** русский · [English version](./SKILL.md)
+> **Язык:** русский · [English version](./SKILL.md) · [Українська версія](./SKILL-uk.md)
 
 # gateway-client — как агенту пользоваться ACP-A2A_gateway
 
@@ -16,13 +17,34 @@ description: >-
 ACP-агентами. Два порта, четыре направления. Ты можешь быть и клиентом
 (ходить в агентов через шлюз), и агентом (тебя подключают как stdio-агента).
 
+## 0. Какие агенты говорят по ACP
+
+Регистрируй любого из них как запись `agents[]`; шлюз поднимает процесс и разговаривает
+ACP через его stdio.
+
+| Агент | Как отдаёт ACP |
+|---|---|
+| opencode | нативно: `opencode acp` |
+| hermes | нативно: `hermes acp` |
+| Claude Code (Anthropic) | адаптер `claude-agent-acp` — <https://github.com/agentclientprotocol/claude-agent-acp> |
+| Codex (OpenAI) | адаптер `codex-acp` — <https://github.com/agentclientprotocol/codex-acp> |
+| Gemini CLI | нативный режим: `gemini --acp` |
+| Cline | ACP CLI — <https://cline.bot/cli> |
+| Cursor | режим ACP — <https://cursor.com/docs/cli/acp> |
+
+Полный курируемый список — [реестр ACP-агентов](https://agentclientprotocol.com/get-started/registry).
+Агент, который не говорит ни по ACP, ни по A2A (например OpenClaw), как stdio-агента не
+подключить: нужен адаптер, либо выводи его как A2A-сервер и иди через направление 2.
+Специфичные агенту переменные окружения — в `agents[].env` внутри `config.yaml`;
+доступные на конкретном хосте `agent_id` — те, что объявлены в его `config.yaml`.
+
 ## 1. Когда ты клиент (идёшь в агентов через шлюз)
 
 ### TCP (ACP-клиент, направления 1/2)
 
 ```bash
 # порт listen (по умолч. 8347), первая строка — handshake, дальше ACP JSON-RPC построчно
-{ printf '%s\n' '{"token":"TOKEN","agent_id":"claurst-main"}'
+{ printf '%s\n' '{"token":"TOKEN","agent_id":"<agent_id>"}'
   printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{}}}'
   printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"/tmp","mcpServers":[],"additionalDirectories":[]}}'
 } | nc 127.0.0.1 8347
@@ -69,12 +91,12 @@ curl -s -X POST http://127.0.0.1:8348/agents/<agent_id>/rpc \
 ## 3. Когда тебя подключают как агента (stdio)
 
 - Твоя команда должна включать ACP-подкоманду:
-  claurst → `claurst acp`, hermes → `hermes acp`, opencode → `opencode acp`.
-  Это **не** `--bare`, **не** `--print`.
+  ACP-точка входа агента: `opencode acp`, `hermes acp`, `gemini --acp`
+  или бинарь адаптера (`claude-agent-acp` / `codex-acp`). Это **не** `--bare`, **не** `--print`.
 - Твой stdout должен быть **настоящим pipe** (не файл): `> log` роняет Hermes
   с `Pipe transport is only for pipes`. Шлюз спавнит через `Stdio::piped()` — ок.
-- claurst: ставь `CLAURST_DISABLE_MODELS_FETCH=1`, `CLAURST_SHARE_NO_OPEN=1`
-  (не ходить за моделями, не открывать браузер).
+- Агентам в headless-режиме обычно нужны флаги, чтобы не открывать браузер и не переавторизовываться
+  на каждом спавне — передавай их через `agents[].env` в `config.yaml`.
 - Ожидай, что шлюз/клиент дёргает `session/new` **многократно** на одном процессе —
   это нормально, каждый раз отвечай новым `sessionId`.
 
@@ -82,7 +104,7 @@ curl -s -X POST http://127.0.0.1:8348/agents/<agent_id>/rpc \
 
 | Симптом | Причина | Обход |
 |---|---|---|
-| `continue` по contextId таймаутит (2-й `message/send` в ту же сессию) | Дефект конвертера шлюза (направление 4), воспроизводится на claurst и hermes | Держать каждый запрос в новой сессии (без contextId) либо чинить шлюз; прямым `session/prompt` продолжение работает |
+| `continue` по contextId таймаутит (2-й `message/send` в ту же сессию) | Дефект конвертера шлюза (направление 4), воспроизводится на stdio-агентах этого хоста | Держать каждый запрос в новой сессии (без contextId) либо чинить шлюз; прямым `session/prompt` продолжение работает |
 | `Reply::Streaming` — ошибка «Фаза 1: стриминг не реализован» | Стриминг не реализован в конвертере | Только блокирующие вызовы |
 | Таймаут ответа агента | `agent_call_timeout_secs` (по умолч. 120) | Увеличить в `config.yaml` |
 | Ошибка `-32010` / HTTP 409 на старом `contextId` | Агент умер и был переспавнен (P2-10): сессия относится к прошлому поколению процесса (`ContextLost`) | Повторить тот же вызов — заведётся свежая сессия. Пометка одноразовая |
