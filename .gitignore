@@ -19,5 +19,3 @@ dist/
 docs/ToDo/
 docs/bags/
 
-# локальная рабочая config-копия с путями этого хоста и dev-токенами
-config.loc.buffer.yaml
