@@ -6,7 +6,9 @@ description: >-
   session/prompt formats, continuing a conversation via contextId, isolation
   between clients, known limitations. Trigger: "send a task through the
   gateway", "talk to agent X through the gateway", "A2A message/send", "why
-  does continue time out".
+  does continue time out"; ru: "отправить задачу через гатевей", "поговорить с
+  агентом X через шлюз", "почему continue таймаутит"; uk: "надіслати задачу
+  крізь гейтвей", "чому continue тайм-аутить".
 ---
 
 # gateway-client — how an agent uses ACP-A2A_gateway
