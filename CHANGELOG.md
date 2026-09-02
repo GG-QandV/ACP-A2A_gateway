@@ -23,8 +23,7 @@ editing that single line (plus `Cargo.lock` on the next `cargo check`), tagging
   Previously Russian lived in the unsuffixed file (the `06-gateway-guide`,
   `A2A-protocol-strategy-2026` and `INSTALL` families were flipped accordingly).
 - `docs/TZ-*` / `docs/tz-*` renamed to `docs/SPEC-*`; `docs/шлюз-описание-a2a.md`
-  to `docs/a2a-gateway-overview.md`; `docs/bags/Подтверждение бага.md` to
-  `docs/bags/bug-confirmation.md` — no Cyrillic in tracked file names.
+  to `docs/a2a-gateway-overview.md` — no Cyrillic in tracked file names.
 - Decision identifiers are now Latin (`P-18`) in both languages.
 - `protocol`, `core` and `gatewayd` manifests use
   `version.workspace = true` / `edition.workspace = true` instead of repeating
@@ -36,7 +35,7 @@ editing that single line (plus `Cargo.lock` on the next `cargo check`), tagging
 ### Removed
 - Working documents are no longer tracked and are covered by `.gitignore`:
   `docs/Правки/`, `docs/правки 2/`, `docs/правки 3+аддс/`, `docs/правки 4/`,
-  `docs/суть+маркетинг/`.
+  `docs/суть+маркетинг/`, `docs/ToDo/`, `docs/bags/`.
 
 ## [1.0.2] - 2026-08-19
 
