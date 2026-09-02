@@ -25,10 +25,10 @@
 //    prevents a hidden parasitic conflict of two contextId sources.
 // ============================================================================
 
-use protocol::a2a_sdk_compat::{normalize_message, render_task_sdk};
 use protocol::a2a::{
     Artifact, ContextId, Message, MessageRole, Part, Task, TaskId, TaskState, TaskStatus,
 };
+use protocol::a2a_sdk_compat::{normalize_message, render_task_sdk};
 use serde_json::json;
 
 fn sample_completed_task(id: &str, ctx: &str) -> Task {
@@ -49,7 +49,9 @@ fn sample_completed_task(id: &str, ctx: &str) -> Task {
             artifact_id: "a1".into(),
             name: Some("response".into()),
             description: None,
-            parts: vec![Part::Text { text: "pong".into() }],
+            parts: vec![Part::Text {
+                text: "pong".into(),
+            }],
             metadata: None,
         }]),
         metadata: None,
@@ -64,7 +66,10 @@ fn semantic_serialization_stays_flat_no_task_wrapper() {
     // The "message/send" path still uses direct serde_json::to_value(t)
     // — not render_task_sdk. Confirming there is no {task:...} wrapper there.
     let flat = serde_json::to_value(&task).expect("serialize");
-    assert!(flat.get("task").is_none(), "семантический ответ должен остаться плоским");
+    assert!(
+        flat.get("task").is_none(),
+        "семантический ответ должен остаться плоским"
+    );
     assert_eq!(flat["id"], "task-1");
     assert_eq!(flat["status"]["state"], "completed");
 }
@@ -73,7 +78,10 @@ fn semantic_serialization_stays_flat_no_task_wrapper() {
 fn sdk_serialization_wraps_in_task_and_uses_upper_state() {
     let task = sample_completed_task("task-1", "ctx-1");
     let sdk = render_task_sdk(&task);
-    assert!(sdk.get("task").is_some(), "SDK-ответ обязан содержать обёртку task");
+    assert!(
+        sdk.get("task").is_some(),
+        "SDK-ответ обязан содержать обёртку task"
+    );
     assert_eq!(sdk["task"]["status"]["state"], "TASK_STATE_COMPLETED");
     assert_eq!(sdk["task"]["contextId"], "ctx-1");
 }
@@ -82,7 +90,11 @@ fn sdk_serialization_wraps_in_task_and_uses_upper_state() {
 
 #[test]
 fn task_state_serializes_as_kebab_case_not_snake_case() {
-    let status = TaskStatus { state: TaskState::InputRequired, message: None, timestamp: None };
+    let status = TaskStatus {
+        state: TaskState::InputRequired,
+        message: None,
+        timestamp: None,
+    };
     let v = serde_json::to_value(&status).expect("serialize");
     // Confirmation of the fact from protocol/src/a2a.rs: rename_all = "kebab-case".
     // Earlier specs assumed "input_required" (snake) — that was wrong.
@@ -146,14 +158,20 @@ fn extract_sdk_task_id_contract_name_wins_over_id() {
         if let Some(name) = params.get("name").and_then(serde_json::Value::as_str) {
             return name.rsplit('/').next().map(str::to_string);
         }
-        params.get("id").and_then(serde_json::Value::as_str).map(str::to_string)
+        params
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
     }
 
     let params = json!({ "name": "tasks/task-777", "id": "task-999" });
     assert_eq!(extract_sdk_task_id(&params), Some("task-777".to_string()));
 
     let params_id_only = json!({ "id": "task-999" });
-    assert_eq!(extract_sdk_task_id(&params_id_only), Some("task-999".to_string()));
+    assert_eq!(
+        extract_sdk_task_id(&params_id_only),
+        Some("task-999".to_string())
+    );
 
     let params_empty = json!({});
     assert_eq!(extract_sdk_task_id(&params_empty), None);
@@ -205,6 +223,11 @@ fn full_roundtrip_sdk_message_to_sdk_task_without_network() {
 
     assert_eq!(outbound["task"]["status"]["state"], "TASK_STATE_COMPLETED");
     assert_eq!(outbound["task"]["status"]["message"]["role"], "ROLE_USER");
-    assert_eq!(outbound["task"]["status"]["message"]["parts"][0]["text"], "ping");
-    assert!(outbound["task"]["status"]["message"]["parts"][0].get("kind").is_none());
+    assert_eq!(
+        outbound["task"]["status"]["message"]["parts"][0]["text"],
+        "ping"
+    );
+    assert!(outbound["task"]["status"]["message"]["parts"][0]
+        .get("kind")
+        .is_none());
 }

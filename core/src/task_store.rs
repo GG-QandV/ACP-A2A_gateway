@@ -52,7 +52,9 @@ pub const DEFAULT_TASK_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 impl TaskStore {
     pub fn new(base_dir: impl Into<PathBuf>) -> Self {
-        Self { base_dir: base_dir.into() }
+        Self {
+            base_dir: base_dir.into(),
+        }
     }
 
     fn path_for(&self, id: &TaskId) -> PathBuf {
@@ -66,7 +68,10 @@ impl TaskStore {
         let final_path = self.path_for(&task.id);
         let tmp_path = final_path.with_extension("json.tmp");
 
-        let stored = StoredTask { owner: Some(owner), task: task.clone() };
+        let stored = StoredTask {
+            owner: Some(owner),
+            task: task.clone(),
+        };
         let json = serde_json::to_vec_pretty(&stored)?;
         fs::write(&tmp_path, &json).await?;
 
@@ -84,12 +89,15 @@ impl TaskStore {
     /// update would invalidate the already accumulated task store.
     pub async fn load_owned(&self, id: &TaskId) -> anyhow::Result<OwnedTask> {
         let path = self.path_for(id);
-        let bytes = fs::read(&path).await.map_err(|e| {
-            anyhow::anyhow!("task {id:?} не найдена в хранилище ({path:?}): {e}")
-        })?;
+        let bytes = fs::read(&path)
+            .await
+            .map_err(|e| anyhow::anyhow!("task {id:?} не найдена в хранилище ({path:?}): {e}"))?;
 
         match serde_json::from_slice::<StoredTask>(&bytes) {
-            Ok(stored) => Ok(OwnedTask { task: stored.task, owner: stored.owner }),
+            Ok(stored) => Ok(OwnedTask {
+                task: stored.task,
+                owner: stored.owner,
+            }),
             Err(envelope_err) => {
                 // Old format: the file contains a Task directly.
                 let task: Task = serde_json::from_slice(&bytes).map_err(|legacy_err| {
@@ -136,9 +144,15 @@ impl TaskStore {
                 continue;
             }
 
-            let Ok(meta) = entry.metadata().await else { continue };
-            let Ok(modified) = meta.modified() else { continue };
-            let Ok(age) = now.duration_since(modified) else { continue };
+            let Ok(meta) = entry.metadata().await else {
+                continue;
+            };
+            let Ok(modified) = meta.modified() else {
+                continue;
+            };
+            let Ok(age) = now.duration_since(modified) else {
+                continue;
+            };
 
             if age > ttl && fs::remove_file(&path).await.is_ok() {
                 removed += 1;
@@ -168,7 +182,11 @@ mod tests {
         Task {
             id: TaskId(id.into()),
             context_id: ContextId("ctx-1".into()),
-            status: TaskStatus { state: TaskState::Completed, message: None, timestamp: None },
+            status: TaskStatus {
+                state: TaskState::Completed,
+                message: None,
+                timestamp: None,
+            },
             history: None,
             artifacts: None,
             metadata: None,
@@ -187,9 +205,6 @@ mod tests {
         assert_eq!(loaded.id.0, "task-123");
         assert_eq!(loaded.status.state, TaskState::Completed);
     }
-
-
-
 
     /// FOUND by test: sanitize_task_id strips all non-ASCII characters,
     /// so two different non-ASCII identifiers yield ONE file name and
@@ -218,7 +233,10 @@ mod tests {
         filetime::set_file_mtime(&old_path, filetime::FileTime::from_system_time(long_ago))
             .unwrap();
 
-        let removed = store.sweep_expired(Duration::from_secs(60 * 60 * 24)).await.unwrap();
+        let removed = store
+            .sweep_expired(Duration::from_secs(60 * 60 * 24))
+            .await
+            .unwrap();
 
         assert_eq!(removed, 1);
         assert!(store.load(&TaskId("task-fresh".into())).await.is_ok());
@@ -246,7 +264,10 @@ mod tests {
     #[tokio::test]
     async fn sweep_on_missing_dir_is_not_an_error() {
         let store = TaskStore::new("/tmp/точно-нет-такого-каталога-gateway");
-        assert_eq!(store.sweep_expired(Duration::from_secs(1)).await.unwrap(), 0);
+        assert_eq!(
+            store.sweep_expired(Duration::from_secs(1)).await.unwrap(),
+            0
+        );
     }
 
     #[tokio::test]
@@ -256,7 +277,10 @@ mod tests {
         let owner = Owner::from_token("t-alice");
 
         store.save(&sample_task("task-owned"), owner).await.unwrap();
-        let loaded = store.load_owned(&TaskId("task-owned".into())).await.unwrap();
+        let loaded = store
+            .load_owned(&TaskId("task-owned".into()))
+            .await
+            .unwrap();
 
         assert_eq!(loaded.owner, Some(owner));
         assert_eq!(loaded.task.id.0, "task-owned");
@@ -272,20 +296,34 @@ mod tests {
         // Write in the old format: bare Task, without an envelope.
         let task = sample_task("task-legacy");
         let path = dir.path().join("task-legacy.json");
-        tokio::fs::write(&path, serde_json::to_vec_pretty(&task).unwrap()).await.unwrap();
+        tokio::fs::write(&path, serde_json::to_vec_pretty(&task).unwrap())
+            .await
+            .unwrap();
 
-        let loaded = store.load_owned(&TaskId("task-legacy".into())).await.unwrap();
+        let loaded = store
+            .load_owned(&TaskId("task-legacy".into()))
+            .await
+            .unwrap();
         assert_eq!(loaded.task.id.0, "task-legacy");
-        assert!(loaded.owner.is_none(), "у старой записи владелец неизвестен");
+        assert!(
+            loaded.owner.is_none(),
+            "у старой записи владелец неизвестен"
+        );
     }
 
     #[tokio::test]
     async fn corrupted_file_errors_with_both_reasons() {
         let dir = tempfile::tempdir().unwrap();
         let store = TaskStore::new(dir.path());
-        tokio::fs::write(dir.path().join("broken.json"), b"{not json").await.unwrap();
+        tokio::fs::write(dir.path().join("broken.json"), b"{not json")
+            .await
+            .unwrap();
 
-        let err = store.load_owned(&TaskId("broken".into())).await.unwrap_err().to_string();
+        let err = store
+            .load_owned(&TaskId("broken".into()))
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("конверт"));
     }
 

@@ -55,7 +55,10 @@ pub struct InitializeResponse {
     /// implementations send a string — we accept both, store and return a number.
     // default = a function, not Default::default(): for u32 it equals 0,
     // while an absent field means version 1, not a zero one.
-    #[serde(default = "default_protocol_version", deserialize_with = "de_protocol_version")]
+    #[serde(
+        default = "default_protocol_version",
+        deserialize_with = "de_protocol_version"
+    )]
     pub protocol_version: ProtocolVersion,
     #[serde(default)]
     pub agent_capabilities: AgentCapabilities,
@@ -240,8 +243,18 @@ pub enum ContentBlock {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum EmbeddedResource {
-    Text { uri: String, text: String, #[serde(rename = "mimeType")] mime_type: Option<String> },
-    Blob { uri: String, blob: String, #[serde(rename = "mimeType")] mime_type: Option<String> },
+    Text {
+        uri: String,
+        text: String,
+        #[serde(rename = "mimeType")]
+        mime_type: Option<String>,
+    },
+    Blob {
+        uri: String,
+        blob: String,
+        #[serde(rename = "mimeType")]
+        mime_type: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -280,11 +293,29 @@ pub struct PromptResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "sessionUpdate", rename_all = "snake_case")]
 pub enum SessionUpdate {
-    AgentMessageChunk { message_id: Option<String>, content: ContentBlock },
-    ToolCall { tool_call_id: String, title: String, kind: String, status: ToolCallStatus },
-    ToolCallUpdate { tool_call_id: String, status: ToolCallStatus, content: Option<Vec<ContentBlock>> },
-    Plan { entries: Vec<PlanEntry> },
-    UsageUpdate { used: u64, size: u64, cost: Option<Cost> },
+    AgentMessageChunk {
+        message_id: Option<String>,
+        content: ContentBlock,
+    },
+    ToolCall {
+        tool_call_id: String,
+        title: String,
+        kind: String,
+        status: ToolCallStatus,
+    },
+    ToolCallUpdate {
+        tool_call_id: String,
+        status: ToolCallStatus,
+        content: Option<Vec<ContentBlock>>,
+    },
+    Plan {
+        entries: Vec<PlanEntry>,
+    },
+    UsageUpdate {
+        used: u64,
+        size: u64,
+        cost: Option<Cost>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]

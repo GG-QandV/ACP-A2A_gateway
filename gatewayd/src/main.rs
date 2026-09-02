@@ -8,7 +8,9 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use gatewayd::approvals::Status;
-use gatewayd::config::{ApprovalsConfig, EventLogConfig, HealthConfig, JournalConfig, TaskStoreConfig};
+use gatewayd::config::{
+    ApprovalsConfig, EventLogConfig, HealthConfig, JournalConfig, TaskStoreConfig,
+};
 use gatewayd::health::DbTarget;
 use gatewayd::journal::Journal;
 use gatewayd::registry::{AgentEntry, Registry, Transport};
@@ -380,8 +382,12 @@ fn init_buffer_dbs(event_log: &EventLogConfig, task_store: &TaskStoreConfig) -> 
 fn init_sqlite_db(path: &std::path::Path, label: &str) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("не удалось создать каталог для {label}: {}", parent.display()))?;
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "не удалось создать каталог для {label}: {}",
+                    parent.display()
+                )
+            })?;
         }
     }
     let conn = rusqlite::Connection::open(path)
@@ -391,7 +397,12 @@ fn init_sqlite_db(path: &std::path::Path, label: &str) -> anyhow::Result<()> {
          PRAGMA synchronous=NORMAL;
          PRAGMA busy_timeout=5000;",
     )
-    .with_context(|| format!("не удалось настроить sqlite для {label}: {}", path.display()))?;
+    .with_context(|| {
+        format!(
+            "не удалось настроить sqlite для {label}: {}",
+            path.display()
+        )
+    })?;
     drop(conn);
     tracing::info!(label, path = %path.display(), "sqlite БД инициализирована");
     Ok(())
@@ -400,9 +411,7 @@ fn init_sqlite_db(path: &std::path::Path, label: &str) -> anyhow::Result<()> {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
-    let config_path = args
-        .next()
-        .unwrap_or_else(|| "config.yaml".to_string());
+    let config_path = args.next().unwrap_or_else(|| "config.yaml".to_string());
 
     // Phase 6: interactive setup wizard for the user.
     // `gatewayd --setup [file.yaml]` generates the whole config with defaults;
@@ -419,7 +428,10 @@ async fn main() -> anyhow::Result<()> {
 
     // Phase 7: agent approvals via CLI. `gatewayd --approvals [--db PATH]`,
     // `gatewayd --approve <name> [--db PATH]`, `--reject <name> ...`.
-    if matches!(config_path.as_str(), "--approvals" | "--approve" | "--reject") {
+    if matches!(
+        config_path.as_str(),
+        "--approvals" | "--approve" | "--reject"
+    ) {
         return cli::run_approvals(&config_path, &args.collect::<Vec<_>>());
     }
 
@@ -443,7 +455,7 @@ async fn main() -> anyhow::Result<()> {
     let task_ttl = std::time::Duration::from_secs(raw_config.task_retention_days * 24 * 60 * 60);
     let sweep_dir = task_store_dir.clone();
 
-// Phase 7 (approvals): when enabled, an agent enters the Registry only
+    // Phase 7 (approvals): when enabled, an agent enters the Registry only
     // after being approved via CLI. Not-approved (pending/rejected) agents are
     // excluded — the gateway does not serve them.
     let (registry, excluded_agents) = if raw_config.approvals.enabled {
@@ -536,8 +548,12 @@ async fn main() -> anyhow::Result<()> {
             max_mb: raw_config.journal.max_size_mb,
         });
     }
-    let health_monitor =
-        gatewayd::health::spawn(registry.clone(), journal.clone(), &raw_config.health, health_targets);
+    let health_monitor = gatewayd::health::spawn(
+        registry.clone(),
+        journal.clone(),
+        &raw_config.health,
+        health_targets,
+    );
     // A disabled monitor = an eternal stub so that select does not exit
     // prematurely (same trick as log_monitor above).
     let health_task = match health_monitor {
@@ -698,9 +714,7 @@ async fn largest_file_size_mb(dir: &str) -> u64 {
 }
 
 /// List of directory files with mtime and size — for log-directory cleanup.
-async fn collect_log_files(
-    dir: &str,
-) -> Vec<(std::path::PathBuf, std::time::SystemTime, u64)> {
+async fn collect_log_files(dir: &str) -> Vec<(std::path::PathBuf, std::time::SystemTime, u64)> {
     let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
         return Vec::new();
     };

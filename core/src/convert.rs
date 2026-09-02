@@ -8,12 +8,12 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use protocol::acp::{
-    self, ContentBlock, McpServer, NewSessionRequest, PromptRequest, PromptResponse,
-    SessionId, SessionUpdate, StopReason,
-};
 use protocol::a2a::{
     self, Artifact, ContextId, Message, MessageRole, Part, Task, TaskId, TaskState, TaskStatus,
+};
+use protocol::acp::{
+    self, ContentBlock, McpServer, NewSessionRequest, PromptRequest, PromptResponse, SessionId,
+    SessionUpdate, StopReason,
 };
 
 use crate::agent::{A2aAgent, AcpAgent};
@@ -30,21 +30,37 @@ use crate::task_store::{OwnedTask, TaskStore};
 pub fn content_block_to_part(cb: ContentBlock) -> Part {
     match cb {
         ContentBlock::Text { text } => Part::Text { text },
-        ContentBlock::Image { mime_type, data, .. } => Part::File {
-            file: a2a::FilePart { uri: None, bytes: Some(data), mime_type: Some(mime_type) },
+        ContentBlock::Image {
+            mime_type, data, ..
+        } => Part::File {
+            file: a2a::FilePart {
+                uri: None,
+                bytes: Some(data),
+                mime_type: Some(mime_type),
+            },
         },
         ContentBlock::Audio { mime_type, data } => Part::File {
-            file: a2a::FilePart { uri: None, bytes: Some(data), mime_type: Some(mime_type) },
+            file: a2a::FilePart {
+                uri: None,
+                bytes: Some(data),
+                mime_type: Some(mime_type),
+            },
         },
         ContentBlock::Resource { resource } => match resource {
             acp::EmbeddedResource::Text { text, .. } => Part::Text { text },
-            acp::EmbeddedResource::Blob { blob, mime_type, .. } => {
-                Part::File { file: a2a::FilePart { uri: None, bytes: Some(blob), mime_type } }
-            }
+            acp::EmbeddedResource::Blob {
+                blob, mime_type, ..
+            } => Part::File {
+                file: a2a::FilePart {
+                    uri: None,
+                    bytes: Some(blob),
+                    mime_type,
+                },
+            },
         },
-        ContentBlock::ResourceLink { uri, name, .. } => {
-            Part::Text { text: format!("[resource: {name}]({uri})") }
-        }
+        ContentBlock::ResourceLink { uri, name, .. } => Part::Text {
+            text: format!("[resource: {name}]({uri})"),
+        },
     }
 }
 
@@ -54,12 +70,21 @@ pub fn part_to_content_block(p: Part) -> ContentBlock {
         // FIXED (audit P2-13): previously ANY File became an Image,
         // including audio and PDF. The type is chosen by mime.
         Part::File { file } => {
-            let mime = file.mime_type.unwrap_or_else(|| "application/octet-stream".into());
+            let mime = file
+                .mime_type
+                .unwrap_or_else(|| "application/octet-stream".into());
             let data = file.bytes.unwrap_or_default();
             if mime.starts_with("image/") {
-                ContentBlock::Image { mime_type: mime, data, uri: file.uri }
+                ContentBlock::Image {
+                    mime_type: mime,
+                    data,
+                    uri: file.uri,
+                }
             } else if mime.starts_with("audio/") {
-                ContentBlock::Audio { mime_type: mime, data }
+                ContentBlock::Audio {
+                    mime_type: mime,
+                    data,
+                }
             } else {
                 ContentBlock::Resource {
                     resource: acp::EmbeddedResource::Blob {
@@ -70,16 +95,25 @@ pub fn part_to_content_block(p: Part) -> ContentBlock {
                 }
             }
         }
-        Part::Data { data } => ContentBlock::Text { text: data.to_string() },
+        Part::Data { data } => ContentBlock::Text {
+            text: data.to_string(),
+        },
     }
 }
 
 fn message_to_prompt(session: SessionId, m: Message) -> PromptRequest {
-    PromptRequest { session_id: session, prompt: m.parts.into_iter().map(part_to_content_block).collect() }
+    PromptRequest {
+        session_id: session,
+        prompt: m.parts.into_iter().map(part_to_content_block).collect(),
+    }
 }
 
 fn prompt_to_message(p: PromptRequest) -> Message {
-    Message { role: MessageRole::User, parts: p.prompt.into_iter().map(content_block_to_part).collect(), message_id: None }
+    Message {
+        role: MessageRole::User,
+        parts: p.prompt.into_iter().map(content_block_to_part).collect(),
+        message_id: None,
+    }
 }
 
 // =========================================================================
@@ -103,7 +137,9 @@ fn task_state_to_stop_reason(state: TaskState) -> anyhow::Result<StopReason> {
 
 fn stop_reason_to_task_state(sr: StopReason) -> TaskState {
     match sr {
-        StopReason::EndTurn | StopReason::MaxTokens | StopReason::MaxTurnRequests => TaskState::Completed,
+        StopReason::EndTurn | StopReason::MaxTokens | StopReason::MaxTurnRequests => {
+            TaskState::Completed
+        }
         StopReason::Refusal => TaskState::Failed,
         StopReason::Cancelled => TaskState::Canceled,
     }
@@ -191,11 +227,7 @@ impl<T: AcpAgent> AcpAsA2a<T> {
     /// Session for a specific conversation. The first request with a new
     /// contextId spawns a fresh ACP session on the same agent process —
     /// no need to multiply processes, that is what sessionId exists for.
-    async fn ensure_session(
-        &self,
-        context: &ContextId,
-        owner: Owner,
-    ) -> anyhow::Result<SessionId> {
+    async fn ensure_session(&self, context: &ContextId, owner: Owner) -> anyhow::Result<SessionId> {
         let mut sessions = self.sessions.lock().await;
 
         let now = std::time::Instant::now();
@@ -234,12 +266,20 @@ impl<T: AcpAgent> AcpAsA2a<T> {
             // with the same contextId starts the conversation anew.
             if entry.generation != generation {
                 let previous = entry.generation;
-                let stale = sessions.remove(context).expect("запись только что читалась");
+                let stale = sessions
+                    .remove(context)
+                    .expect("запись только что читалась");
                 self.lease.forget(&stale.session_id).await;
-                return Err(ContextLost { previous, current: generation }.into());
+                return Err(ContextLost {
+                    previous,
+                    current: generation,
+                }
+                .into());
             }
 
-            let entry = sessions.get_mut(context).expect("запись только что читалась");
+            let entry = sessions
+                .get_mut(context)
+                .expect("запись только что читалась");
             entry.last_used = now;
             return Ok(entry.session_id.clone());
         }
@@ -273,11 +313,7 @@ impl<T: AcpAgent> AcpAsA2a<T> {
 
     /// Session of an existing conversation without creating a new one. Used
     /// by cancel: there is nothing to cancel if the conversation never existed.
-    async fn lookup_session(
-        &self,
-        context: &ContextId,
-        owner: Owner,
-    ) -> anyhow::Result<SessionId> {
+    async fn lookup_session(&self, context: &ContextId, owner: Owner) -> anyhow::Result<SessionId> {
         let sessions = self.sessions.lock().await;
         let entry = sessions
             .get(context)
@@ -354,11 +390,10 @@ impl<T: AcpAgent> AcpAsA2a<T> {
 
         let _guard = self.lease.acquire(&session, self.lease_timeout).await?;
 
-        let incoming_message = task
-            .status
-            .message
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("task.status.message обязателен для send_task в MVP"))?;
+        let incoming_message =
+            task.status.message.clone().ok_or_else(|| {
+                anyhow::anyhow!("task.status.message обязателен для send_task в MVP")
+            })?;
         let prompt_req = message_to_prompt(session.clone(), incoming_message);
 
         // ADDED (P-20): send_task_as uses prompt_streaming() —
@@ -371,8 +406,11 @@ impl<T: AcpAgent> AcpAsA2a<T> {
                 // the A2A client got a Task with no Parts at all. Now
                 // PromptResponse.content goes into artifacts and into
                 // status.message with role Agent.
-                let parts: Vec<Part> =
-                    resp.content.into_iter().map(content_block_to_part).collect();
+                let parts: Vec<Part> = resp
+                    .content
+                    .into_iter()
+                    .map(content_block_to_part)
+                    .collect();
                 let agent_message = (!parts.is_empty()).then(|| Message {
                     role: MessageRole::Agent,
                     parts: parts.clone(),
@@ -390,7 +428,11 @@ impl<T: AcpAgent> AcpAsA2a<T> {
                 let result = Task {
                     id: task.id,
                     context_id: task.context_id,
-                    status: TaskStatus { state, message: agent_message, timestamp: now_iso8601() },
+                    status: TaskStatus {
+                        state,
+                        message: agent_message,
+                        timestamp: now_iso8601(),
+                    },
                     history: None,
                     artifacts,
                     metadata: None,
@@ -456,7 +498,6 @@ impl<T: AcpAgent> AcpAsA2a<T> {
             }
         }
     }
-
 }
 
 /// ADDED (P-21, diff convert-streaming-mapping.rs, senior-level):
@@ -547,7 +588,9 @@ fn session_update_to_a2a_event(update: SessionUpdate, task_id: &TaskId) -> Optio
 fn text_status_message(text: &str) -> Message {
     Message {
         role: MessageRole::Agent,
-        parts: vec![Part::Text { text: text.to_string() }],
+        parts: vec![Part::Text {
+            text: text.to_string(),
+        }],
         message_id: None,
     }
 }
@@ -567,12 +610,19 @@ impl<T: AcpAgent + Send + Sync> A2aAgent for AcpAsA2a<T> {
             })
             .await?;
         Ok(a2a::AgentCard {
-            name: init.agent_info.as_ref().map(|i| i.name.clone()).unwrap_or_default(),
+            name: init
+                .agent_info
+                .as_ref()
+                .map(|i| i.name.clone())
+                .unwrap_or_default(),
             description: None,
             // A2A AgentCard.version is a string, ACP protocolVersion is a number.
             version: init.protocol_version.to_string(),
             url: self.public_url.clone(),
-            capabilities: a2a::AgentCardCapabilities { streaming: false, push_notifications: false },
+            capabilities: a2a::AgentCardCapabilities {
+                streaming: false,
+                push_notifications: false,
+            },
             skills: Vec::new(),
         })
     }
@@ -674,10 +724,7 @@ impl<T: A2aAgent> A2aAsAcp<T> {
         self.lease.forget(session).await;
     }
 
-    async fn evict_expired(
-        &self,
-        sessions: &mut HashMap<SessionId, std::time::Instant>,
-    ) {
+    async fn evict_expired(&self, sessions: &mut HashMap<SessionId, std::time::Instant>) {
         let now = std::time::Instant::now();
         let ttl = self.session_ttl;
         let expired: Vec<SessionId> = sessions
@@ -704,12 +751,14 @@ impl<T: A2aAgent> A2aAsAcp<T> {
     pub async fn leased_sessions(&self) -> usize {
         self.lease.tracked_sessions().await
     }
-
 }
 
 #[async_trait]
 impl<T: A2aAgent + Send + Sync> AcpAgent for A2aAsAcp<T> {
-    async fn initialize(&self, _req: acp::InitializeRequest) -> anyhow::Result<acp::InitializeResponse> {
+    async fn initialize(
+        &self,
+        _req: acp::InitializeRequest,
+    ) -> anyhow::Result<acp::InitializeResponse> {
         let card = self.inner.card().await?;
         Ok(acp::InitializeResponse {
             // Reverse conversion: A2A card string -> ACP number.
@@ -723,27 +772,43 @@ impl<T: A2aAgent + Send + Sync> AcpAgent for A2aAsAcp<T> {
                 .unwrap_or(acp::DEFAULT_PROTOCOL_VERSION),
             agent_capabilities: acp::AgentCapabilities {
                 load_session: false,
-                prompt_capabilities: acp::PromptCapabilities { image: true, audio: false, embedded_context: false },
+                prompt_capabilities: acp::PromptCapabilities {
+                    image: true,
+                    audio: false,
+                    embedded_context: false,
+                },
                 mcp_capabilities: Default::default(),
                 session_capabilities: Default::default(),
             },
-            agent_info: Some(acp::Implementation { name: card.name, version: String::new() }),
+            agent_info: Some(acp::Implementation {
+                name: card.name,
+                version: String::new(),
+            }),
             auth_methods: Vec::new(),
         })
     }
 
-    async fn new_session(&self, _req: NewSessionRequest) -> anyhow::Result<acp::NewSessionResponse> {
+    async fn new_session(
+        &self,
+        _req: NewSessionRequest,
+    ) -> anyhow::Result<acp::NewSessionResponse> {
         let session_id = SessionId(new_session_id());
         self.register_session(session_id.clone()).await?;
         Ok(acp::NewSessionResponse { session_id })
     }
 
-    async fn prompt(&self, req: PromptRequest) -> anyhow::Result<Reply<PromptResponse, SessionUpdate>> {
+    async fn prompt(
+        &self,
+        req: PromptRequest,
+    ) -> anyhow::Result<Reply<PromptResponse, SessionUpdate>> {
         // Check BEFORE acquire: otherwise an unknown sessionId managed
         // to create a lease entry before it was rejected.
         self.touch_session(&req.session_id).await?;
 
-        let _guard = self.lease.acquire(&req.session_id, self.lease_timeout).await?;
+        let _guard = self
+            .lease
+            .acquire(&req.session_id, self.lease_timeout)
+            .await?;
 
         let message = prompt_to_message(req.clone());
         // FIXED (audit P2-5): TaskId was set equal to session_id, so
@@ -753,7 +818,11 @@ impl<T: A2aAgent + Send + Sync> AcpAgent for A2aAsAcp<T> {
         let task = Task {
             id: TaskId(format!("{}-{}", req.session_id.0, unique_suffix())),
             context_id: ContextId(req.session_id.0),
-            status: TaskStatus { state: TaskState::Submitted, message: Some(message), timestamp: now_iso8601() },
+            status: TaskStatus {
+                state: TaskState::Submitted,
+                message: Some(message),
+                timestamp: now_iso8601(),
+            },
             history: None,
             artifacts: None,
             metadata: None,
@@ -771,7 +840,10 @@ impl<T: A2aAgent + Send + Sync> AcpAgent for A2aAsAcp<T> {
                 for artifact in t.artifacts.unwrap_or_default() {
                     content.extend(artifact.parts.into_iter().map(part_to_content_block));
                 }
-                Ok(Reply::Complete(PromptResponse { stop_reason, content }))
+                Ok(Reply::Complete(PromptResponse {
+                    stop_reason,
+                    content,
+                }))
             }
             // ADDED (P-20, diff convert-streaming-mapping.rs): A2aEvent
             // -> SessionUpdate is translated by a background task until the terminal
@@ -835,7 +907,9 @@ impl<T: A2aAgent + Send + Sync> AcpAgent for A2aAsAcp<T> {
 /// 4. Message(_) — AgentMessageChunk, one per Part.
 fn a2a_event_to_session_update(event: a2a::A2aEvent) -> Vec<SessionUpdate> {
     match event {
-        a2a::A2aEvent::TaskStatusUpdate { status, r#final, .. } => {
+        a2a::A2aEvent::TaskStatusUpdate {
+            status, r#final, ..
+        } => {
             if r#final {
                 // The terminal event is handled separately by the calling
                 // code — nothing is emitted here.
@@ -945,7 +1019,10 @@ mod tests {
         };
         let event = session_update_to_a2a_event(update, &TaskId("t-1".into()));
         assert!(
-            matches!(event, Some(a2a::A2aEvent::TaskStatusUpdate { r#final: false, .. })),
+            matches!(
+                event,
+                Some(a2a::A2aEvent::TaskStatusUpdate { r#final: false, .. })
+            ),
             "AgentMessageChunk должен маппиться в не-терминальный TaskStatusUpdate"
         );
     }
@@ -1001,7 +1078,10 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
                 .join(" ");
-            assert!(text.contains("шаг 1") && text.contains("шаг 2"), "план должен содержать оба шага: {text}");
+            assert!(
+                text.contains("шаг 1") && text.contains("шаг 2"),
+                "план должен содержать оба шага: {text}"
+            );
         } else {
             panic!("Plan должен маппиться в TaskStatusUpdate");
         }
@@ -1015,7 +1095,10 @@ mod tests {
             cost: None,
         };
         let event = session_update_to_a2a_event(update, &TaskId("t-1".into()));
-        assert!(event.is_none(), "UsageUpdate сознательно не транслируется клиенту (Р-21)");
+        assert!(
+            event.is_none(),
+            "UsageUpdate сознательно не транслируется клиенту (Р-21)"
+        );
     }
 
     #[test]
@@ -1048,7 +1131,7 @@ mod tests {
                         text: "один".into(),
                     },
                     Part::Text {
-                        text: "два".into(),
+                        text: "два".into()
                     },
                 ],
                 metadata: None,
@@ -1056,9 +1139,12 @@ mod tests {
             append: None,
         };
         let updates = a2a_event_to_session_update(event);
-        assert_eq!(updates.len(), 2, "2 Part -> 2 отдельных AgentMessageChunk, не склеены");
+        assert_eq!(
+            updates.len(),
+            2,
+            "2 Part -> 2 отдельных AgentMessageChunk, не склеены"
+        );
     }
-
 
     /// Fake ACP agent: replies with fixed text and counts
     /// how many ACP sessions were requested of it.
@@ -1079,7 +1165,8 @@ mod tests {
 
     impl EchoAcpAgent {
         fn simulate_restart(&self) {
-            self.generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.generation
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
 
         /// Process killed but not restarted yet — the generation
@@ -1096,8 +1183,10 @@ mod tests {
             &self,
             _req: acp::InitializeRequest,
         ) -> anyhow::Result<InitializeResponse> {
-            self.initialized.store(true, std::sync::atomic::Ordering::SeqCst);
-            self.initialize_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.initialized
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.initialize_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(InitializeResponse {
                 protocol_version: acp::DEFAULT_PROTOCOL_VERSION,
                 agent_capabilities: Default::default(),
@@ -1112,8 +1201,12 @@ mod tests {
             }
             // Counter: each new session gets its own id — otherwise
             // conversation isolation is indistinguishable from its absence.
-            let n = self.sessions_created.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(NewSessionResponse { session_id: SessionId(format!("sess-{n}")) })
+            let n = self
+                .sessions_created
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(NewSessionResponse {
+                session_id: SessionId(format!("sess-{n}")),
+            })
         }
 
         async fn prompt(
@@ -1123,7 +1216,9 @@ mod tests {
             *self.last_prompt_session.lock().unwrap() = Some(_req.session_id.clone());
             Ok(Reply::Complete(PromptResponse {
                 stop_reason: StopReason::EndTurn,
-                content: vec![ContentBlock::Text { text: "ответ агента".into() }],
+                content: vec![ContentBlock::Text {
+                    text: "ответ агента".into(),
+                }],
             }))
         }
 
@@ -1135,10 +1230,12 @@ mod tests {
         /// is detected here, and the generation grows here too.
         async fn ensure_ready(&self) -> anyhow::Result<()> {
             if self.dead.swap(false, std::sync::atomic::Ordering::SeqCst) {
-                self.generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.generation
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 // A fresh process is uninitialized: the handshake is part
                 // of the process bring-up, as in SupervisedStdioAgent.
-                self.initialized.store(false, std::sync::atomic::Ordering::SeqCst);
+                self.initialized
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
             }
             if !self.initialized.load(std::sync::atomic::Ordering::SeqCst) {
                 self.initialize(acp::InitializeRequest {
@@ -1192,16 +1289,26 @@ mod tests {
             "http://localhost:8348/agents/test/rpc".into(),
         );
 
-        let reply = adapter.send_task(task_with_text("t-1", "привет")).await.unwrap();
-        let Reply::Complete(task) = reply else { panic!("ожидался Complete") };
+        let reply = adapter
+            .send_task(task_with_text("t-1", "привет"))
+            .await
+            .unwrap();
+        let Reply::Complete(task) = reply else {
+            panic!("ожидался Complete")
+        };
 
         assert_eq!(task.status.state, TaskState::Completed);
 
-        let artifacts = task.artifacts.expect("артефакт с ответом должен присутствовать");
+        let artifacts = task
+            .artifacts
+            .expect("артефакт с ответом должен присутствовать");
         assert_eq!(artifacts.len(), 1);
         assert!(matches!(&artifacts[0].parts[0], Part::Text { text } if text == "ответ агента"));
 
-        let message = task.status.message.expect("status.message должен содержать ответ");
+        let message = task
+            .status
+            .message
+            .expect("status.message должен содержать ответ");
         assert!(matches!(message.role, MessageRole::Agent));
     }
 
@@ -1218,11 +1325,17 @@ mod tests {
             "http://localhost:8348/agents/test/rpc".into(),
         );
 
-        adapter.send_task(task_with_text("t-2", "привет")).await.unwrap();
+        adapter
+            .send_task(task_with_text("t-2", "привет"))
+            .await
+            .unwrap();
         let canceled = adapter.cancel_task(TaskId("t-2".into())).await.unwrap();
 
         assert_eq!(canceled.status.state, TaskState::Canceled);
-        assert_eq!(canceled.context_id.0, "ctx", "context_id не должен теряться");
+        assert_eq!(
+            canceled.context_id.0, "ctx",
+            "context_id не должен теряться"
+        );
     }
 
     /// Regression for audit P2-13: any File was turned into an Image.
@@ -1235,7 +1348,10 @@ mod tests {
                 mime_type: Some("application/pdf".into()),
             },
         };
-        assert!(matches!(part_to_content_block(pdf), ContentBlock::Resource { .. }));
+        assert!(matches!(
+            part_to_content_block(pdf),
+            ContentBlock::Resource { .. }
+        ));
 
         let wav = Part::File {
             file: a2a::FilePart {
@@ -1244,7 +1360,10 @@ mod tests {
                 mime_type: Some("audio/wav".into()),
             },
         };
-        assert!(matches!(part_to_content_block(wav), ContentBlock::Audio { .. }));
+        assert!(matches!(
+            part_to_content_block(wav),
+            ContentBlock::Audio { .. }
+        ));
     }
 
     /// Regression for audit P2-6: input-required took down the whole turn.
@@ -1288,13 +1407,34 @@ mod tests {
         let alice = Owner::from_token("token-alice");
         let bob = Owner::from_token("token-bob");
 
-        adapter.send_task_as(alice, task_in_context("t-a", "ctx-alice", "привет")).await.unwrap();
-        let session_alice = adapter.inner.last_prompt_session.lock().unwrap().clone().unwrap();
+        adapter
+            .send_task_as(alice, task_in_context("t-a", "ctx-alice", "привет"))
+            .await
+            .unwrap();
+        let session_alice = adapter
+            .inner
+            .last_prompt_session
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap();
 
-        adapter.send_task_as(bob, task_in_context("t-b", "ctx-bob", "привет")).await.unwrap();
-        let session_bob = adapter.inner.last_prompt_session.lock().unwrap().clone().unwrap();
+        adapter
+            .send_task_as(bob, task_in_context("t-b", "ctx-bob", "привет"))
+            .await
+            .unwrap();
+        let session_bob = adapter
+            .inner
+            .last_prompt_session
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap();
 
-        assert_ne!(session_alice, session_bob, "разговоры не должны делить ACP-сессию");
+        assert_ne!(
+            session_alice, session_bob,
+            "разговоры не должны делить ACP-сессию"
+        );
         assert_eq!(adapter.active_sessions().await, 2);
     }
 
@@ -1306,15 +1446,39 @@ mod tests {
         let adapter = adapter_for_test(dir.path());
         let owner = Owner::from_token("token-alice");
 
-        adapter.send_task_as(owner, task_in_context("t-1", "ctx-1", "раз")).await.unwrap();
-        let first = adapter.inner.last_prompt_session.lock().unwrap().clone().unwrap();
+        adapter
+            .send_task_as(owner, task_in_context("t-1", "ctx-1", "раз"))
+            .await
+            .unwrap();
+        let first = adapter
+            .inner
+            .last_prompt_session
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap();
 
-        adapter.send_task_as(owner, task_in_context("t-2", "ctx-1", "два")).await.unwrap();
-        let second = adapter.inner.last_prompt_session.lock().unwrap().clone().unwrap();
+        adapter
+            .send_task_as(owner, task_in_context("t-2", "ctx-1", "два"))
+            .await
+            .unwrap();
+        let second = adapter
+            .inner
+            .last_prompt_session
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap();
 
         assert_eq!(first, second);
         assert_eq!(adapter.active_sessions().await, 1);
-        assert_eq!(adapter.inner.sessions_created.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            adapter
+                .inner
+                .sessions_created
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
     }
 
     /// A guessed foreign contextId does not attach to someone else's conversation.
@@ -1326,7 +1490,10 @@ mod tests {
         let alice = Owner::from_token("token-alice");
         let mallory = Owner::from_token("token-mallory");
 
-        adapter.send_task_as(alice, task_in_context("t-1", "ctx-secret", "тайна")).await.unwrap();
+        adapter
+            .send_task_as(alice, task_in_context("t-1", "ctx-secret", "тайна"))
+            .await
+            .unwrap();
 
         let attempt = adapter
             .send_task_as(mallory, task_in_context("t-2", "ctx-secret", "подсяду"))
@@ -1343,11 +1510,23 @@ mod tests {
         let alice = Owner::from_token("token-alice");
         let mallory = Owner::from_token("token-mallory");
 
-        adapter.send_task_as(alice, task_in_context("t-1", "ctx-secret", "тайна")).await.unwrap();
+        adapter
+            .send_task_as(alice, task_in_context("t-1", "ctx-secret", "тайна"))
+            .await
+            .unwrap();
 
-        assert!(adapter.get_task_as(alice, TaskId("t-1".into())).await.is_ok());
-        assert!(adapter.get_task_as(mallory, TaskId("t-1".into())).await.is_err());
-        assert!(adapter.cancel_task_as(mallory, TaskId("t-1".into())).await.is_err());
+        assert!(adapter
+            .get_task_as(alice, TaskId("t-1".into()))
+            .await
+            .is_ok());
+        assert!(adapter
+            .get_task_as(mallory, TaskId("t-1".into()))
+            .await
+            .is_err());
+        assert!(adapter
+            .cancel_task_as(mallory, TaskId("t-1".into()))
+            .await
+            .is_err());
     }
 
     /// Anonymous calls (bare trait) — a separate bucket, not merged
@@ -1358,8 +1537,13 @@ mod tests {
         let adapter = adapter_for_test(dir.path());
         let alice = Owner::from_token("token-alice");
 
-        adapter.send_task_as(alice, task_in_context("t-1", "ctx-1", "привет")).await.unwrap();
-        let via_trait = adapter.send_task(task_in_context("t-2", "ctx-1", "привет")).await;
+        adapter
+            .send_task_as(alice, task_in_context("t-1", "ctx-1", "привет"))
+            .await
+            .unwrap();
+        let via_trait = adapter
+            .send_task(task_in_context("t-2", "ctx-1", "привет"))
+            .await;
 
         assert!(via_trait.is_err());
     }
@@ -1378,14 +1562,24 @@ mod tests {
         );
         let owner = Owner::from_token("token-alice");
 
-        adapter.send_task_as(owner, task_in_context("t-1", "ctx-old", "раз")).await.unwrap();
+        adapter
+            .send_task_as(owner, task_in_context("t-1", "ctx-old", "раз"))
+            .await
+            .unwrap();
         assert_eq!(adapter.active_sessions().await, 1);
 
         tokio::time::sleep(Duration::from_millis(80)).await;
 
         // A request with another context also runs the eviction pass.
-        adapter.send_task_as(owner, task_in_context("t-2", "ctx-new", "два")).await.unwrap();
-        assert_eq!(adapter.active_sessions().await, 1, "просроченный разговор должен быть выселен");
+        adapter
+            .send_task_as(owner, task_in_context("t-2", "ctx-new", "два"))
+            .await
+            .unwrap();
+        assert_eq!(
+            adapter.active_sessions().await,
+            1,
+            "просроченный разговор должен быть выселен"
+        );
     }
 
     /// Cancel works by the task's conversation, not by the 'current' session.
@@ -1395,10 +1589,19 @@ mod tests {
         let adapter = adapter_for_test(dir.path());
         let owner = Owner::from_token("token-alice");
 
-        adapter.send_task_as(owner, task_in_context("t-a", "ctx-a", "раз")).await.unwrap();
-        adapter.send_task_as(owner, task_in_context("t-b", "ctx-b", "два")).await.unwrap();
+        adapter
+            .send_task_as(owner, task_in_context("t-a", "ctx-a", "раз"))
+            .await
+            .unwrap();
+        adapter
+            .send_task_as(owner, task_in_context("t-b", "ctx-b", "два"))
+            .await
+            .unwrap();
 
-        let canceled = adapter.cancel_task_as(owner, TaskId("t-a".into())).await.unwrap();
+        let canceled = adapter
+            .cancel_task_as(owner, TaskId("t-a".into()))
+            .await
+            .unwrap();
         assert_eq!(canceled.context_id.0, "ctx-a");
         assert_eq!(canceled.status.state, TaskState::Canceled);
     }
@@ -1425,18 +1628,30 @@ mod tests {
         let alice = Owner::from_token("token-alice");
         let mallory = Owner::from_token("token-mallory");
 
-        adapter.send_task_as(alice, task_in_context("t-1", "ctx-secret", "тайна")).await.unwrap();
+        adapter
+            .send_task_as(alice, task_in_context("t-1", "ctx-secret", "тайна"))
+            .await
+            .unwrap();
 
         // Evict the conversation: a request with another context runs the TTL pass.
         tokio::time::sleep(Duration::from_millis(80)).await;
-        adapter.send_task_as(mallory, task_in_context("t-2", "ctx-other", "своё")).await.unwrap();
+        adapter
+            .send_task_as(mallory, task_in_context("t-2", "ctx-other", "своё"))
+            .await
+            .unwrap();
 
         // Alice's session is forgotten, but the task attribution remained in the store.
         assert!(
-            adapter.get_task_as(mallory, TaskId("t-1".into())).await.is_err(),
+            adapter
+                .get_task_as(mallory, TaskId("t-1".into()))
+                .await
+                .is_err(),
             "чужая задача не должна открываться после выселения сессии"
         );
-        assert!(adapter.get_task_as(alice, TaskId("t-1".into())).await.is_ok());
+        assert!(adapter
+            .get_task_as(alice, TaskId("t-1".into()))
+            .await
+            .is_ok());
     }
 
     /// Attribution survives a process restart: a new adapter over the same
@@ -1449,15 +1664,24 @@ mod tests {
 
         {
             let adapter = adapter_for_test(dir.path());
-            adapter.send_task_as(alice, task_in_context("t-1", "ctx-1", "привет")).await.unwrap();
+            adapter
+                .send_task_as(alice, task_in_context("t-1", "ctx-1", "привет"))
+                .await
+                .unwrap();
         }
 
         // New adapter = empty session registry, as after a restart.
         let restarted = adapter_for_test(dir.path());
         assert_eq!(restarted.active_sessions().await, 0);
 
-        assert!(restarted.get_task_as(mallory, TaskId("t-1".into())).await.is_err());
-        assert!(restarted.get_task_as(alice, TaskId("t-1".into())).await.is_ok());
+        assert!(restarted
+            .get_task_as(mallory, TaskId("t-1".into()))
+            .await
+            .is_err());
+        assert!(restarted
+            .get_task_as(alice, TaskId("t-1".into()))
+            .await
+            .is_ok());
     }
 
     /// An anonymous call must not expose tasks owned by token clients.
@@ -1467,7 +1691,10 @@ mod tests {
         let adapter = adapter_for_test(dir.path());
         let alice = Owner::from_token("token-alice");
 
-        adapter.send_task_as(alice, task_in_context("t-1", "ctx-1", "привет")).await.unwrap();
+        adapter
+            .send_task_as(alice, task_in_context("t-1", "ctx-1", "привет"))
+            .await
+            .unwrap();
 
         assert!(adapter.get_task(TaskId("t-1".into())).await.is_err());
     }
@@ -1485,12 +1712,18 @@ mod tests {
         let adapter = adapter_for_test(dir.path());
         let owner = Owner::from_token("token-alice");
 
-        adapter.send_task_as(owner, task_in_context("t-1", "ctx-1", "запомни 42")).await.unwrap();
+        adapter
+            .send_task_as(owner, task_in_context("t-1", "ctx-1", "запомни 42"))
+            .await
+            .unwrap();
 
         adapter.inner.simulate_restart();
 
         let err = adapter
-            .send_task_as(owner, task_in_context("t-2", "ctx-1", "что я просил запомнить?"))
+            .send_task_as(
+                owner,
+                task_in_context("t-2", "ctx-1", "что я просил запомнить?"),
+            )
             .await
             .err()
             .expect("разговор прошлого поколения должен быть помечен потерянным");
@@ -1509,7 +1742,10 @@ mod tests {
         let adapter = adapter_for_test(dir.path());
         let owner = Owner::from_token("token-alice");
 
-        adapter.send_task_as(owner, task_in_context("t-1", "ctx-1", "раз")).await.unwrap();
+        adapter
+            .send_task_as(owner, task_in_context("t-1", "ctx-1", "раз"))
+            .await
+            .unwrap();
         adapter.inner.simulate_restart();
 
         assert!(adapter
@@ -1518,7 +1754,10 @@ mod tests {
             .is_err());
 
         // The second call already creates a fresh session of the new generation.
-        adapter.send_task_as(owner, task_in_context("t-3", "ctx-1", "три")).await.unwrap();
+        adapter
+            .send_task_as(owner, task_in_context("t-3", "ctx-1", "три"))
+            .await
+            .unwrap();
         assert_eq!(adapter.active_sessions().await, 1);
     }
 
@@ -1531,7 +1770,10 @@ mod tests {
         let alice = Owner::from_token("token-alice");
         let mallory = Owner::from_token("token-mallory");
 
-        adapter.send_task_as(alice, task_in_context("t-1", "ctx-secret", "тайна")).await.unwrap();
+        adapter
+            .send_task_as(alice, task_in_context("t-1", "ctx-secret", "тайна"))
+            .await
+            .unwrap();
         adapter.inner.simulate_restart();
 
         let err = adapter
@@ -1554,8 +1796,14 @@ mod tests {
         let owner = Owner::from_token("token-alice");
 
         adapter.inner.simulate_restart();
-        adapter.send_task_as(owner, task_in_context("t-1", "ctx-new", "раз")).await.unwrap();
-        adapter.send_task_as(owner, task_in_context("t-2", "ctx-new", "два")).await.unwrap();
+        adapter
+            .send_task_as(owner, task_in_context("t-1", "ctx-new", "раз"))
+            .await
+            .unwrap();
+        adapter
+            .send_task_as(owner, task_in_context("t-2", "ctx-new", "два"))
+            .await
+            .unwrap();
 
         assert_eq!(adapter.active_sessions().await, 1);
     }
@@ -1577,13 +1825,19 @@ mod tests {
         let adapter = adapter_for_test(dir.path());
         let owner = Owner::from_token("token-alice");
 
-        adapter.send_task_as(owner, task_in_context("t-1", "ctx-1", "запомни 42")).await.unwrap();
+        adapter
+            .send_task_as(owner, task_in_context("t-1", "ctx-1", "запомни 42"))
+            .await
+            .unwrap();
 
         // Process killed; restart will happen lazily, inside the call.
         adapter.inner.simulate_kill();
 
         let err = adapter
-            .send_task_as(owner, task_in_context("t-2", "ctx-1", "что я просил запомнить?"))
+            .send_task_as(
+                owner,
+                task_in_context("t-2", "ctx-1", "что я просил запомнить?"),
+            )
             .await
             .err()
             .expect("первый же запрос после смерти агента должен дать ContextLost");
@@ -1602,7 +1856,10 @@ mod tests {
         let adapter = adapter_for_test(dir.path());
         let owner = Owner::from_token("token-alice");
 
-        adapter.send_task_as(owner, task_in_context("t-1", "ctx-1", "раз")).await.unwrap();
+        adapter
+            .send_task_as(owner, task_in_context("t-1", "ctx-1", "раз"))
+            .await
+            .unwrap();
         adapter.inner.simulate_kill();
 
         assert!(adapter
@@ -1610,7 +1867,10 @@ mod tests {
             .await
             .is_err());
 
-        adapter.send_task_as(owner, task_in_context("t-3", "ctx-1", "три")).await.unwrap();
+        adapter
+            .send_task_as(owner, task_in_context("t-3", "ctx-1", "три"))
+            .await
+            .unwrap();
         assert_eq!(adapter.active_sessions().await, 1);
     }
 
@@ -1624,9 +1884,15 @@ mod tests {
         let owner = Owner::from_token("token-alice");
 
         // card() was not called — the path is exactly as in message/send.
-        adapter.send_task_as(owner, task_in_context("t-1", "ctx-1", "привет")).await.unwrap();
+        adapter
+            .send_task_as(owner, task_in_context("t-1", "ctx-1", "привет"))
+            .await
+            .unwrap();
 
-        assert!(adapter.inner.initialized.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(adapter
+            .inner
+            .initialized
+            .load(std::sync::atomic::Ordering::SeqCst));
     }
 
     /// And, more importantly, after a restart the fresh process also gets
@@ -1637,8 +1903,14 @@ mod tests {
         let adapter = adapter_for_test(dir.path());
         let owner = Owner::from_token("token-alice");
 
-        adapter.send_task_as(owner, task_in_context("t-1", "ctx-1", "раз")).await.unwrap();
-        let before = adapter.inner.initialize_calls.load(std::sync::atomic::Ordering::SeqCst);
+        adapter
+            .send_task_as(owner, task_in_context("t-1", "ctx-1", "раз"))
+            .await
+            .unwrap();
+        let before = adapter
+            .inner
+            .initialize_calls
+            .load(std::sync::atomic::Ordering::SeqCst);
 
         adapter.inner.simulate_kill();
         // The first call reports context loss...
@@ -1647,10 +1919,16 @@ mod tests {
             .await
             .is_err());
         // ...but the handshake with the new process has already happened.
-        let after = adapter.inner.initialize_calls.load(std::sync::atomic::Ordering::SeqCst);
+        let after = adapter
+            .inner
+            .initialize_calls
+            .load(std::sync::atomic::Ordering::SeqCst);
         assert!(after > before, "свежий процесс должен получить initialize");
 
-        adapter.send_task_as(owner, task_in_context("t-3", "ctx-1", "три")).await.unwrap();
+        adapter
+            .send_task_as(owner, task_in_context("t-3", "ctx-1", "три"))
+            .await
+            .unwrap();
     }
 
     // ---------------------------------------------------------------
@@ -1710,7 +1988,9 @@ mod tests {
     fn prompt_for(session: &SessionId) -> PromptRequest {
         PromptRequest {
             session_id: session.clone(),
-            prompt: vec![ContentBlock::Text { text: "привет".into() }],
+            prompt: vec![ContentBlock::Text {
+                text: "привет".into(),
+            }],
         }
     }
 
@@ -1741,7 +2021,11 @@ mod tests {
     async fn cancel_releases_lease_entry() {
         let adapter = A2aAsAcp::new(StubA2aAgent, Duration::from_secs(5));
 
-        let session = adapter.new_session(new_session_req()).await.unwrap().session_id;
+        let session = adapter
+            .new_session(new_session_req())
+            .await
+            .unwrap()
+            .session_id;
         adapter.prompt(prompt_for(&session)).await.unwrap();
 
         assert_eq!(adapter.active_sessions().await, 1);
@@ -1750,7 +2034,11 @@ mod tests {
         adapter.cancel(session).await.unwrap();
 
         assert_eq!(adapter.active_sessions().await, 0);
-        assert_eq!(adapter.leased_sessions().await, 0, "лиз должен быть освобождён");
+        assert_eq!(
+            adapter.leased_sessions().await,
+            0,
+            "лиз должен быть освобождён"
+        );
     }
 
     /// A long connection with many closed sessions does not accumulate entries.
@@ -1759,8 +2047,11 @@ mod tests {
         let adapter = A2aAsAcp::new(StubA2aAgent, Duration::from_secs(5));
 
         for _ in 0..300 {
-            let session =
-                adapter.new_session(new_session_req()).await.unwrap().session_id;
+            let session = adapter
+                .new_session(new_session_req())
+                .await
+                .unwrap()
+                .session_id;
             adapter.prompt(prompt_for(&session)).await.unwrap();
             adapter.cancel(session).await.unwrap();
         }
@@ -1794,7 +2085,11 @@ mod tests {
             Duration::from_millis(50),
         );
 
-        let session = adapter.new_session(new_session_req()).await.unwrap().session_id;
+        let session = adapter
+            .new_session(new_session_req())
+            .await
+            .unwrap()
+            .session_id;
         adapter.prompt(prompt_for(&session)).await.unwrap();
         assert_eq!(adapter.leased_sessions().await, 1);
 
@@ -1803,8 +2098,16 @@ mod tests {
         // Any request runs the eviction pass.
         adapter.new_session(new_session_req()).await.unwrap();
 
-        assert_eq!(adapter.active_sessions().await, 1, "остаётся только свежая сессия");
-        assert_eq!(adapter.leased_sessions().await, 0, "лиз просроченной сессии освобождён");
+        assert_eq!(
+            adapter.active_sessions().await,
+            1,
+            "остаётся только свежая сессия"
+        );
+        assert_eq!(
+            adapter.leased_sessions().await,
+            0,
+            "лиз просроченной сессии освобождён"
+        );
     }
 
     /// Regression for audit P2-12: AgentCard.url was empty, making the
@@ -1818,6 +2121,10 @@ mod tests {
         let card = adapter.card().await.unwrap();
 
         assert!(!card.url.is_empty(), "url карточки не должен быть пустым");
-        assert!(card.url.starts_with("http"), "url должен быть абсолютным: {}", card.url);
+        assert!(
+            card.url.starts_with("http"),
+            "url должен быть абсолютным: {}",
+            card.url
+        );
     }
 }

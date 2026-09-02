@@ -58,7 +58,8 @@ pub async fn serve(
         let task_store_dir = task_store_dir.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(socket, registry, task_store_dir, lease_timeout).await {
+            if let Err(e) = handle_connection(socket, registry, task_store_dir, lease_timeout).await
+            {
                 tracing::warn!(%peer_addr, error = %e, "connection closed with error");
             }
         });
@@ -75,14 +76,19 @@ async fn handle_connection(
     let mut reader = BufReader::new(read_half);
 
     let mut handshake_line = String::new();
-    tokio::time::timeout(HANDSHAKE_TIMEOUT, read_line_limited(&mut reader, &mut handshake_line))
-        .await
-        .map_err(|_| anyhow::anyhow!("handshake timeout"))??;
+    tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        read_line_limited(&mut reader, &mut handshake_line),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("handshake timeout"))??;
     let handshake: Handshake = serde_json::from_str(handshake_line.trim())
         .map_err(|e| anyhow::anyhow!("invalid handshake: {e}"))?;
 
     if !registry.check_token(&handshake.token) {
-        write_half.write_all(b"{\"error\":\"invalid token\"}\n").await?;
+        write_half
+            .write_all(b"{\"error\":\"invalid token\"}\n")
+            .await?;
         anyhow::bail!("token rejected for agent_id={}", handshake.agent_id);
     }
 
@@ -138,8 +144,14 @@ async fn handle_stdio_passthrough(
     cmd.kill_on_drop(true);
 
     let mut child = cmd.spawn()?;
-    let mut child_stdin = child.stdin.take().ok_or_else(|| anyhow::anyhow!("no stdin"))?;
-    let child_stdout = child.stdout.take().ok_or_else(|| anyhow::anyhow!("no stdout"))?;
+    let mut child_stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("no stdin"))?;
+    let child_stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("no stdout"))?;
     let mut child_stdout_reader = BufReader::new(child_stdout);
 
     let socket_to_child = async {
@@ -248,7 +260,13 @@ async fn handle_http_target(
         let request: JsonRpcRequest = match serde_json::from_str(line.trim()) {
             Ok(r) => r,
             Err(e) => {
-                write_error(&mut writer, Value::Null, -32700, &format!("parse error: {e}")).await?;
+                write_error(
+                    &mut writer,
+                    Value::Null,
+                    -32700,
+                    &format!("parse error: {e}"),
+                )
+                .await?;
                 continue;
             }
         };
@@ -349,15 +367,25 @@ async fn dispatch_acp_method(
                 .get("sessionId")
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow::anyhow!("session/cancel: sessionId обязателен"))?;
-            adapter.cancel(SessionId(session_id_raw.to_string())).await?;
+            adapter
+                .cancel(SessionId(session_id_raw.to_string()))
+                .await?;
             Ok(AcpDispatchResult::Json(json!({})))
         }
         other => anyhow::bail!("method_not_found: {other}"),
     }
 }
 
-async fn write_ok<W: AsyncWriteExt + Unpin>(writer: &mut W, id: Value, result: Value) -> anyhow::Result<()> {
-    let payload = JsonRpcOk { jsonrpc: "2.0", id, result };
+async fn write_ok<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    id: Value,
+    result: Value,
+) -> anyhow::Result<()> {
+    let payload = JsonRpcOk {
+        jsonrpc: "2.0",
+        id,
+        result,
+    };
     let mut bytes = serde_json::to_vec(&payload)?;
     bytes.push(b'\n');
     writer.write_all(&bytes).await?;
@@ -370,7 +398,14 @@ async fn write_error<W: AsyncWriteExt + Unpin>(
     code: i64,
     message: &str,
 ) -> anyhow::Result<()> {
-    let payload = JsonRpcErr { jsonrpc: "2.0", id, error: JsonRpcErrBody { code, message: message.to_string() } };
+    let payload = JsonRpcErr {
+        jsonrpc: "2.0",
+        id,
+        error: JsonRpcErrBody {
+            code,
+            message: message.to_string(),
+        },
+    };
     let mut bytes = serde_json::to_vec(&payload)?;
     bytes.push(b'\n');
     writer.write_all(&bytes).await?;

@@ -53,10 +53,7 @@ pub struct StreamUsageRow {
     pub limit: usize,
 }
 
-pub fn collect_snapshot(
-    targets: &[DbTarget],
-    registry: &Registry,
-) -> HealthSnapshot {
+pub fn collect_snapshot(targets: &[DbTarget], registry: &Registry) -> HealthSnapshot {
     let db_usage = targets
         .iter()
         .map(|t| {
@@ -152,7 +149,9 @@ pub fn spawn(
                 }
                 match level {
                     Level::Error => tracing::error!(message = %msg, "health: БД переполнена"),
-                    Level::Warn => tracing::warn!(message = %msg, "health: БД приближается к лимиту"),
+                    Level::Warn => {
+                        tracing::warn!(message = %msg, "health: БД приближается к лимиту")
+                    }
                     Level::Info => tracing::info!(message = %msg, "health"),
                 }
             }

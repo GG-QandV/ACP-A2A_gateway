@@ -475,11 +475,7 @@ async fn rest_send_message_core(
             let permit = match state.registry.try_acquire_stream(agent_id) {
                 Ok(p) => p,
                 Err(e) => {
-                    return rest_sdk_error(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        -32000,
-                        &e.to_string(),
-                    )
+                    return rest_sdk_error(StatusCode::SERVICE_UNAVAILABLE, -32000, &e.to_string())
                 }
             };
             tracing::info!(
@@ -592,7 +588,10 @@ fn spawn_stream_relay(
                 _ => None,
             };
             // Client may have dropped off — ignore the send error, the relay continues.
-            let _ = client_tx.send(StreamItem { seq: persisted, event });
+            let _ = client_tx.send(StreamItem {
+                seq: persisted,
+                event,
+            });
         }
         // The agent channel closed (stream finished) — resubscribers get
         // Closed from the hub and know there will be no more live tail.
@@ -642,9 +641,7 @@ fn stream_to_sse(
 fn event_task_id(event: &protocol::a2a::A2aEvent) -> Option<String> {
     match event {
         protocol::a2a::A2aEvent::TaskStatusUpdate { task_id, .. }
-        | protocol::a2a::A2aEvent::TaskArtifactUpdate { task_id, .. } => {
-            Some(task_id.0.clone())
-        }
+        | protocol::a2a::A2aEvent::TaskArtifactUpdate { task_id, .. } => Some(task_id.0.clone()),
         protocol::a2a::A2aEvent::Message(_) => None,
     }
 }
@@ -785,12 +782,7 @@ enum DispatchResult {
     /// ADDED (Phase 3): ready-made SSE stream for tasks/resubscribe —
     /// first history from the durable event_log (seq > after_seq), then
     /// live continuation from the per-task hub (Phase 3.2).
-    Resubscribe(
-        futures_util::stream::BoxStream<
-            'static,
-            Result<Event, Infallible>,
-        >,
-    ),
+    Resubscribe(futures_util::stream::BoxStream<'static, Result<Event, Infallible>>),
 }
 
 async fn dispatch_a2a_method(
@@ -879,13 +871,9 @@ async fn dispatch_a2a_method(
                 .get("after_seq")
                 .and_then(Value::as_u64)
                 .unwrap_or(0);
-            let stream = resubscribe_stream(
-                log.clone(),
-                stream_hub.clone(),
-                id.to_string(),
-                after_seq,
-            )
-            .await?;
+            let stream =
+                resubscribe_stream(log.clone(), stream_hub.clone(), id.to_string(), after_seq)
+                    .await?;
             Ok(DispatchResult::Resubscribe(stream))
         }
 

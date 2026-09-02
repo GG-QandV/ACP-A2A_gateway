@@ -108,12 +108,7 @@ impl Journal {
     }
 
     /// Appends an event and returns its monotonic seq.
-    pub async fn append(
-        &self,
-        level: Level,
-        category: &str,
-        message: &str,
-    ) -> anyhow::Result<u64> {
+    pub async fn append(&self, level: Level, category: &str, message: &str) -> anyhow::Result<u64> {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(Cmd::Append {
@@ -124,7 +119,8 @@ impl Journal {
             })
             .await
             .map_err(|_| anyhow::anyhow!("journal: writer отключился"))?;
-        rx.await.map_err(|_| anyhow::anyhow!("journal: writer не ответил"))?
+        rx.await
+            .map_err(|_| anyhow::anyhow!("journal: writer не ответил"))?
     }
 
     /// The last N records, in descending seq order (for CLI viewing).
@@ -137,7 +133,8 @@ impl Journal {
             })
             .await
             .map_err(|_| anyhow::anyhow!("journal: writer отключился"))?;
-        rx.await.map_err(|_| anyhow::anyhow!("journal: writer не ответил"))?
+        rx.await
+            .map_err(|_| anyhow::anyhow!("journal: writer не ответил"))?
     }
 }
 
@@ -160,9 +157,8 @@ pub fn query_recent(path: &Path, filter: &JournalFilter) -> anyhow::Result<Vec<J
     // Read only; never write into the DB of a running gateway.
     conn.pragma_update(None, "query_only", true)?;
 
-    let mut sql = String::from(
-        "SELECT id, ts, level, category, message FROM journal_events WHERE 1=1",
-    );
+    let mut sql =
+        String::from("SELECT id, ts, level, category, message FROM journal_events WHERE 1=1");
     let mut params: Vec<rusqlite::types::Value> = Vec::new();
     if let Some(level) = &filter.level {
         sql.push_str(" AND level = ?");
@@ -292,7 +288,11 @@ impl Writer {
                 rusqlite::params![cutoff],
             ) {
                 Ok(deleted) if deleted > 0 => {
-                    tracing::info!(deleted, retention_days = self.retention_days, "journal: удалены события старше TTL");
+                    tracing::info!(
+                        deleted,
+                        retention_days = self.retention_days,
+                        "journal: удалены события старше TTL"
+                    );
                 }
                 Ok(_) => {}
                 Err(e) => tracing::warn!(error = %e, "journal: TTL-очистка не удалась"),
@@ -353,9 +353,18 @@ mod tests {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("j.db");
         let journal = Journal::spawn(db_path.clone(), 0, 0).unwrap();
-        journal.append(Level::Info, "health", "summary1").await.unwrap();
-        journal.append(Level::Warn, "health", "warn1").await.unwrap();
-        journal.append(Level::Error, "stream", "err1").await.unwrap();
+        journal
+            .append(Level::Info, "health", "summary1")
+            .await
+            .unwrap();
+        journal
+            .append(Level::Warn, "health", "warn1")
+            .await
+            .unwrap();
+        journal
+            .append(Level::Error, "stream", "err1")
+            .await
+            .unwrap();
 
         let no_filter = query_recent(&db_path, &JournalFilter::default()).unwrap();
         assert_eq!(no_filter.len(), 3);

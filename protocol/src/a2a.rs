@@ -55,7 +55,10 @@ pub enum TaskState {
 
 impl TaskState {
     pub fn is_terminal(&self) -> bool {
-        matches!(self, Self::Completed | Self::Failed | Self::Canceled | Self::Rejected)
+        matches!(
+            self,
+            Self::Completed | Self::Failed | Self::Canceled | Self::Rejected
+        )
     }
 
     pub fn is_interrupted(&self) -> bool {
@@ -157,7 +160,15 @@ pub struct PushNotificationConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum A2aEvent {
-    TaskStatusUpdate { task_id: TaskId, status: TaskStatus, r#final: bool },
-    TaskArtifactUpdate { task_id: TaskId, artifact: Artifact, append: Option<bool> },
+    TaskStatusUpdate {
+        task_id: TaskId,
+        status: TaskStatus,
+        r#final: bool,
+    },
+    TaskArtifactUpdate {
+        task_id: TaskId,
+        artifact: Artifact,
+        append: Option<bool>,
+    },
     Message(Message),
 }

@@ -36,7 +36,10 @@ impl HttpA2aAgent {
     }
 
     fn agent_card_url(&self) -> String {
-        format!("{}/.well-known/agent.json", self.base_url.trim_end_matches('/'))
+        format!(
+            "{}/.well-known/agent.json",
+            self.base_url.trim_end_matches('/')
+        )
     }
 
     async fn call<P: Serialize, R: for<'de> Deserialize<'de>>(
@@ -63,7 +66,9 @@ impl HttpA2aAgent {
             .map_err(|e| anyhow::anyhow!("A2A HTTP request failed ({method}): {e}"))?
             .json()
             .await
-            .map_err(|e| anyhow::anyhow!("A2A response не парсится как JSON-RPC ({method}): {e}"))?;
+            .map_err(|e| {
+                anyhow::anyhow!("A2A response не парсится как JSON-RPC ({method}): {e}")
+            })?;
 
         match resp {
             JsonRpcResponse::Ok { result, .. } => Ok(result),
@@ -77,8 +82,16 @@ impl HttpA2aAgent {
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum JsonRpcResponse<R> {
-    Ok { #[allow(dead_code)] jsonrpc: String, result: R },
-    Err { #[allow(dead_code)] jsonrpc: String, error: JsonRpcError },
+    Ok {
+        #[allow(dead_code)]
+        jsonrpc: String,
+        result: R,
+    },
+    Err {
+        #[allow(dead_code)]
+        jsonrpc: String,
+        error: JsonRpcError,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -231,7 +244,13 @@ async fn sse_to_a2a_events(
 
 fn uuid_stub() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
-    format!("req-{:x}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos())
+    format!(
+        "req-{:x}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    )
 }
 
 #[cfg(test)]
@@ -267,36 +286,34 @@ mod tests {
         // IMPORTANT: events are serialized via serde_json::to_string(&A2aEvent)
         // — EXACTLY like the prod stream_to_sse. No manual JSON hardcoding:
         // the format comes from the serde attributes of the real types.
-        let app = Router::new().route("/a2a", post(|| async {
-            let working = protocol::a2a::A2aEvent::TaskStatusUpdate {
-                task_id: TaskId("t-1".into()),
-                status: protocol::a2a::TaskStatus {
-                    state: protocol::a2a::TaskState::Working,
-                    message: None,
-                    timestamp: None,
-                },
-                r#final: false,
-            };
-            let completed = protocol::a2a::A2aEvent::TaskStatusUpdate {
-                task_id: TaskId("t-1".into()),
-                status: protocol::a2a::TaskStatus {
-                    state: protocol::a2a::TaskState::Completed,
-                    message: None,
-                    timestamp: None,
-                },
-                r#final: true,
-            };
-            let frame = |ev: &protocol::a2a::A2aEvent| {
-                format!("data: {}\n\n", serde_json::to_string(ev).unwrap())
-            };
-            let sse = format!("{}{}", frame(&working), frame(&completed));
-            (
-                StatusCode::OK,
-                [("content-type", "text/event-stream")],
-                sse,
-            )
-                .into_response()
-        }));
+        let app = Router::new().route(
+            "/a2a",
+            post(|| async {
+                let working = protocol::a2a::A2aEvent::TaskStatusUpdate {
+                    task_id: TaskId("t-1".into()),
+                    status: protocol::a2a::TaskStatus {
+                        state: protocol::a2a::TaskState::Working,
+                        message: None,
+                        timestamp: None,
+                    },
+                    r#final: false,
+                };
+                let completed = protocol::a2a::A2aEvent::TaskStatusUpdate {
+                    task_id: TaskId("t-1".into()),
+                    status: protocol::a2a::TaskStatus {
+                        state: protocol::a2a::TaskState::Completed,
+                        message: None,
+                        timestamp: None,
+                    },
+                    r#final: true,
+                };
+                let frame = |ev: &protocol::a2a::A2aEvent| {
+                    format!("data: {}\n\n", serde_json::to_string(ev).unwrap())
+                };
+                let sse = format!("{}{}", frame(&working), frame(&completed));
+                (StatusCode::OK, [("content-type", "text/event-stream")], sse).into_response()
+            }),
+        );
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -312,9 +329,7 @@ mod tests {
                 state: protocol::a2a::TaskState::Submitted,
                 message: Some(protocol::a2a::Message {
                     role: protocol::a2a::MessageRole::User,
-                    parts: vec![protocol::a2a::Part::Text {
-                        text: "hi".into(),
-                    }],
+                    parts: vec![protocol::a2a::Part::Text { text: "hi".into() }],
                     message_id: None,
                 }),
                 timestamp: None,
@@ -333,12 +348,18 @@ mod tests {
             .await
             .expect("первое событие приходит")
             .expect("канал не закрыт");
-        assert!(matches!(first, protocol::a2a::A2aEvent::TaskStatusUpdate { r#final: false, .. }));
+        assert!(matches!(
+            first,
+            protocol::a2a::A2aEvent::TaskStatusUpdate { r#final: false, .. }
+        ));
 
         let second = tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await
             .expect("второе событие приходит")
             .expect("канал не закрыт");
-        assert!(matches!(second, protocol::a2a::A2aEvent::TaskStatusUpdate { r#final: true, .. }));
+        assert!(matches!(
+            second,
+            protocol::a2a::A2aEvent::TaskStatusUpdate { r#final: true, .. }
+        ));
     }
 }

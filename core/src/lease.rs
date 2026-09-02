@@ -36,7 +36,10 @@ impl TurnLease {
     ) -> Result<TurnGuard, TurnLeaseTimeoutError> {
         let per_session_lock = {
             let mut locks = self.locks.lock().await;
-            locks.entry(session.clone()).or_insert_with(|| Arc::new(Mutex::new(()))).clone()
+            locks
+                .entry(session.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
         };
 
         match timeout(wait_budget, per_session_lock.lock_owned()).await {
@@ -74,7 +77,10 @@ mod tests {
         let lease = TurnLease::default();
         let session = SessionId("s-1".into());
 
-        let guard = lease.acquire(&session, Duration::from_secs(1)).await.unwrap();
+        let guard = lease
+            .acquire(&session, Duration::from_secs(1))
+            .await
+            .unwrap();
         let start = Instant::now();
 
         let lease_ref = &lease;
@@ -98,7 +104,10 @@ mod tests {
         let lease = TurnLease::default();
         let session = SessionId("s-2".into());
 
-        let _held = lease.acquire(&session, Duration::from_secs(1)).await.unwrap();
+        let _held = lease
+            .acquire(&session, Duration::from_secs(1))
+            .await
+            .unwrap();
         let result = lease.acquire(&session, Duration::from_millis(50)).await;
 
         // Fail-closed: an error, not a panic and not a silent pass into the critical section.
@@ -108,8 +117,13 @@ mod tests {
     #[tokio::test]
     async fn different_sessions_do_not_block_each_other() {
         let lease = TurnLease::default();
-        let _a = lease.acquire(&SessionId("a".into()), Duration::from_millis(50)).await.unwrap();
-        let b = lease.acquire(&SessionId("b".into()), Duration::from_millis(50)).await;
+        let _a = lease
+            .acquire(&SessionId("a".into()), Duration::from_millis(50))
+            .await
+            .unwrap();
+        let b = lease
+            .acquire(&SessionId("b".into()), Duration::from_millis(50))
+            .await;
         assert!(b.is_ok());
     }
 
@@ -117,7 +131,12 @@ mod tests {
     async fn forget_removes_session_entry() {
         let lease = TurnLease::default();
         let session = SessionId("s-3".into());
-        drop(lease.acquire(&session, Duration::from_millis(50)).await.unwrap());
+        drop(
+            lease
+                .acquire(&session, Duration::from_millis(50))
+                .await
+                .unwrap(),
+        );
         lease.forget(&session).await;
         assert!(lease.locks.lock().await.is_empty());
     }

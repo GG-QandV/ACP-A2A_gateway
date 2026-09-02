@@ -25,9 +25,13 @@ fn repo_config_yaml() -> String {
 fn event_log_section_parses_from_buffer_config() {
     let yaml = repo_config_yaml();
     let value: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("YAML парсится");
-    let event_log: EventLogConfig =
-        serde_yaml::from_value(value.get("event_log").cloned().expect("секция event_log есть"))
-            .expect("EventLogConfig парсится");
+    let event_log: EventLogConfig = serde_yaml::from_value(
+        value
+            .get("event_log")
+            .cloned()
+            .expect("секция event_log есть"),
+    )
+    .expect("EventLogConfig парсится");
     assert!(event_log.enabled, "event_log должен быть включён");
     assert_eq!(event_log.storage_backend, "sqlite");
     assert_eq!(
@@ -41,9 +45,13 @@ fn event_log_section_parses_from_buffer_config() {
 fn task_store_section_parses_from_buffer_config() {
     let yaml = repo_config_yaml();
     let value: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("YAML парсится");
-    let task_store: TaskStoreConfig =
-        serde_yaml::from_value(value.get("task_store").cloned().expect("секция task_store есть"))
-            .expect("TaskStoreConfig парсится");
+    let task_store: TaskStoreConfig = serde_yaml::from_value(
+        value
+            .get("task_store")
+            .cloned()
+            .expect("секция task_store есть"),
+    )
+    .expect("TaskStoreConfig парсится");
     assert!(task_store.enabled, "task_store должен быть включён");
     assert_eq!(task_store.storage_backend, "sqlite");
     assert_eq!(

@@ -13,9 +13,7 @@
 //! Task/Message serialization unchanged for semantic clients (regression risk
 //! of editing a2a.rs directly — otherwise message/send starts replying differently).
 
-use crate::a2a::{
-    Artifact, FilePart, Message, MessageRole, Part, Task, TaskState,
-};
+use crate::a2a::{Artifact, FilePart, Message, MessageRole, Part, Task, TaskState};
 use serde_json::{json, Value};
 
 #[derive(Debug, thiserror::Error)]
@@ -51,7 +49,9 @@ fn normalize_part(raw: &Value) -> Result<Part, SdkCompatError> {
     }
 
     if let Some(text) = raw.get("text").and_then(Value::as_str) {
-        return Ok(Part::Text { text: text.to_string() });
+        return Ok(Part::Text {
+            text: text.to_string(),
+        });
     }
 
     if raw.get("url").is_some() || raw.get("raw").is_some() {
@@ -63,7 +63,11 @@ fn normalize_part(raw: &Value) -> Result<Part, SdkCompatError> {
             .and_then(Value::as_str)
             .map(str::to_string);
         return Ok(Part::File {
-            file: FilePart { uri, bytes, mime_type },
+            file: FilePart {
+                uri,
+                bytes,
+                mime_type,
+            },
         });
     }
 
@@ -92,7 +96,11 @@ pub fn normalize_message(raw: &Value) -> Result<Message, SdkCompatError> {
         .and_then(Value::as_str)
         .map(str::to_string);
 
-    Ok(Message { role, parts, message_id })
+    Ok(Message {
+        role,
+        parts,
+        message_id,
+    })
 }
 
 fn task_state_to_sdk(state: TaskState) -> &'static str {
@@ -214,7 +222,10 @@ mod compat_tests {
     #[test]
     fn normalize_message_rejects_unknown_role() {
         let raw = json!({ "role": "typo", "parts": [] });
-        assert!(matches!(normalize_message(&raw), Err(SdkCompatError::UnknownRole)));
+        assert!(matches!(
+            normalize_message(&raw),
+            Err(SdkCompatError::UnknownRole)
+        ));
     }
 
     #[test]
@@ -222,7 +233,11 @@ mod compat_tests {
         let task = Task {
             id: TaskId("task-1".into()),
             context_id: ContextId("ctx-1".into()),
-            status: TaskStatus { state: TaskState::Canceled, message: None, timestamp: None },
+            status: TaskStatus {
+                state: TaskState::Canceled,
+                message: None,
+                timestamp: None,
+            },
             history: None,
             artifacts: None,
             metadata: None,
@@ -239,13 +254,19 @@ mod compat_tests {
         let task = Task {
             id: TaskId("task-2".into()),
             context_id: ContextId("ctx-2".into()),
-            status: TaskStatus { state: TaskState::Completed, message: None, timestamp: None },
+            status: TaskStatus {
+                state: TaskState::Completed,
+                message: None,
+                timestamp: None,
+            },
             history: None,
             artifacts: Some(vec![Artifact {
                 artifact_id: "art-1".into(),
                 name: Some("response".into()),
                 description: None,
-                parts: vec![Part::Text { text: "pong".into() }],
+                parts: vec![Part::Text {
+                    text: "pong".into(),
+                }],
                 metadata: None,
             }]),
             metadata: None,
@@ -254,6 +275,8 @@ mod compat_tests {
         assert_eq!(rendered["task"]["status"]["state"], "TASK_STATE_COMPLETED");
         assert_eq!(rendered["task"]["artifacts"][0]["parts"][0]["text"], "pong");
         // The SDK part must not contain "kind".
-        assert!(rendered["task"]["artifacts"][0]["parts"][0].get("kind").is_none());
+        assert!(rendered["task"]["artifacts"][0]["parts"][0]
+            .get("kind")
+            .is_none());
     }
 }

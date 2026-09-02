@@ -47,7 +47,8 @@ pub fn run_journal(args: &[String]) -> anyhow::Result<()> {
                 i += 1;
             }
             "--level" => {
-                let v = value.ok_or_else(|| anyhow::anyhow!("--level: expected info|warn|error"))?;
+                let v =
+                    value.ok_or_else(|| anyhow::anyhow!("--level: expected info|warn|error"))?;
                 if !matches!(v, "info" | "warn" | "error") {
                     anyhow::bail!("--level: expected info|warn|error, got {v}");
                 }
@@ -127,8 +128,7 @@ pub fn run_approvals(command: &str, args: &[String]) -> anyhow::Result<()> {
             Ok(())
         }
         "--approve" | "--reject" => {
-            let agent = name
-                .ok_or_else(|| anyhow::anyhow!("{command}: expected agent name"))?;
+            let agent = name.ok_or_else(|| anyhow::anyhow!("{command}: expected agent name"))?;
             let status = if command == "--approve" {
                 Status::Approved
             } else {
@@ -154,7 +154,11 @@ fn print_approvals(list: &[ApprovalRecord]) {
         id_w = id_w.max(r.agent_id.len());
         st_w = st_w.max(r.status.as_str().len());
     }
-    let fp_w = list.iter().map(|r| r.fingerprint.len().max(11)).max().unwrap_or(11);
+    let fp_w = list
+        .iter()
+        .map(|r| r.fingerprint.len().max(11))
+        .max()
+        .unwrap_or(11);
     let time_w = "YYYY-MM-DD HH:MM:SS UTC".len();
 
     let sep = |w: usize| "-".repeat(w);

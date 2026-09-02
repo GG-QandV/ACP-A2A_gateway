@@ -50,7 +50,11 @@ pub fn run(output: Option<String>) -> anyhow::Result<()> {
     let mut agents: Vec<AgentSpec> = Vec::new();
     for i in 0..agent_count {
         println!("\n  Agent #{}", i + 1);
-        let name = ask_str(&mut input, "  Agent id (unique)", &format!("agent-{}", i + 1));
+        let name = ask_str(
+            &mut input,
+            "  Agent id (unique)",
+            &format!("agent-{}", i + 1),
+        );
         let transport = ask_str(&mut input, "  Transport (stdio)", "stdio");
         let command_raw = ask_str(
             &mut input,
@@ -79,28 +83,35 @@ pub fn run(output: Option<String>) -> anyhow::Result<()> {
 
     // --- Logging ---------------------------------------------------------
     println!("\n# Logging");
-    let log_level = ask_str(&mut input, "Log level (error/warn/info/debug/trace)", "info");
+    let log_level = ask_str(
+        &mut input,
+        "Log level (error/warn/info/debug/trace)",
+        "info",
+    );
     let log_output = ask_str(&mut input, "Log output (stdout/file)", "stdout");
     let (log_path, log_max_file_mb, log_max_files, log_max_total_mb) = if log_output == "file" {
-        let path = ask_str(&mut input, "Log file path", "/var/log/acp-a2a-gateway/gateway.log");
+        let path = ask_str(
+            &mut input,
+            "Log file path",
+            "/var/log/acp-a2a-gateway/gateway.log",
+        );
         let max_file = ask_num(&mut input, "Max file size (MB)", 100);
         let max_files = ask_num(&mut input, "Max file count", 10);
         let max_total = ask_num(&mut input, "Max total size (MB)", 1000);
         (path, max_file, max_files, max_total)
     } else {
-        (
-            String::new(),
-            0,
-            0,
-            0,
-        )
+        (String::new(), 0, 0, 0)
     };
 
     // --- Buffer (Phase 1): event log --------------------------------------
     println!("\n# Event buffer (durable stream buffer, source of truth for resubscribe)");
     let event_log_enabled = ask_bool(&mut input, "Enable durable event buffer?", true);
     let (event_log_path, event_log_max_mb) = if event_log_enabled {
-        let path = ask_str(&mut input, "Event log database path", "/tmp/gateway/event_log.db");
+        let path = ask_str(
+            &mut input,
+            "Event log database path",
+            "/tmp/gateway/event_log.db",
+        );
         let max_mb = ask_num(&mut input, "Event log max size (MB)", 100);
         (path, max_mb)
     } else {
@@ -111,7 +122,11 @@ pub fn run(output: Option<String>) -> anyhow::Result<()> {
     println!("\n# Task store backend (sqlite replaces file storage)");
     let task_store_enabled = ask_bool(&mut input, "Enable sqlite task store?", true);
     let (task_store_path, task_store_max_mb) = if task_store_enabled {
-        let path = ask_str(&mut input, "Task store database path", "/tmp/gateway/task_store.db");
+        let path = ask_str(
+            &mut input,
+            "Task store database path",
+            "/tmp/gateway/task_store.db",
+        );
         let max_mb = ask_num(&mut input, "Task store max size (MB)", 500);
         (path, max_mb)
     } else {
@@ -122,9 +137,17 @@ pub fn run(output: Option<String>) -> anyhow::Result<()> {
     println!("\n# Journal (durable event log for health alerts, disconnects, approvals)");
     let journal_enabled = ask_bool(&mut input, "Enable journal?", true);
     let (journal_path, journal_max_mb, journal_retention_days) = if journal_enabled {
-        let path = ask_str(&mut input, "Journal database path", "/tmp/gateway/journal.db");
+        let path = ask_str(
+            &mut input,
+            "Journal database path",
+            "/tmp/gateway/journal.db",
+        );
         let max_mb = ask_num(&mut input, "Journal max size (MB)", 100);
-        let days = ask_num(&mut input, "Journal retention (days, 0 = keep everything)", 30);
+        let days = ask_num(
+            &mut input,
+            "Journal retention (days, 0 = keep everything)",
+            30,
+        );
         (path, max_mb, days)
     } else {
         (String::new(), 0, 0)
@@ -188,8 +211,7 @@ pub fn run(output: Option<String>) -> anyhow::Result<()> {
         &approvals_path,
     );
 
-    std::fs::write(&out_path, &yaml)
-        .map_err(|e| anyhow::anyhow!("failed to write config: {e}"))?;
+    std::fs::write(&out_path, &yaml).map_err(|e| anyhow::anyhow!("failed to write config: {e}"))?;
 
     println!("\n------------------------------------------------------------");
     println!(" Config written to {}", out_path);
@@ -267,7 +289,11 @@ fn ask_bool(input: &mut impl BufRead, label: &str, default: bool) -> bool {
 
 fn ask_tokens(input: &mut impl BufRead) -> Vec<String> {
     loop {
-        let v = prompt(input, "Auth tokens (comma separated, at least one)", "t-dev-local-001");
+        let v = prompt(
+            input,
+            "Auth tokens (comma separated, at least one)",
+            "t-dev-local-001",
+        );
         let tokens: Vec<String> = v
             .split(',')
             .map(|s| s.trim().to_string())
@@ -345,8 +371,12 @@ fn render(
 
     s.push_str(&format!("\ntask_store_dir: \"{task_store_dir}\"\n"));
     s.push_str(&format!("task_retention_days: {task_retention_days}\n"));
-    s.push_str(&format!("turn_lease_timeout_secs: {turn_lease_timeout_secs}\n"));
-    s.push_str(&format!("agent_call_timeout_secs: {agent_call_timeout_secs}\n"));
+    s.push_str(&format!(
+        "turn_lease_timeout_secs: {turn_lease_timeout_secs}\n"
+    ));
+    s.push_str(&format!(
+        "agent_call_timeout_secs: {agent_call_timeout_secs}\n"
+    ));
 
     s.push_str("\nlogging:\n");
     s.push_str(&format!("  level: {log_level}\n"));

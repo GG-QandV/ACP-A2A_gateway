@@ -56,10 +56,7 @@ const SIZE_CHECK_EVERY_N_APPENDS: u64 = 64;
 
 impl EventLog {
     /// Opens the DB and spins up the writer task. `max_size_mb == 0` = no limit.
-    pub fn spawn(
-        path: PathBuf,
-        max_size_mb: u64,
-    ) -> anyhow::Result<Arc<Self>> {
+    pub fn spawn(path: PathBuf, max_size_mb: u64) -> anyhow::Result<Arc<Self>> {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent)
@@ -106,7 +103,8 @@ impl EventLog {
             })
             .await
             .map_err(|_| anyhow::anyhow!("event_log: writer отключился"))?;
-        rx.await.map_err(|_| anyhow::anyhow!("event_log: writer не ответил"))?
+        rx.await
+            .map_err(|_| anyhow::anyhow!("event_log: writer не ответил"))?
     }
 
     /// Returns events with seq > after_seq, in ascending seq order.
@@ -126,7 +124,8 @@ impl EventLog {
             })
             .await
             .map_err(|_| anyhow::anyhow!("event_log: writer отключился"))?;
-        rx.await.map_err(|_| anyhow::anyhow!("event_log: writer не ответил"))?
+        rx.await
+            .map_err(|_| anyhow::anyhow!("event_log: writer не ответил"))?
     }
 
     /// The last seq for a task (0 if there are no events). The client asks
@@ -140,7 +139,8 @@ impl EventLog {
             })
             .await
             .map_err(|_| anyhow::anyhow!("event_log: writer отключился"))?;
-        rx.await.map_err(|_| anyhow::anyhow!("event_log: writer не ответил"))?
+        rx.await
+            .map_err(|_| anyhow::anyhow!("event_log: writer не ответил"))?
     }
 }
 

@@ -2,26 +2,29 @@
 //! Types and (de)serialization for ACP and A2A. Knows nothing about Reply<T>,
 //! streaming or conversion — protocol structures only, "as in the canon".
 
-pub mod acp;
 pub mod a2a;
 pub mod a2a_sdk_compat;
+pub mod acp;
 
-pub use acp::*;
 pub use a2a::*;
+pub use acp::*;
 
 #[cfg(test)]
 mod tests {
-    use crate::acp::{ContentBlock, InitializeResponse as PromptResponseless, PromptResponse, StopReason};
+    use crate::acp::{
+        ContentBlock, InitializeResponse as PromptResponseless, PromptResponse, StopReason,
+    };
 
     /// Test from docs/03-dev-guide-testing.md — missing in the repo.
     #[test]
     fn content_block_roundtrip() {
-        let cb = ContentBlock::Text { text: "hello".into() };
+        let cb = ContentBlock::Text {
+            text: "hello".into(),
+        };
         let json = serde_json::to_string(&cb).unwrap();
         let restored: ContentBlock = serde_json::from_str(&json).unwrap();
         assert!(matches!(restored, ContentBlock::Text { text } if text == "hello"));
     }
-
 
     /// Regression for a live bug: claurst answers protocolVersion as a number.
     /// The field used to be String, and the handshake failed on every spawn.
@@ -66,7 +69,10 @@ mod tests {
             client_info: None,
         };
         let json = serde_json::to_string(&req).unwrap();
-        assert!(json.contains(r#""protocolVersion":1"#), "версия должна уходить числом: {json}");
+        assert!(
+            json.contains(r#""protocolVersion":1"#),
+            "версия должна уходить числом: {json}"
+        );
         assert!(!json.contains(r#""protocolVersion":"1""#));
     }
 
