@@ -4,6 +4,20 @@ A gateway layer between **ACP agents** (claurst, hermes, opencode) and **A2A cli
 
 **Version:** 1.1.2 — release notes in [CHANGELOG.md](CHANGELOG.md). The version lives once in the root `Cargo.toml` (`[workspace.package]`) and is inherited by the `protocol`, `gateway-core` and `gatewayd` crates.
 
+## Install and run
+
+Prebuilt binaries for Linux, Windows and macOS (arm64 / Intel / universal) are attached to the
+[release page](https://github.com/GG-QandV/ACP-A2A_gateway/releases/tag/v1.1.2), each with a
+`.sha256` sidecar.
+
+```bash
+cp config.example.yaml config.yaml      # then edit: tokens, agents, paths
+./gatewayd config.yaml                  # Windows: gatewayd.exe config.yaml
+```
+
+Step-by-step guides, including how to build from source and how to run under WSL2:
+**English** [INSTALL.md](INSTALL.md) · **русский** [INSTALL-ru.md](INSTALL-ru.md) · **українська** [INSTALL-uk.md](INSTALL-uk.md).
+
 ## Directions
 
 | # | Incoming side | Agent | Transport | Port/route |
