@@ -112,6 +112,8 @@ jobs:
       run:
         shell: bash
     steps:
+      - uses: actions/checkout@v4
+
       - name: Resolve tag
         id: tag
         run: |
@@ -125,7 +127,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.tag.outputs.tag }}
         run: |
-          gh release download "$TAG" -p "gatewayd-${TAG}-darwin-arm64" -p "gatewayd-${TAG}-darwin-x86_64" -D dl
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p "gatewayd-${TAG}-darwin-arm64" -p "gatewayd-${TAG}-darwin-x86_64" -D dl
       - name: lipo + upload
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -140,7 +142,7 @@ jobs:
           p = sys.argv[1]
           print(f"{hashlib.sha256(open(p,'rb').read()).hexdigest()}  {p}")
           PY
-          gh release upload "$TAG" "$out" "$out.sha256" --clobber
+          gh release upload -R "$GITHUB_REPOSITORY" "$TAG" "$out" "$out.sha256" --clobber
 
   summary:
     name: asset summary
@@ -157,6 +159,6 @@ jobs:
         run: |
           tag="${{ inputs.tag || github.ref_name }}"
           echo "### Assets on \`$tag\`" >> "$GITHUB_STEP_SUMMARY"
-          gh release view "$tag" --json assets,name,isDraft \
+          gh release view "$tag" -R "$GITHUB_REPOSITORY" --json assets,name,isDraft \
             --jq '"release: \(.name) (draft=\(.isDraft))", (.assets[] | "- `\(.name)` — \(.size) bytes")' \
             >> "$GITHUB_STEP_SUMMARY" || true
