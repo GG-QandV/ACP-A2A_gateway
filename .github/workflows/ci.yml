@@ -1,9 +1,9 @@
 name: ci
 
+# Manual runs only (owner's decision 2026-10-24: Actions quota). Start it from the
+# Actions tab or `gh workflow run ci.yml`; pushes and pull requests do not trigger it.
 on:
-  push:
-    branches: [main]
-  pull_request:
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
