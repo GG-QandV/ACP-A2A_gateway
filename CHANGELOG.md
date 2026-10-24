@@ -33,6 +33,8 @@ editing that single line (plus `Cargo.lock` on the next `cargo check`), tagging
   (unbiased `select!` in the stdio stream relay); queued chunks now always precede the terminal.
 
 ### Changed
+- `ci.yml` runs only on manual dispatch (`workflow_dispatch`); pushes and pull requests no
+  longer trigger it.
 - The whole workspace was formatted with `cargo fmt --all` — the repository had never passed
   `cargo fmt --check` before (22 files), which would have failed the new Format gate at once.
 - `AGENTS.md` and `CLAUDE.md` are no longer tracked in the repository; their vetted versions
