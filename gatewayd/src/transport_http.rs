@@ -341,6 +341,15 @@ async fn rpc_handler(
     // token; otherwise the adapter can't tell one client from another.
     let owner = Owner::from_token(&token);
 
+    // ADDED: non-blocking message/send (`configuration.blocking: false`):
+    // answer at once with the task in state `working`, run the turn in the
+    // background. The client collects the result via tasks/get or
+    // tasks/resubscribe, so no connection has to stay open while the agent
+    // thinks (proxies cut a response that sends no bytes for ~30 s).
+    if is_non_blocking_send(&request) {
+        return start_detached_send(&state, &agent_id, adapter, owner, request).await;
+    }
+
     let result = dispatch_a2a_method(
         &adapter,
         owner,
@@ -388,6 +397,165 @@ async fn rpc_handler(
             &e.to_string(),
         ),
         Err(e) => rpc_error(request.id, StatusCode::OK, -32000, &e.to_string()),
+    }
+}
+
+/// `message/send` / `SendMessage` with `params.configuration.blocking == false`.
+/// The A2A default is blocking, so an absent flag keeps the old behavior.
+fn is_non_blocking_send(request: &JsonRpcRequest) -> bool {
+    matches!(request.method.as_str(), "message/send" | "SendMessage")
+        && request
+            .params
+            .get("configuration")
+            .and_then(|c| c.get("blocking"))
+            .and_then(Value::as_bool)
+            == Some(false)
+}
+
+/// Non-blocking send: record the task as `working`, hand the turn to a
+/// background task and return the task at once. The background task holds a
+/// stream slot of the agent (same limit as a live SSE stream), relays events
+/// into the event_log (tasks/resubscribe) and stores the final task
+/// (tasks/get) with the agent's text gathered from the stream.
+async fn start_detached_send(
+    state: &Arc<HttpState>,
+    agent_id: &str,
+    adapter: Arc<AcpAsA2a<SupervisedStdioAgent>>,
+    owner: Owner,
+    request: JsonRpcRequest,
+) -> axum::response::Response {
+    let sdk = request.method == "SendMessage";
+    let built = if sdk {
+        build_task_from_send_params_sdk(&request.params)
+    } else {
+        build_task_from_send_params(&request.params)
+    };
+    let task = match built {
+        Ok(t) => t,
+        Err(e) => return rpc_error(request.id, StatusCode::OK, -32602, &e.to_string()),
+    };
+    let permit = match state.registry.try_acquire_stream(agent_id) {
+        Ok(p) => p,
+        Err(e) => {
+            return rpc_error(
+                request.id,
+                StatusCode::SERVICE_UNAVAILABLE,
+                -32000,
+                &e.to_string(),
+            )
+        }
+    };
+
+    let mut working = task.clone();
+    working.status.state = protocol::a2a::TaskState::Working;
+    working.status.message = None;
+    if let Err(e) = adapter.record_task_as(owner, &working).await {
+        return rpc_error(request.id, StatusCode::OK, -32000, &e.to_string());
+    }
+
+    let event_log = state.event_log.clone();
+    let hub = state.stream_hub.clone();
+    tokio::spawn(async move {
+        let _permit = permit;
+        let final_task = run_detached_turn(&adapter, owner, task, event_log, hub).await;
+        if let Err(e) = adapter.record_task_as(owner, &final_task).await {
+            tracing::error!(task_id = %final_task.id.0, error = %e, "detached send: final task not stored");
+        }
+    });
+
+    let rendered = if sdk {
+        render_task_sdk(&working)
+    } else {
+        match serde_json::to_value(&working) {
+            Ok(v) => v,
+            Err(e) => return rpc_error(request.id, StatusCode::OK, -32000, &e.to_string()),
+        }
+    };
+    Json(json!({ "jsonrpc": "2.0", "id": request.id, "result": rendered })).into_response()
+}
+
+/// Runs one turn to its end and returns the task to store: the adapter's
+/// own task for a non-streaming reply, a task built from the stream
+/// otherwise, `failed` with the error text if the turn could not run.
+async fn run_detached_turn(
+    adapter: &Arc<AcpAsA2a<SupervisedStdioAgent>>,
+    owner: Owner,
+    task: Task,
+    event_log: Option<Arc<EventLog>>,
+    hub: Arc<StreamHub>,
+) -> Task {
+    use protocol::a2a::{A2aEvent, Message, MessageRole, Part, TaskState, TaskStatus};
+
+    let failed = |base: &Task, text: String| Task {
+        id: base.id.clone(),
+        context_id: base.context_id.clone(),
+        status: TaskStatus {
+            state: TaskState::Failed,
+            message: Some(Message {
+                role: MessageRole::Agent,
+                parts: vec![Part::Text { text }],
+                message_id: None,
+            }),
+            timestamp: None,
+        },
+        history: None,
+        artifacts: None,
+        metadata: None,
+    };
+
+    let base = task.clone();
+    let rx = match adapter.send_task_as(owner, task).await {
+        Ok(gateway_core::Reply::Complete(done)) => return done,
+        Ok(gateway_core::Reply::Streaming(rx)) => rx,
+        Err(e) => return failed(&base, e.to_string()),
+    };
+
+    let mut relay = spawn_stream_relay(rx, event_log, hub);
+    let mut text = String::new();
+    let mut state = None;
+    while let Some(item) = relay.recv().await {
+        if let A2aEvent::TaskStatusUpdate {
+            status, r#final, ..
+        } = item.event
+        {
+            if let Some(message) = status.message {
+                for part in message.parts {
+                    if let Part::Text { text: t } = part {
+                        text.push_str(&t);
+                    }
+                }
+            }
+            if r#final {
+                state = Some(status.state);
+            }
+        }
+    }
+
+    let Some(state) = state else {
+        return failed(&base, "stream closed before the final event".to_string());
+    };
+    let parts = vec![Part::Text { text }];
+    Task {
+        id: base.id.clone(),
+        context_id: base.context_id.clone(),
+        status: TaskStatus {
+            state,
+            message: Some(Message {
+                role: MessageRole::Agent,
+                parts: parts.clone(),
+                message_id: None,
+            }),
+            timestamp: None,
+        },
+        history: None,
+        artifacts: Some(vec![protocol::a2a::Artifact {
+            artifact_id: format!("{}-response", base.id.0),
+            name: Some("response".into()),
+            description: None,
+            parts,
+            metadata: None,
+        }]),
+        metadata: None,
     }
 }
 

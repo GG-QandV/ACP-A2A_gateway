@@ -18,10 +18,19 @@ editing that single line (plus `Cargo.lock` on the next `cargo check`), tagging
 - `scripts/publish-docs.sh`: publishes `AGENTS.md` / `CLAUDE.md` into `main` from the
   out-of-repo overlay, then re-applies `skip-worktree` so indexing-tool noise stays invisible.
 
+### Added
+- Non-blocking `message/send` / `SendMessage`: with `params.configuration.blocking: false` the
+  gateway answers at once with the task in state `working` and runs the turn in the background;
+  `tasks/get` serves the final task with the agent's text, `tasks/resubscribe` the events. An
+  absent flag keeps the old blocking behavior.
+
 ### Fixed
 - SSE responses (`message/send` streams and `tasks/resubscribe`) now send a `: keep-alive`
-  comment every 15 s while the agent is silent. A long-thinking agent no longer leaves the
-  response without bytes for tens of seconds, which tunnels and egress proxies cut with a 502.
+  comment every 15 s while the agent is silent **between events**. The response headers still
+  wait for the agent's first event, so a proxy that cuts a response silent for ~30 s before the
+  first event is handled by non-blocking send (above), not by keep-alive.
+- The last agent chunk was dropped at random when the final response arrived together with it
+  (unbiased `select!` in the stdio stream relay); queued chunks now always precede the terminal.
 
 ### Changed
 - The whole workspace was formatted with `cargo fmt --all` — the repository had never passed

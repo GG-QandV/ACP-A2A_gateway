@@ -77,6 +77,10 @@ curl -s -X POST http://127.0.0.1:8348/agents/<agent_id>/rpc \
 - **Продовження розмови**: `contextId` кладеться в `message.contextId`
   (або `params.contextId`), а **НЕ** в `configuration` — configuration його не читає.
 - Без `contextId` → шлюз починає нову розмову.
+- **Довге завдання**: додайте в `params` `"configuration": {"blocking": false}`. Відповідь
+  приходить одразу з `result.id` і `status.state: "working"`; опитуйте `tasks/get` з цим `id`,
+  доки стан не перестане бути `working`; текст агента — у `result.status.message.parts[0].text`.
+  Потрібно, коли проксі між вами і шлюзом обриває відповідь, що мовчить десятки секунд.
 - Чужий `contextId` → помилка `contextId принадлежит другому клиенту`
   (ізоляція за токенами, IDOR закритий).
 - Неіснуючий `contextId` → не відхиляється, створюється новий (за задумом).
