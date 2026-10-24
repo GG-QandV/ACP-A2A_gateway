@@ -18,6 +18,11 @@ editing that single line (plus `Cargo.lock` on the next `cargo check`), tagging
 - `scripts/publish-docs.sh`: publishes `AGENTS.md` / `CLAUDE.md` into `main` from the
   out-of-repo overlay, then re-applies `skip-worktree` so indexing-tool noise stays invisible.
 
+### Fixed
+- SSE responses (`message/send` streams and `tasks/resubscribe`) now send a `: keep-alive`
+  comment every 15 s while the agent is silent. A long-thinking agent no longer leaves the
+  response without bytes for tens of seconds, which tunnels and egress proxies cut with a 502.
+
 ### Changed
 - The whole workspace was formatted with `cargo fmt --all` — the repository had never passed
   `cargo fmt --check` before (22 files), which would have failed the new Format gate at once.

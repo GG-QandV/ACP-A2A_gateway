@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use axum::extract::{Path as AxumPath, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::sse::{Event, Sse};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Json};
 use axum::routing::{get, post};
 use axum::Router;
@@ -356,7 +356,9 @@ async fn rpc_handler(
         // ADDED (Phase 3): tasks/resubscribe renders as an SSE stream
         // (history + live) — the client sees the same id:s as in the live stream,
         // and can continue after the last one received.
-        Ok(DispatchResult::Resubscribe(stream)) => Sse::new(stream).into_response(),
+        Ok(DispatchResult::Resubscribe(stream)) => Sse::new(stream)
+            .keep_alive(sse_keep_alive())
+            .into_response(),
         // ADDED (task D): the streaming response renders as SSE,
         // not as a JSON-RPC envelope — the client reads an A2aEvent stream.
         // ADDED (Part 2, task A): parallel-stream limit —
@@ -633,7 +635,19 @@ fn stream_to_sse(
         }
         Ok(ev)
     });
-    Sse::new(stream)
+    Sse::new(stream).keep_alive(sse_keep_alive())
+}
+
+/// Period of SSE comment lines (`: keep-alive`) on a stream with no events.
+/// An agent may think for minutes before its first chunk; proxies between
+/// the client and the gateway (tunnels, egress proxies) drop a response that
+/// sends no bytes for tens of seconds. SSE clients ignore comment lines.
+const SSE_KEEP_ALIVE_SECS: u64 = 15;
+
+fn sse_keep_alive() -> KeepAlive {
+    KeepAlive::new()
+        .interval(std::time::Duration::from_secs(SSE_KEEP_ALIVE_SECS))
+        .text("keep-alive")
 }
 
 /// task_id from an A2aEvent for persistence into event_log. Message carries no
