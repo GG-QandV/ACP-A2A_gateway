@@ -77,6 +77,10 @@ curl -s -X POST http://127.0.0.1:8348/agents/<agent_id>/rpc \
 - **Продолжение разговора**: `contextId` кладётся в `message.contextId`
   (или `params.contextId`), **НЕ** в `configuration` — конфигурация его не читает.
 - Без `contextId` → гатевей заводит новый разговор.
+- **Долгая задача**: добавьте в `params` `"configuration": {"blocking": false}`. Ответ приходит
+  сразу с `result.id` и `status.state: "working"`; опрашивайте `tasks/get` с этим `id`, пока
+  состояние не перестанет быть `working`; текст агента — в `result.status.message.parts[0].text`.
+  Нужно, когда прокси между вами и гатевеем рвёт ответ, молчащий десятки секунд.
 - Чужой существующий `contextId` → ошибка `contextId принадлежит другому клиенту`
   (изоляция между токенами, IDOR закрыт).
 - Несуществующий `contextId` → не отклоняется, заводится заново (так задумано).

@@ -79,6 +79,10 @@ curl -s -X POST http://127.0.0.1:8348/agents/<agent_id>/rpc \
 - **Continuing a conversation**: `contextId` goes into `message.contextId`
   (or `params.contextId`), **NOT** into `configuration` — configuration does not read it.
 - Without `contextId` → the gateway starts a new conversation.
+- **Long task**: add `"configuration": {"blocking": false}` to `params`. The response comes at
+  once with `result.id` and `status.state: "working"`; poll `tasks/get` with that `id` until the
+  state is not `working`; the agent's text is in `result.status.message.parts[0].text`. Use it when
+  a proxy between you and the gateway cuts responses that stay silent for tens of seconds.
 - Another client's existing `contextId` → error `contextId принадлежит другому клиенту`
   (isolation between tokens, IDOR closed).
 - A nonexistent `contextId` → not rejected, a new one is created (by design).

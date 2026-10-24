@@ -344,6 +344,15 @@ impl<T: AcpAgent> AcpAsA2a<T> {
         Ok(stored.task)
     }
 
+    /// Store a task on behalf of its owner. Used by the transport for
+    /// non-blocking `message/send` (`configuration.blocking: false`): the
+    /// task is recorded as `working` before the turn starts and replaced by
+    /// the final state when the background turn ends, so `tasks/get` can
+    /// serve it in between.
+    pub async fn record_task_as(&self, owner: Owner, task: &Task) -> anyhow::Result<()> {
+        self.tasks.save(task, owner).await
+    }
+
     /// Cancel with an owner check. The session of the conversation that owns
     /// the task is cancelled, not the adapter's 'current' session.
     pub async fn cancel_task_as(&self, owner: Owner, id: TaskId) -> anyhow::Result<Task> {

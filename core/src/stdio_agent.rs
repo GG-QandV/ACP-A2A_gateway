@@ -398,7 +398,12 @@ impl AcpAgent for StdioAcpAgent {
                     async move {
                         let mut last_chunks = 0usize;
                         loop {
+                            // FIXED: biased, chunk branch first — the reader task
+                            // forwards a chunk before the final response that follows
+                            // it on stdout, so when both are ready the chunk must win;
+                            // an unbiased select dropped the last chunk at random.
                             tokio::select! {
+                                biased;
                                 chunk = rx.recv() => {
                                     match chunk {
                                         Some(c) => {
@@ -411,6 +416,13 @@ impl AcpAgent for StdioAcpAgent {
                                     }
                                 }
                                 resp = &mut resp_rx => {
+                                    // Chunks already queued belong before the terminal.
+                                    while let Ok(c) = rx.try_recv() {
+                                        last_chunks += 1;
+                                        if out_tx.send(c).is_err() {
+                                            break;
+                                        }
+                                    }
                                     let terminal = match resp {
                                         Ok(Ok(value)) => serde_json::from_value::<PromptResponse>(value)
                                             .map_err(|e| format!("bad PromptResponse: {e}"))
