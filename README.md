@@ -2,12 +2,12 @@
 
 A gateway layer between **ACP agents** (claurst, hermes, opencode) and **A2A clients** (external services, other agents). It listens on two ports (TCP + HTTP), serves four directions, issues tokens, and isolates conversations between clients. Includes streaming with a durable event buffer, a journal, health monitoring, and agent approval via CLI.
 
-**Version:** 1.1.2 — release notes in [CHANGELOG.md](CHANGELOG.md). The version lives once in the root `Cargo.toml` (`[workspace.package]`) and is inherited by the `protocol`, `gateway-core` and `gatewayd` crates.
+**Version:** 1.2.0 — release notes in [CHANGELOG.md](CHANGELOG.md). The version lives once in the root `Cargo.toml` (`[workspace.package]`) and is inherited by the `protocol`, `gateway-core` and `gatewayd` crates.
 
 ## Install and run
 
 Prebuilt binaries for Linux, Windows and macOS (arm64 / Intel / universal) are attached to the
-[release page](https://github.com/GG-QandV/ACP-A2A_gateway/releases/tag/v1.1.2), each with a
+[release page](https://github.com/GG-QandV/ACP-A2A_gateway/releases/tag/v1.2.0), each with a
 `.sha256` sidecar.
 
 ```bash

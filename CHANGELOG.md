@@ -11,7 +11,14 @@ editing that single line (plus `Cargo.lock` on the next `cargo check`), tagging
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-11-03
+
 ### Added
+- Per-agent `session_mode` (stdio agents): the gateway sends the ACP `session/set_mode` request
+  right after `session/new`, so an agent whose default mode waits for an interactive approval
+  can be switched to a non-interactive one from the config. Absent key = no extra request, the
+  old behavior. New protocol types `SetSessionModeRequest` / `SetSessionModeResponse`; see
+  `config.example.yaml`.
 - `.github/workflows/ci.yml`: `cargo fmt --all --check` + `cargo clippy --workspace
   --all-targets -- -D warnings` + `cargo test --workspace --locked` on ubuntu, windows and
   macOS runners (first green run: all three platforms).
@@ -25,6 +32,8 @@ editing that single line (plus `Cargo.lock` on the next `cargo check`), tagging
   absent flag keeps the old blocking behavior.
 
 ### Fixed
+- The stdio stream relay no longer emits an empty terminal chunk and no longer logs the false
+  "0 chunks" warning.
 - SSE responses (`message/send` streams and `tasks/resubscribe`) now send a `: keep-alive`
   comment every 15 s while the agent is silent **between events**. The response headers still
   wait for the agent's first event, so a proxy that cuts a response silent for ~30 s before the

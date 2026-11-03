@@ -20,6 +20,10 @@ agents:
     transport: stdio
     command: ["opencode", "acp"]
     cwd: "/srv/workspaces/opencode"
+    # Optional (stdio agents only): ACP mode id sent with `session/set_mode` right after
+    # every `session/new`. Use it for an agent whose default mode asks for an interactive
+    # approval the gateway cannot answer. Omit it to keep the agent's own default.
+    # session_mode: "<mode id the agent advertises in session/new>"
 
   ops-agent:
     transport: http
