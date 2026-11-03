@@ -58,6 +58,10 @@ pub struct SpawnConfig {
     /// ADDED (Streaming roadmap Part 2): timeout BETWEEN chunks of an already
     /// started stream — does not block a long but live stream.
     pub idle_chunk_timeout: Duration,
+    /// ADDED (gateway session-mode support): ACP `session/set_mode` value to
+    /// apply to every freshly created session. `None` = leave the agent's
+    /// default mode (old behaviour).
+    pub session_mode: Option<String>,
 }
 
 impl SpawnConfig {
@@ -131,6 +135,7 @@ impl SupervisedStdioAgent {
             config.call_timeout,
             config.first_chunk_timeout,
             config.idle_chunk_timeout,
+            config.session_mode.clone(),
         )
         .await?;
 
@@ -198,6 +203,14 @@ impl AcpAgent for SupervisedStdioAgent {
 
     async fn new_session(&self, req: NewSessionRequest) -> anyhow::Result<NewSessionResponse> {
         self.healthy().await?.new_session(req).await
+    }
+
+    /// ADDED (gateway session-mode support): delegates to the live process.
+    async fn set_session_mode(&self, session: SessionId, mode_id: &str) -> anyhow::Result<()> {
+        self.healthy()
+            .await?
+            .set_session_mode(session, mode_id)
+            .await
     }
 
     async fn prompt(

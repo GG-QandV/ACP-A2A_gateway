@@ -209,6 +209,28 @@ pub struct NewSessionResponse {
     pub session_id: SessionId,
 }
 
+// --- session/set_mode ---
+
+/// `session/set_mode` request (ACP): the client asks the agent to switch the
+/// session into one of the modes the agent advertised in `session/new`.
+///
+/// ADDED (gateway session-mode support): an agent that gates file edits behind
+/// per-edit approval (Hermes' `default` mode → "ask") is unusable behind a
+/// gateway, because the gateway has no UI to answer the approval request and
+/// answers "denied". Sending `session/set_mode` right after `session/new`
+/// lets the config choose a non-interactive mode per agent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetSessionModeRequest {
+    pub session_id: SessionId,
+    pub mode_id: String,
+}
+
+/// `session/set_mode` response: ACP defines it as an empty object.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetSessionModeResponse {}
+
 // --- session/prompt: ContentBlock ---
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

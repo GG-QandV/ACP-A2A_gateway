@@ -231,6 +231,9 @@ async fn get_or_spawn_adapter(
         // timeouts come from config (streaming. section).
         first_chunk_timeout: entry.first_chunk_timeout,
         idle_chunk_timeout: entry.idle_chunk_timeout,
+        // ADDED (gateway session-mode support): the configured ACP mode is
+        // applied once per new session — see StdioAcpAgent::new_session.
+        session_mode: entry.session_mode.clone(),
     })
     .await
     .map_err(|source| {

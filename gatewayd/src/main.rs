@@ -193,6 +193,12 @@ enum RawAgentEntry {
         env: HashMap<String, String>,
         #[serde(default)]
         streaming: StreamingConfig,
+        /// ADDED (gateway session-mode support): ACP `session/set_mode` value
+        /// applied to every freshly created session of this agent. Needed for
+        /// agents that gate file edits behind an interactive approval the
+        /// gateway cannot answer (Hermes `default` → "ask"). `None` = leave the
+        /// agent's own default — old behaviour, no extra request is sent.
+        session_mode: Option<String>,
     },
     Http {
         url: String,
@@ -283,6 +289,11 @@ fn build_registry(
                 streaming
             }
         };
+        // ADDED (gateway session-mode support): only stdio agents have a mode.
+        let session_mode = match entry {
+            RawAgentEntry::Stdio { session_mode, .. } => session_mode.clone(),
+            RawAgentEntry::Http { .. } => None,
+        };
         if streaming.max_concurrent_streams == 0 {
             anyhow::bail!(
                 "agent {id}: streaming.max_concurrent_streams не может быть 0 — используйте отдельный флаг disable_streaming: true, если стрим не нужен"
@@ -318,11 +329,12 @@ fn build_registry(
         };
         agents.insert(
             id.clone(),
-            AgentEntry::new(
+            AgentEntry::with_session_mode(
                 transport,
                 streaming.max_concurrent_streams,
                 std::time::Duration::from_secs(streaming.first_chunk_timeout_secs),
                 std::time::Duration::from_secs(streaming.idle_chunk_timeout_secs),
+                session_mode,
             ),
         );
     }

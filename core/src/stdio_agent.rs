@@ -48,6 +48,10 @@ pub struct StdioAcpAgent {
     /// ADDED (streaming roadmap Part 2): timeout BETWEEN chunks.
     /// Same as first_chunk_timeout — applied in the stream loop.
     idle_chunk_timeout: std::time::Duration,
+    /// ADDED (gateway session-mode support): ACP mode to set on every freshly
+    /// created session, from the agent's `session_mode:` config key.
+    /// `None` = do not send `session/set_mode` (old behaviour).
+    session_mode: Option<String>,
 }
 
 impl StdioAcpAgent {
@@ -58,6 +62,7 @@ impl StdioAcpAgent {
         call_timeout: std::time::Duration,
         first_chunk_timeout: std::time::Duration,
         idle_chunk_timeout: std::time::Duration,
+        session_mode: Option<String>,
     ) -> anyhow::Result<Self> {
         let (program, args) = command
             .split_first()
@@ -105,6 +110,7 @@ impl StdioAcpAgent {
             call_timeout,
             first_chunk_timeout,
             idle_chunk_timeout,
+            session_mode,
         })
     }
 
@@ -289,7 +295,52 @@ impl AcpAgent for StdioAcpAgent {
     }
 
     async fn new_session(&self, req: NewSessionRequest) -> anyhow::Result<NewSessionResponse> {
-        self.call("session/new", req).await
+        let resp: NewSessionResponse = self.call("session/new", req).await?;
+        // ADDED (gateway session-mode support): apply the configured ACP mode to
+        // the freshly created session. Without this the agent keeps its
+        // interactive default (Hermes: "ask" for every file edit), and a
+        // gateway — which has no approval UI — denies the edits.
+        // A failure here is logged, not fatal: the session exists and a mode
+        // the agent does not know must not kill the whole turn.
+        if let Some(mode) = self.session_mode.as_deref() {
+            let mode_req = protocol::acp::SetSessionModeRequest {
+                session_id: resp.session_id.clone(),
+                mode_id: mode.to_string(),
+            };
+            match self
+                .call::<_, protocol::acp::SetSessionModeResponse>("session/set_mode", mode_req)
+                .await
+            {
+                Ok(_) => tracing::info!(
+                    session = %resp.session_id.0,
+                    mode,
+                    "session/set_mode применён"
+                ),
+                Err(e) => tracing::warn!(
+                    session = %resp.session_id.0,
+                    mode,
+                    error = %e,
+                    "session/set_mode не удался — сессия остаётся в режиме агента по умолчанию"
+                ),
+            }
+        }
+        Ok(resp)
+    }
+
+    /// ADDED (gateway session-mode support): ACP `session/set_mode`.
+    ///
+    /// The gateway has no UI to answer an agent's per-edit approval request, so
+    /// an agent left in an interactive mode (Hermes `default` → "ask") answers
+    /// every `write_file` with "Edit approval denied by ACP client". Setting a
+    /// non-interactive mode from the config (`session_mode: dont_ask`) is what
+    /// makes edits work behind the gateway.
+    async fn set_session_mode(&self, session: SessionId, mode_id: &str) -> anyhow::Result<()> {
+        let req = protocol::acp::SetSessionModeRequest {
+            session_id: session,
+            mode_id: mode_id.to_string(),
+        };
+        let _: protocol::acp::SetSessionModeResponse = self.call("session/set_mode", req).await?;
+        Ok(())
     }
 
     async fn prompt(
@@ -396,7 +447,14 @@ impl AcpAgent for StdioAcpAgent {
                     let updates = self.updates.clone();
                     let idle_chunk_timeout = self.idle_chunk_timeout;
                     async move {
-                        let mut last_chunks = 0usize;
+                        // NOTE: the first chunk was already forwarded to out_tx
+                        // before this task started, so this branch is only ever
+                        // entered for a turn that really streamed. That is also
+                        // why there is no "0 chunks" diagnostic here anymore: the
+                        // old counter started at 0 (excluding the first chunk) and
+                        // fired a false warning on every single-chunk answer; a
+                        // genuinely chunk-free turn takes the Reply::Complete
+                        // branch below instead.
                         loop {
                             // FIXED: biased, chunk branch first — the reader task
                             // forwards a chunk before the final response that follows
@@ -407,7 +465,6 @@ impl AcpAgent for StdioAcpAgent {
                                 chunk = rx.recv() => {
                                     match chunk {
                                         Some(c) => {
-                                            last_chunks += 1;
                                             if out_tx.send(c).is_err() {
                                                 break; // receiver disconnected
                                             }
@@ -418,31 +475,47 @@ impl AcpAgent for StdioAcpAgent {
                                 resp = &mut resp_rx => {
                                     // Chunks already queued belong before the terminal.
                                     while let Ok(c) = rx.try_recv() {
-                                        last_chunks += 1;
                                         if out_tx.send(c).is_err() {
                                             break;
                                         }
                                     }
-                                    let terminal = match resp {
+                                    // FIXED (empty terminal chunk): an agent that
+                                    // already streamed the whole answer returns
+                                    // PromptResponse without content. Turning that
+                                    // empty response into AgentMessageChunk used to
+                                    // leak a `"text":""` event into every SSE stream
+                                    // (A2A clients saw it as a junk message part
+                                    // right before `completed`). Forward a terminal
+                                    // chunk only when it carries text; closing the
+                                    // channel is enough to produce Completed.
+                                    let terminal: Result<Option<SessionUpdate>, String> = match resp {
                                         Ok(Ok(value)) => serde_json::from_value::<PromptResponse>(value)
                                             .map_err(|e| format!("bad PromptResponse: {e}"))
-                                            .map(|r| SessionUpdate::AgentMessageChunk {
-                                                message_id: None,
-                                                content: prompt_to_content_block(&r),
+                                            .map(|r| {
+                                                let content = prompt_to_content_block(&r);
+                                                if content_is_empty(&content) {
+                                                    None
+                                                } else {
+                                                    Some(SessionUpdate::AgentMessageChunk {
+                                                        message_id: None,
+                                                        content,
+                                                    })
+                                                }
                                             }),
                                         Ok(Err(err_msg)) => Err(err_msg),
                                         Err(_) => Err("agent stdout closed before prompt response".to_string()),
                                     };
                                     match terminal {
-                                        Ok(terminal) => {
-                                            if last_chunks == 0 {
-                                                tracing::warn!(
-                                                    session_id = %session_key,
-                                                    chunk_count = last_chunks,
-                                                    "stream produced 0 chunks before terminal event"
-                                                );
+                                        Ok(maybe_terminal) => {
+                                            // No "0 chunks" diagnostic here: this
+                                            // branch is entered only after at least
+                                            // one chunk reached the client. A genuinely
+                                            // chunk-free turn takes the Reply::Complete
+                                            // branch below (agent never started
+                                            // streaming), which logs nothing.
+                                            if let Some(terminal) = maybe_terminal {
+                                                let _ = out_tx.send(terminal);
                                             }
-                                            let _ = out_tx.send(terminal);
                                         }
                                         Err(e) => {
                                             tracing::error!(
@@ -558,6 +631,16 @@ async fn collect_session_update(parsed: &Value, updates: &UpdatesMap) {
 
 /// Final PromptResponse → terminal SessionUpdate (a text chunk
 /// carrying the full response content). Called in prompt() after the turn completes.
+/// True when the block carries no visible text — typically the terminal
+/// AgentMessageChunk built from a PromptResponse whose content is empty
+/// because the answer was already delivered as streamed chunks.
+fn content_is_empty(block: &protocol::acp::ContentBlock) -> bool {
+    match block {
+        protocol::acp::ContentBlock::Text { text, .. } => text.trim().is_empty(),
+        _ => false,
+    }
+}
+
 fn prompt_to_content_block(resp: &PromptResponse) -> protocol::acp::ContentBlock {
     // Merge all response content into one text block: an ACP agent's
     // final answer may consist of several ContentBlocks, but
@@ -620,6 +703,7 @@ mod tests {
             Duration::from_secs(30),
             first_chunk_timeout,
             idle_chunk_timeout,
+            None,
         )
         .await
         .expect("mock агент спавнится")
@@ -695,6 +779,59 @@ mod tests {
 
         assert!(matches!(first, SessionUpdate::AgentMessageChunk { .. }));
         assert!(matches!(second, SessionUpdate::AgentMessageChunk { .. }));
+    }
+
+    /// REGRESSION (empty terminal chunk): an agent that already streamed the
+    /// whole answer returns PromptResponse without content. The relay used to
+    /// convert that empty response into an extra AgentMessageChunk with
+    /// `"text":""` — every A2A client saw it as a junk message part right
+    /// before `completed` (Hermes hits this on every turn, opencode too).
+    #[tokio::test]
+    async fn empty_final_response_does_not_emit_empty_terminal_chunk() {
+        let agent = spawn_mock(&[
+            ("MOCK_AGENT_STREAM_CHUNKS", "2"),
+            ("MOCK_AGENT_FINAL_CONTENT_EMPTY", "1"),
+        ])
+        .await;
+        let session = init_session(&agent).await;
+
+        let reply = agent
+            .prompt_streaming(PromptRequest {
+                session_id: session.clone(),
+                prompt: vec![ContentBlock::Text {
+                    text: "hello".into(),
+                }],
+            })
+            .await
+            .expect("prompt_streaming works");
+
+        let Reply::Streaming(mut rx) = reply else {
+            panic!("expected Reply::Streaming");
+        };
+
+        let mut texts: Vec<String> = Vec::new();
+        while let Some(update) = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("stream closes")
+        {
+            if let SessionUpdate::AgentMessageChunk {
+                content: ContentBlock::Text { text, .. },
+                ..
+            } = update
+            {
+                texts.push(text);
+            }
+        }
+
+        assert_eq!(
+            texts.len(),
+            2,
+            "only 2 real chunks must arrive, no empty terminal one: {texts:?}"
+        );
+        assert!(
+            texts.iter().all(|t| !t.trim().is_empty()),
+            "the stream must not contain empty text chunks: {texts:?}"
+        );
     }
 
     /// T9: idle_chunk_timeout closes a stalled stream. The mock sends 1 chunk,

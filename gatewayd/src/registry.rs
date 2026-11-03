@@ -33,6 +33,9 @@ pub struct AgentEntry {
     /// ADDED (Streaming roadmap Part 2): timeout BETWEEN chunks
     /// of the agent stream — from the `streaming.idle_chunk_timeout_secs` config.
     pub idle_chunk_timeout: std::time::Duration,
+    /// ADDED (gateway session-mode support): ACP mode set on every new session,
+    /// from the agent's `session_mode:` config key. `None` = do not switch.
+    pub session_mode: Option<String>,
 }
 
 /// ADDED (Phase 5): one summary line of occupied stream slots.
@@ -50,12 +53,31 @@ impl AgentEntry {
         first_chunk_timeout: std::time::Duration,
         idle_chunk_timeout: std::time::Duration,
     ) -> Self {
+        Self::with_session_mode(
+            transport,
+            max_concurrent_streams,
+            first_chunk_timeout,
+            idle_chunk_timeout,
+            None,
+        )
+    }
+
+    /// ADDED (gateway session-mode support): same as `new` plus the ACP mode.
+    /// Existing callers keep using `new` (None = old behaviour).
+    pub fn with_session_mode(
+        transport: Transport,
+        max_concurrent_streams: usize,
+        first_chunk_timeout: std::time::Duration,
+        idle_chunk_timeout: std::time::Duration,
+        session_mode: Option<String>,
+    ) -> Self {
         Self {
             transport,
             stream_permits: Arc::new(tokio::sync::Semaphore::new(max_concurrent_streams)),
             stream_limit: max_concurrent_streams,
             first_chunk_timeout,
             idle_chunk_timeout,
+            session_mode,
         }
     }
 }

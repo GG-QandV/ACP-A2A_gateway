@@ -14,6 +14,16 @@ pub trait AcpAgent: Send + Sync {
     async fn initialize(&self, req: InitializeRequest) -> anyhow::Result<InitializeResponse>;
     async fn new_session(&self, req: NewSessionRequest) -> anyhow::Result<NewSessionResponse>;
 
+    /// ADDED (gateway session-mode support): ACP `session/set_mode`.
+    ///
+    /// Called once per freshly created session when the agent entry in the
+    /// gateway config carries `session_mode:`. Default = no-op so an agent that
+    /// does not implement the method (or a config without the field) keeps the
+    /// old behaviour exactly.
+    async fn set_session_mode(&self, _session: SessionId, _mode_id: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     async fn prompt(
         &self,
         req: PromptRequest,

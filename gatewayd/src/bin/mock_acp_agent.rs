@@ -39,6 +39,11 @@ fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
+    // Regression for the empty terminal chunk: agents that already streamed
+    // the whole answer return PromptResponse without content (Hermes does).
+    let final_content_empty: bool = std::env::var("MOCK_AGENT_FINAL_CONTENT_EMPTY")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
 
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
@@ -120,13 +125,21 @@ fn main() {
                 if final_delay_ms > 0 {
                     thread::sleep(Duration::from_millis(final_delay_ms));
                 }
-                let resp = serde_json::json!({
-                    "stopReason": "end_turn",
-                    "content": [{
-                        "type": "text",
-                        "text": prompt_text,
-                    }],
-                });
+                let resp = if final_content_empty {
+                    // No content: everything was already delivered as chunks.
+                    serde_json::json!({
+                        "stopReason": "end_turn",
+                        "content": [],
+                    })
+                } else {
+                    serde_json::json!({
+                        "stopReason": "end_turn",
+                        "content": [{
+                            "type": "text",
+                            "text": prompt_text,
+                        }],
+                    })
+                };
                 write_response(&stdout, &id, Ok(resp));
                 if exit_after_prompts > 0 && prompts_served >= exit_after_prompts {
                     return;
